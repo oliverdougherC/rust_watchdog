@@ -1,0 +1,30 @@
+[nfs]
+server = "192.168.1.244"
+
+[[shares]]
+name = "movies"
+remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/Movies"
+local_mount = "/Volumes/JellyfinMovies"
+
+[[shares]]
+name = "tv"
+remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/TV"
+local_mount = "/Volumes/JellyfinTV"
+
+[transcode]
+max_average_bitrate_mbps = 25.0
+target_codec = "av1"
+preset_file = "AV1_MKV.json"
+preset_name = "AV1_MKV"
+timeout_seconds = 18000
+max_retries = 1
+min_free_space_multiplier = 2.0
+
+[scan]
+video_extensions = [".mkv", ".mp4", ".avi", ".mov", ".webm"]
+interval_seconds = 300
+
+[paths]
+transcode_temp = "/Volumes/External/tmp/"
+database = "watchdog.db"
+log_dir = "logs"

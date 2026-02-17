@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+
+# Database files
+*.db
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+
+# Environment / secrets
+.env
