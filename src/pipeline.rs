@@ -134,8 +134,26 @@ pub async fn run_watchdog_pass(
     // Filter out already-inspected files and build transcode queue
     let mut transcode_queue: Vec<(FileEntry, TranscodeEval)> = Vec::new();
     let discovered_count = all_entries.len();
+    let mut last_scan_log = Instant::now();
 
-    for entry in &all_entries {
+    for (idx, entry) in all_entries.iter().enumerate() {
+        let scanned = idx + 1;
+        state.set_queue_info(scanned as u32, discovered_count as u32);
+        if scanned == 1 || scanned == discovered_count || last_scan_log.elapsed().as_secs() >= 2 {
+            tui_log(
+                state,
+                "INFO",
+                &format!(
+                    "Scanning: {}/{} files (queued: {}, inspected this pass: {})",
+                    scanned,
+                    discovered_count,
+                    transcode_queue.len(),
+                    stats.files_inspected
+                ),
+            );
+            last_scan_log = Instant::now();
+        }
+
         // Check shutdown
         if shutdown_rx.try_recv().is_ok() {
             return Err(WatchdogError::Shutdown);
