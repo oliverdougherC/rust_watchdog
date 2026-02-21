@@ -14,9 +14,9 @@ pub fn render_dashboard(f: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Status bar (with border)
-            Constraint::Length(5),  // Stat cards (taller)
-            Constraint::Length(5),  // Current transcode
+            Constraint::Length(3), // Status bar (with border)
+            Constraint::Length(5), // Stat cards (taller)
+            Constraint::Length(5), // Current transcode
             Constraint::Min(6),    // Recent activity
         ])
         .split(area);
@@ -62,7 +62,11 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
 
     let phase_str = state.phase.to_string();
     let phase_badge = StatusBadge::new(&phase_str, phase_color);
-    let nfs_label = if state.nfs_healthy { "Healthy" } else { "Unhealthy" };
+    let nfs_label = if state.nfs_healthy {
+        "Healthy"
+    } else {
+        "Unhealthy"
+    };
     let nfs_badge = StatusBadge::new(nfs_label, nfs_color);
 
     let mut spans = vec![Span::raw(" State: ")];
@@ -108,8 +112,8 @@ fn render_stat_cards(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         Color::DarkGray
     };
-    let failures = StatCard::new("Failures", failures_str)
-        .style(Style::default().fg(failures_color));
+    let failures =
+        StatCard::new("Failures", failures_str).style(Style::default().fg(failures_color));
     f.render_widget(failures, card_areas[2]);
 
     let queue_str = if state.queue_total > 0 {
@@ -117,8 +121,7 @@ fn render_stat_cards(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         "0".to_string()
     };
-    let queue = StatCard::new("Queue", queue_str)
-        .style(Style::default().fg(Color::Magenta));
+    let queue = StatCard::new("Queue", queue_str).style(Style::default().fg(Color::Magenta));
     f.render_widget(queue, card_areas[3]);
 }
 
@@ -134,7 +137,11 @@ fn render_current_transcode(f: &mut Frame, area: Rect, state: &AppState) {
     if let Some(ref file) = state.current_file {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
             .split(inner);
 
         // Show just the filename, not the full path
@@ -168,11 +175,7 @@ fn render_current_transcode(f: &mut Frame, area: Rect, state: &AppState) {
         );
 
         let gauge = Gauge::default()
-            .gauge_style(
-                Style::default()
-                    .fg(Color::Green)
-                    .bg(Color::DarkGray),
-            )
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
             .ratio((state.transcode_percent / 100.0).clamp(0.0, 1.0))
             .label(label);
 

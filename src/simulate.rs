@@ -3,9 +3,9 @@ use crate::error::Result;
 use crate::pipeline::PipelineDeps;
 use crate::traits::*;
 use rand::Rng;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 /// Simulated VFS entry.
@@ -34,21 +34,48 @@ impl SimulatedFileSystem {
 
         let codecs = ["h264", "hevc", "mpeg4", "av1"];
         let movie_names = [
-            "The.Matrix.1999", "Inception.2010", "Interstellar.2014",
-            "Blade.Runner.2049", "Dune.Part.Two.2024", "Oppenheimer.2023",
-            "The.Dark.Knight.2008", "Pulp.Fiction.1994", "Fight.Club.1999",
-            "The.Shawshank.Redemption.1994", "Parasite.2019", "Whiplash.2014",
-            "Mad.Max.Fury.Road.2015", "Arrival.2016", "The.Godfather.1972",
-            "Goodfellas.1990", "No.Country.for.Old.Men.2007",
-            "There.Will.Be.Blood.2007", "The.Grand.Budapest.Hotel.2014",
-            "Moonlight.2016", "La.La.Land.2016", "Joker.2019",
-            "The.Social.Network.2010", "Drive.2011", "Sicario.2015",
+            "The.Matrix.1999",
+            "Inception.2010",
+            "Interstellar.2014",
+            "Blade.Runner.2049",
+            "Dune.Part.Two.2024",
+            "Oppenheimer.2023",
+            "The.Dark.Knight.2008",
+            "Pulp.Fiction.1994",
+            "Fight.Club.1999",
+            "The.Shawshank.Redemption.1994",
+            "Parasite.2019",
+            "Whiplash.2014",
+            "Mad.Max.Fury.Road.2015",
+            "Arrival.2016",
+            "The.Godfather.1972",
+            "Goodfellas.1990",
+            "No.Country.for.Old.Men.2007",
+            "There.Will.Be.Blood.2007",
+            "The.Grand.Budapest.Hotel.2014",
+            "Moonlight.2016",
+            "La.La.Land.2016",
+            "Joker.2019",
+            "The.Social.Network.2010",
+            "Drive.2011",
+            "Sicario.2015",
         ];
         let tv_shows = [
-            "Breaking.Bad", "Better.Call.Saul", "The.Wire", "Chernobyl",
-            "True.Detective", "Severance", "The.Bear", "Succession",
-            "The.Last.of.Us", "Shogun", "House.of.the.Dragon",
-            "Andor", "Arcane", "The.Penguin", "Slow.Horses",
+            "Breaking.Bad",
+            "Better.Call.Saul",
+            "The.Wire",
+            "Chernobyl",
+            "True.Detective",
+            "Severance",
+            "The.Bear",
+            "Succession",
+            "The.Last.of.Us",
+            "Shogun",
+            "House.of.the.Dragon",
+            "Andor",
+            "Arcane",
+            "The.Penguin",
+            "Slow.Horses",
         ];
         let extensions = [".mkv", ".mp4", ".avi"];
 
@@ -153,19 +180,21 @@ impl FileSystem for SimulatedFileSystem {
     }
 
     fn file_size(&self, path: &Path) -> Result<u64> {
-        self.find_file(path)
-            .map(|f| f.size)
-            .ok_or_else(|| crate::error::WatchdogError::Io(
-                std::io::Error::new(std::io::ErrorKind::NotFound, "simulated file not found"),
+        self.find_file(path).map(|f| f.size).ok_or_else(|| {
+            crate::error::WatchdogError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "simulated file not found",
             ))
+        })
     }
 
     fn file_mtime(&self, path: &Path) -> Result<f64> {
-        self.find_file(path)
-            .map(|f| f.mtime)
-            .ok_or_else(|| crate::error::WatchdogError::Io(
-                std::io::Error::new(std::io::ErrorKind::NotFound, "simulated file not found"),
+        self.find_file(path).map(|f| f.mtime).ok_or_else(|| {
+            crate::error::WatchdogError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "simulated file not found",
             ))
+        })
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -316,17 +345,23 @@ impl Transcoder for SimulatedTranscoder {
             6.0
         };
         let audio_streams = original.as_ref().map(|f| f.audio_stream_count).unwrap_or(1);
-        let subtitle_streams = original.as_ref().map(|f| f.subtitle_stream_count).unwrap_or(0);
-        self.fs.temp_files.lock().unwrap().insert(output.to_path_buf(), SimFile {
-            path: output.to_path_buf(),
-            size: output_size,
-            mtime: 0.0,
-            codec: "av1".to_string(),
-            bitrate_mbps: output_bitrate,
-            duration_secs: original_duration,
-            audio_stream_count: audio_streams,
-            subtitle_stream_count: subtitle_streams,
-        });
+        let subtitle_streams = original
+            .as_ref()
+            .map(|f| f.subtitle_stream_count)
+            .unwrap_or(0);
+        self.fs.temp_files.lock().unwrap().insert(
+            output.to_path_buf(),
+            SimFile {
+                path: output.to_path_buf(),
+                size: output_size,
+                mtime: 0.0,
+                codec: "av1".to_string(),
+                bitrate_mbps: output_bitrate,
+                duration_secs: original_duration,
+                audio_stream_count: audio_streams,
+                subtitle_stream_count: subtitle_streams,
+            },
+        );
 
         Ok(TranscodeResult {
             success: true,
@@ -373,7 +408,11 @@ impl FileTransfer for SimulatedTransfer {
                 subtitle_stream_count: 0,
             },
         };
-        self.fs.temp_files.lock().unwrap().insert(dest.to_path_buf(), sim_file);
+        self.fs
+            .temp_files
+            .lock()
+            .unwrap()
+            .insert(dest.to_path_buf(), sim_file);
         // Brief delay to simulate transfer
         std::thread::sleep(std::time::Duration::from_millis(100));
         Ok(TransferResult { success: true })
@@ -416,7 +455,12 @@ pub fn create_simulated_deps(config: &Config) -> PipelineDeps {
 struct SimulatedFileSystemWrapper(std::sync::Arc<SimulatedFileSystem>);
 
 impl FileSystem for SimulatedFileSystemWrapper {
-    fn walk_share(&self, share_name: &str, root: &Path, extensions: &[String]) -> Result<Vec<FileEntry>> {
+    fn walk_share(
+        &self,
+        share_name: &str,
+        root: &Path,
+        extensions: &[String],
+    ) -> Result<Vec<FileEntry>> {
         self.0.walk_share(share_name, root, extensions)
     }
     fn file_size(&self, path: &Path) -> Result<u64> {

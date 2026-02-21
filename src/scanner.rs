@@ -22,10 +22,7 @@ impl FileSystem for RealFileSystem {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(
-                        "[{}] Error walking directory: {}",
-                        share_name, e
-                    );
+                    warn!("[{}] Error walking directory: {}", share_name, e);
                     continue;
                 }
             };
@@ -90,11 +87,7 @@ impl FileSystem for RealFileSystem {
             });
         }
 
-        info!(
-            "[{}] Found {} video files",
-            share_name,
-            entries.len()
-        );
+        info!("[{}] Found {} video files", share_name, entries.len());
         Ok(entries)
     }
 

@@ -67,7 +67,10 @@ impl<'a> StatusBadge<'a> {
     pub fn to_spans(&self) -> Vec<Span<'_>> {
         vec![
             Span::styled("● ", Style::default().fg(self.color)),
-            Span::styled(self.label, Style::default().fg(self.color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                self.label,
+                Style::default().fg(self.color).add_modifier(Modifier::BOLD),
+            ),
         ]
     }
 }

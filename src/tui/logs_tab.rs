@@ -67,9 +67,7 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &AppState, tab_state: &mut 
 
     // Auto-scroll to bottom if enabled
     if tab_state.auto_scroll && !state.log_lines.is_empty() {
-        tab_state
-            .list_state
-            .select(Some(state.log_lines.len() - 1));
+        tab_state.list_state.select(Some(state.log_lines.len() - 1));
     }
 
     let items: Vec<ListItem> = state

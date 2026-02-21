@@ -60,9 +60,18 @@ impl HistoryTabState {
 }
 
 pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState) {
-    let header_cells = ["Status", "File", "Codec", "Original", "Output", "Saved", "Duration", "Time"]
-        .iter()
-        .map(|h| Cell::from(Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+    let header_cells = [
+        "Status", "File", "Codec", "Original", "Output", "Saved", "Duration", "Time",
+    ]
+    .iter()
+    .map(|h| {
+        Cell::from(Span::styled(
+            *h,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    });
     let header = Row::new(header_cells).height(1);
 
     let rows: Vec<Row> = tab_state
@@ -78,7 +87,10 @@ pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState
                 .to_string_lossy()
                 .to_string();
 
-            let codec = record.original_codec.clone().unwrap_or_else(|| "?".to_string());
+            let codec = record
+                .original_codec
+                .clone()
+                .unwrap_or_else(|| "?".to_string());
             let orig_size = record
                 .original_size
                 .map(|s| format_bytes(s as u64))
@@ -109,10 +121,7 @@ pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState
             };
 
             let failure_info = if !record.success {
-                record
-                    .failure_reason
-                    .as_deref()
-                    .unwrap_or("unknown")
+                record.failure_reason.as_deref().unwrap_or("unknown")
             } else {
                 ""
             };
@@ -124,7 +133,10 @@ pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState
             };
 
             Row::new(vec![
-                Cell::from(Span::styled(status_str, Style::default().fg(color).add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled(
+                    status_str,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )),
                 Cell::from(file_display),
                 Cell::from(codec),
                 Cell::from(orig_size),

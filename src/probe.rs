@@ -71,8 +71,10 @@ fn parse_probe_result(data: serde_json::Value) -> ProbeResult {
                 Some("video") => {
                     video_count += 1;
                     if video_codec.is_none() {
-                        video_codec =
-                            stream.get("codec_name").and_then(|v| v.as_str()).map(String::from);
+                        video_codec = stream
+                            .get("codec_name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                         stream_bitrate_bps = stream
                             .get("bit_rate")
                             .and_then(|v| v.as_str())
@@ -183,11 +185,7 @@ pub fn evaluate_transcode_need(probe: &ProbeResult, config: &TranscodeConfig) ->
 ///
 /// IMPORTANT: Callers should verify the output file exists and has non-zero size
 /// via the FileSystem trait BEFORE calling this (to support simulation mode).
-pub fn verify_transcode(
-    prober: &dyn Prober,
-    original: &Path,
-    transcoded: &Path,
-) -> Result<bool> {
+pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path) -> Result<bool> {
     // Health check on the transcoded file (ffprobe -v error)
     if !prober.health_check(transcoded)? {
         warn!("Health check failed for {}", transcoded.display());

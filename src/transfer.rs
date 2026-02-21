@@ -10,11 +10,7 @@ pub struct RsyncTransfer;
 
 impl FileTransfer for RsyncTransfer {
     fn transfer(&self, source: &Path, dest: &Path, timeout_secs: u64) -> Result<TransferResult> {
-        let cmd_str = format!(
-            "rsync -avh {} {}",
-            source.display(),
-            dest.display()
-        );
+        let cmd_str = format!("rsync -avh {} {}", source.display(), dest.display());
         info!("Running: {} (timeout: {}s)", cmd_str, timeout_secs);
 
         let mut child = Command::new("rsync")

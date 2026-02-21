@@ -62,7 +62,7 @@ impl Transcoder for HandBrakeTranscoder {
         use nix::pty::openpty;
         use std::io::Read;
         use std::os::fd::AsFd;
-        
+
         use std::process::{Command, Stdio};
 
         let cmd_str = format!(
@@ -142,8 +142,7 @@ impl Transcoder for HandBrakeTranscoder {
             }
 
             // Poll for data with 1s timeout
-            let poll_timeout = PollTimeout::try_from(1000i32)
-                .unwrap_or(PollTimeout::NONE);
+            let poll_timeout = PollTimeout::try_from(1000i32).unwrap_or(PollTimeout::NONE);
             let mut poll_fds = [PollFd::new(master_file.as_fd(), PollFlags::POLLIN)];
             match poll(&mut poll_fds, poll_timeout) {
                 Ok(0) => {

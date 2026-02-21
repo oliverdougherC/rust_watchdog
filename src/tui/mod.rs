@@ -171,7 +171,7 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Title + tabs
-            Constraint::Min(10),  // Content
+            Constraint::Min(10),   // Content
             Constraint::Length(1), // Footer
         ])
         .split(size);
@@ -193,7 +193,11 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp, state: &AppState) {
 fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
     let block = Block::default()
         .title(" Jellyfin AV1 Transcoding Watchdog ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -220,15 +224,40 @@ fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
 
 fn render_footer(f: &mut Frame, area: Rect) {
     let help = Line::from(vec![
-        Span::styled(" q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " q",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":quit  "),
-        Span::styled("1-3", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "1-3",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":tabs  "),
-        Span::styled("Tab", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Tab",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":next  "),
-        Span::styled("j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "j/k",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":scroll  "),
-        Span::styled("Home/End", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Home/End",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":top/bottom"),
     ]);
 

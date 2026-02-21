@@ -306,13 +306,10 @@ impl WatchdogDb {
     /// Get count of inspected files.
     pub fn get_inspected_count(&self) -> i64 {
         let conn = self.lock();
-        conn.query_row("SELECT COUNT(*) FROM inspected_files", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0)
+        conn.query_row("SELECT COUNT(*) FROM inspected_files", [], |row| row.get(0))
+            .unwrap_or(0)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -17,7 +17,7 @@ mod util;
 use crate::config::Config;
 use crate::db::WatchdogDb;
 use crate::nfs::SystemMountManager;
-use crate::pipeline::{PipelineDeps, run_pipeline_loop};
+use crate::pipeline::{run_pipeline_loop, PipelineDeps};
 use crate::probe::FfprobeProber;
 use crate::scanner::RealFileSystem;
 use crate::simulate::create_simulated_deps;
@@ -31,7 +31,11 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(name = "watchdog", about = "Jellyfin AV1 Transcoding Watchdog", version)]
+#[command(
+    name = "watchdog",
+    about = "Jellyfin AV1 Transcoding Watchdog",
+    version
+)]
 struct Cli {
     /// Run in simulation mode with fake data
     #[arg(long)]
@@ -119,7 +123,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Acquire instance lock (skip in simulation mode)
     let _instance_lock = if !cli.simulate {
-        let lock_path = config.resolve_path(&base_dir, &config.paths.database)
+        let lock_path = config
+            .resolve_path(&base_dir, &config.paths.database)
             .with_extension("lock");
         match util::InstanceLock::acquire(&lock_path) {
             Ok(lock) => {

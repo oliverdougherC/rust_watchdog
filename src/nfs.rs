@@ -113,8 +113,7 @@ pub fn ensure_all_mounts(
 
         warn!(
             "Mount '{}' at {} is unavailable; attempting remount",
-            name,
-            local_mount
+            name, local_mount
         );
 
         let success = manager.remount(server, remote_path, mount_path, name)?;
