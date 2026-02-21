@@ -77,7 +77,7 @@ pub async fn run_watchdog_pass(
 
     // Prepare paths
     let preset_path = config.resolve_path(base_dir, &config.transcode.preset_file);
-    let temp_dir = PathBuf::from(&config.paths.transcode_temp);
+    let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
     deps.fs.create_dir_all(&temp_dir)?;
 
     // Clean up stale temp files from previous crashes (e.g., leftover .av1.* or source copies).
@@ -98,6 +98,7 @@ pub async fn run_watchdog_pass(
 
     // Scan all shares
     let mut all_entries = Vec::new();
+    let mut available_shares = 0usize;
     for share in &config.shares {
         let mount_path = Path::new(&share.local_mount);
         if !deps.fs.is_dir(mount_path) {
@@ -108,6 +109,7 @@ pub async fn run_watchdog_pass(
             continue;
         }
 
+        available_shares += 1;
         let entries = deps.fs.walk_share(
             &share.name,
             mount_path,
@@ -117,7 +119,16 @@ pub async fn run_watchdog_pass(
     }
 
     if all_entries.is_empty() {
-        return Err(WatchdogError::NoMediaDirectories);
+        if available_shares == 0 {
+            return Err(WatchdogError::NoMediaDirectories);
+        }
+        info!("No media files found across healthy shares; ending pass");
+        tui_log(state, "INFO", "No media files found this pass");
+        state.set_phase(PipelinePhase::Idle);
+        state.set_last_pass_time();
+        state.set_current_file(None);
+        state.set_transcode_progress(0.0, 0.0, 0.0, String::new());
+        return Ok(stats);
     }
 
     // Filter out already-inspected files and build transcode queue
