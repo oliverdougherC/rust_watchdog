@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
+
+jobs:
+  fast:
+    name: Fast Quality Gate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --all-targets
+
+  real-tools:
+    name: Real Tools Smoke
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    env:
+      WATCHDOG_REAL_TOOLS: "1"
+      WATCHDOG_REAL_INPUT: ${{ secrets.WATCHDOG_REAL_INPUT }}
+      WATCHDOG_REAL_PRESET_FILE: AV1_MKV.json
+      WATCHDOG_REAL_PRESET_NAME: AV1_MKV
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install ffmpeg + handbrake
+        run: |
+          brew update
+          brew install ffmpeg handbrake
+      - name: Real-tools gated tests
+        run: cargo test --test real_tools -- --nocapture

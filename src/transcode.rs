@@ -1,8 +1,12 @@
 use crate::error::{Result, WatchdogError};
+use crate::process::{configure_subprocess_group, terminate_subprocess};
 use crate::traits::{TranscodeProgress, TranscodeResult, Transcoder};
 use regex::Regex;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -17,6 +21,17 @@ static HB_PROGRESS_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+fn push_tail(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    buf.extend_from_slice(chunk);
+    if buf.len() > limit {
+        let drop_len = buf.len() - limit;
+        buf.drain(0..drop_len);
+    }
+}
 
 /// Parse a line of HandBrake output for progress information.
 fn parse_handbrake_progress(line: &str) -> Option<TranscodeProgress> {
@@ -57,6 +72,7 @@ impl Transcoder for HandBrakeTranscoder {
         preset_name: &str,
         timeout_secs: u64,
         progress_tx: mpsc::Sender<TranscodeProgress>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<TranscodeResult> {
         use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
         use nix::pty::openpty;
@@ -83,7 +99,9 @@ impl Transcoder for HandBrakeTranscoder {
         // Convert slave OwnedFd to a File for Stdio
         let slave_file = std::fs::File::from(pty.slave);
 
-        let child_result = Command::new("HandBrakeCLI")
+        let mut cmd = Command::new("HandBrakeCLI");
+        configure_subprocess_group(&mut cmd);
+        let child_result = cmd
             .arg("--preset-import-file")
             .arg(preset_file)
             .arg("-i")
@@ -109,6 +127,8 @@ impl Transcoder for HandBrakeTranscoder {
         let start = Instant::now();
         let mut timed_out = false;
         let mut line_buf = Vec::new();
+        let mut stderr_tail = Vec::new();
+        const STDERR_LIMIT: usize = 128 * 1024;
 
         // Convert master to a File for reading
         let mut master_file = std::fs::File::from(pty.master);
@@ -118,6 +138,8 @@ impl Transcoder for HandBrakeTranscoder {
             if byte == b'\r' || byte == b'\n' {
                 if !line_buf.is_empty() {
                     let line = String::from_utf8_lossy(&line_buf).to_string();
+                    push_tail(&mut stderr_tail, line.as_bytes(), STDERR_LIMIT);
+                    push_tail(&mut stderr_tail, b"\n", STDERR_LIMIT);
                     if let Some(progress) = parse_handbrake_progress(&line) {
                         let _ = progress_tx.try_send(progress);
                     }
@@ -129,9 +151,18 @@ impl Transcoder for HandBrakeTranscoder {
         };
 
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                terminate_subprocess(&mut child, Duration::from_secs(2));
+                let _ = child.wait();
+                return Err(WatchdogError::TranscodeCancelled {
+                    path: input.to_path_buf(),
+                    reason: "cancel signal received".to_string(),
+                });
+            }
+
             if timeout_secs > 0 && start.elapsed().as_secs() > timeout_secs {
                 timed_out = true;
-                let _ = child.kill();
+                terminate_subprocess(&mut child, Duration::from_secs(2));
                 let _ = child.wait();
                 warn!(
                     "HandBrake timed out after {}s: {}",
@@ -215,9 +246,10 @@ impl Transcoder for HandBrakeTranscoder {
 
         if !status.success() {
             warn!(
-                "HandBrakeCLI failed (rc={:?}) for {}",
+                "HandBrakeCLI failed (rc={:?}) for {}: {}",
                 status.code(),
-                input.display()
+                input.display(),
+                String::from_utf8_lossy(&stderr_tail).trim()
             );
         }
 
@@ -226,5 +258,30 @@ impl Transcoder for HandBrakeTranscoder {
             timed_out: false,
             output_exists,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_handbrake_progress;
+
+    #[test]
+    fn parse_progress_line_with_stats() {
+        let line = "Encoding: task 1 of 1, 12.34 % (5.67 fps, avg 4.56 fps, ETA 01h23m45s)";
+        let p = parse_handbrake_progress(line).unwrap();
+        assert!((p.percent - 12.34).abs() < 0.001);
+        assert!((p.fps - 5.67).abs() < 0.001);
+        assert!((p.avg_fps - 4.56).abs() < 0.001);
+        assert_eq!(p.eta, "01h23m45s");
+    }
+
+    #[test]
+    fn parse_progress_line_without_stats() {
+        let line = "Encoding: task 1 of 1, 98.0 %";
+        let p = parse_handbrake_progress(line).unwrap();
+        assert!((p.percent - 98.0).abs() < 0.001);
+        assert_eq!(p.fps, 0.0);
+        assert_eq!(p.avg_fps, 0.0);
+        assert_eq!(p.eta, "");
     }
 }

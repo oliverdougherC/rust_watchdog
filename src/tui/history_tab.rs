@@ -1,28 +1,19 @@
 use crate::db::{TranscodeRecord, WatchdogDb};
-use crate::tui::widgets::status_color;
+use crate::tui::widgets::status_color_for_outcome;
 use crate::util::{format_bytes, format_bytes_signed};
 use ratatui::{
-    layout::{Constraint, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
 
+#[derive(Default)]
 pub struct HistoryTabState {
     pub table_state: TableState,
     pub records: Vec<TranscodeRecord>,
     pub total_records: usize,
-}
-
-impl Default for HistoryTabState {
-    fn default() -> Self {
-        Self {
-            table_state: TableState::default(),
-            records: Vec::new(),
-            total_records: 0,
-        }
-    }
 }
 
 impl HistoryTabState {
@@ -60,6 +51,11 @@ impl HistoryTabState {
 }
 
 pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(6)])
+        .split(area);
+
     let header_cells = [
         "Status", "File", "Codec", "Original", "Output", "Saved", "Duration", "Time",
     ]
@@ -78,8 +74,12 @@ pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState
         .records
         .iter()
         .map(|record| {
-            let status_str = if record.success { "OK" } else { "FAIL" };
-            let color = status_color(record.success);
+            let status_str = match record.outcome {
+                crate::db::TranscodeOutcome::Replaced => "OK",
+                crate::db::TranscodeOutcome::SkippedNoSavings => "SKIP",
+                crate::db::TranscodeOutcome::Failed => "FAIL",
+            };
+            let color = status_color_for_outcome(record.outcome);
 
             let filename = std::path::Path::new(&record.source_path)
                 .file_name()
@@ -101,11 +101,11 @@ pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState
                 .unwrap_or_else(|| "-".to_string());
             let saved = record
                 .space_saved
-                .map(|s| format_bytes_signed(s))
+                .map(format_bytes_signed)
                 .unwrap_or_else(|| "-".to_string());
             let duration = record
                 .duration_seconds
-                .map(|d| crate::util::format_duration(d))
+                .map(crate::util::format_duration)
                 .unwrap_or_else(|| "-".to_string());
             let time = record
                 .completed_at
@@ -173,5 +173,36 @@ pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState
                 .add_modifier(Modifier::REVERSED),
         );
 
-    f.render_stateful_widget(table, area, &mut tab_state.table_state);
+    f.render_stateful_widget(table, chunks[0], &mut tab_state.table_state);
+
+    let details = tab_state
+        .table_state
+        .selected()
+        .and_then(|idx| tab_state.records.get(idx))
+        .map(render_details)
+        .unwrap_or_else(|| "No history selected".to_string());
+    let details_widget = Paragraph::new(details).block(
+        Block::default()
+            .title(" Details ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(details_widget, chunks[1]);
+}
+
+fn render_details(record: &TranscodeRecord) -> String {
+    let outcome = match record.outcome {
+        crate::db::TranscodeOutcome::Replaced => "replaced",
+        crate::db::TranscodeOutcome::SkippedNoSavings => "skipped_no_savings",
+        crate::db::TranscodeOutcome::Failed => "failed",
+    };
+    format!(
+        "Path: {}\nOutcome: {}  Code: {}\nFailure: {}\nStarted: {}\nCompleted: {}",
+        record.source_path,
+        outcome,
+        record.failure_code.as_deref().unwrap_or("-"),
+        record.failure_reason.as_deref().unwrap_or("-"),
+        record.started_at.as_deref().unwrap_or("-"),
+        record.completed_at.as_deref().unwrap_or("-")
+    )
 }

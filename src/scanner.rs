@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::traits::{FileEntry, FileSystem};
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::{info, trace, warn};
 use walkdir::WalkDir;
@@ -15,6 +16,10 @@ impl FileSystem for RealFileSystem {
         extensions: &[String],
     ) -> Result<Vec<FileEntry>> {
         let mut entries = Vec::new();
+        let ext_set: HashSet<String> = extensions
+            .iter()
+            .map(|ext| ext.trim().to_lowercase())
+            .collect();
 
         info!("Scanning share '{}' at {}", share_name, root.display());
 
@@ -49,10 +54,8 @@ impl FileSystem for RealFileSystem {
             let ext_match = path
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| {
-                    let dot_ext = format!(".{}", e.to_lowercase());
-                    extensions.iter().any(|ext| ext.to_lowercase() == dot_ext)
-                })
+                .map(|e| format!(".{}", e.to_lowercase()))
+                .map(|dot_ext| ext_set.contains(&dot_ext))
                 .unwrap_or(false);
 
             if !ext_match {
@@ -131,5 +134,39 @@ impl FileSystem for RealFileSystem {
     fn create_dir_all(&self, path: &Path) -> Result<()> {
         std::fs::create_dir_all(path)?;
         Ok(())
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<std::path::PathBuf>> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            entries.push(entry.path());
+        }
+        Ok(entries)
+    }
+
+    fn walk_files_with_suffix(&self, root: &Path, suffix: &str) -> Result<Vec<std::path::PathBuf>> {
+        let mut matches = Vec::new();
+        for entry in WalkDir::new(root).follow_links(false).into_iter() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Error walking directory {}: {}", root.display(), e);
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if entry
+                .path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+            {
+                matches.push(entry.path().to_path_buf());
+            }
+        }
+        Ok(matches)
     }
 }

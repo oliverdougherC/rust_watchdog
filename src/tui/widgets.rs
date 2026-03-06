@@ -1,3 +1,4 @@
+use crate::db::TranscodeOutcome;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -90,11 +91,10 @@ pub fn log_level_color(line: &str) -> Color {
     }
 }
 
-/// Color for transcode history status.
-pub fn status_color(success: bool) -> Color {
-    if success {
-        Color::Green
-    } else {
-        Color::Red
+pub fn status_color_for_outcome(outcome: TranscodeOutcome) -> Color {
+    match outcome {
+        TranscodeOutcome::Replaced => Color::Green,
+        TranscodeOutcome::SkippedNoSavings => Color::Yellow,
+        TranscodeOutcome::Failed => Color::Red,
     }
 }

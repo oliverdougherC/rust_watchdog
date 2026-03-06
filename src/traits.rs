@@ -1,5 +1,7 @@
 use crate::error::Result;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Metadata about a discovered media file.
@@ -50,6 +52,13 @@ pub struct TransferResult {
     pub success: bool,
 }
 
+/// Result of checking whether a media file is currently in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InUseStatus {
+    InUse,
+    NotInUse,
+}
+
 /// Abstracts filesystem operations: walking directories, stat, rename, remove, free space.
 pub trait FileSystem: Send + Sync {
     /// Walk a directory and return all video file entries for a given share.
@@ -83,6 +92,12 @@ pub trait FileSystem: Send + Sync {
 
     /// Create directories recursively.
     fn create_dir_all(&self, path: &Path) -> Result<()>;
+
+    /// List direct entries in a directory.
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
+
+    /// Recursively find files ending in the given suffix.
+    fn walk_files_with_suffix(&self, root: &Path, suffix: &str) -> Result<Vec<PathBuf>>;
 }
 
 /// Abstracts ffprobe execution.
@@ -99,6 +114,7 @@ pub trait Transcoder: Send + Sync {
     /// Run HandBrakeCLI with the given input/output paths.
     /// Progress updates are sent via the provided channel.
     /// Returns when the transcode completes or times out.
+    #[allow(clippy::too_many_arguments)]
     fn transcode(
         &self,
         input: &Path,
@@ -107,6 +123,7 @@ pub trait Transcoder: Send + Sync {
         preset_name: &str,
         timeout_secs: u64,
         progress_tx: mpsc::Sender<TranscodeProgress>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<TranscodeResult>;
 }
 
@@ -129,4 +146,9 @@ pub trait MountManager: Send + Sync {
         local_mount: &Path,
         share_name: &str,
     ) -> Result<bool>;
+}
+
+/// Detect whether a file is currently opened by another process.
+pub trait InUseDetector: Send + Sync {
+    fn check_in_use(&self, path: &Path) -> Result<InUseStatus>;
 }

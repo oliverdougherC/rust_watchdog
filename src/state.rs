@@ -7,6 +7,7 @@ use tokio::sync::watch;
 pub enum PipelinePhase {
     Idle,
     Scanning,
+    Paused,
     Transcoding,
     Waiting,
 }
@@ -16,6 +17,7 @@ impl std::fmt::Display for PipelinePhase {
         match self {
             PipelinePhase::Idle => write!(f, "Idle"),
             PipelinePhase::Scanning => write!(f, "Scanning"),
+            PipelinePhase::Paused => write!(f, "Paused"),
             PipelinePhase::Transcoding => write!(f, "Transcoding"),
             PipelinePhase::Waiting => write!(f, "Waiting"),
         }
@@ -48,6 +50,15 @@ pub struct AppState {
     pub run_transcoded: u64,
     pub run_failures: u64,
     pub run_space_saved: i64,
+    pub run_skipped_inspected: u64,
+    pub run_skipped_young: u64,
+    pub run_skipped_cooldown: u64,
+    pub run_skipped_filtered: u64,
+    pub run_skipped_in_use: u64,
+
+    // Failure insights
+    pub top_failure_reasons: Vec<(String, u64)>,
+    pub share_health: Vec<(String, bool)>,
 
     // Timing
     pub last_pass_time: Option<DateTime<Utc>>,
@@ -76,6 +87,13 @@ impl Default for AppState {
             run_transcoded: 0,
             run_failures: 0,
             run_space_saved: 0,
+            run_skipped_inspected: 0,
+            run_skipped_young: 0,
+            run_skipped_cooldown: 0,
+            run_skipped_filtered: 0,
+            run_skipped_in_use: 0,
+            top_failure_reasons: Vec::new(),
+            share_health: Vec::new(),
             last_pass_time: None,
             log_lines: VecDeque::with_capacity(500),
         }
@@ -86,6 +104,7 @@ const MAX_LOG_LINES: usize = 500;
 
 /// Manages shared state between the pipeline task and the TUI task
 /// using a `tokio::sync::watch` channel.
+#[derive(Clone)]
 pub struct StateManager {
     tx: watch::Sender<AppState>,
 }
@@ -155,6 +174,13 @@ impl StateManager {
         });
     }
 
+    /// Set per-share health snapshot.
+    pub fn set_share_health(&self, share_health: Vec<(String, bool)>) {
+        self.tx.send_modify(|state| {
+            state.share_health = share_health;
+        });
+    }
+
     /// Record the completion of a pass.
     pub fn set_last_pass_time(&self) {
         self.tx.send_modify(|state| {
@@ -165,5 +191,10 @@ impl StateManager {
     /// Subscribe to state changes.
     pub fn subscribe(&self) -> watch::Receiver<AppState> {
         self.tx.subscribe()
+    }
+
+    /// Get a snapshot of the current state.
+    pub fn snapshot(&self) -> AppState {
+        self.tx.borrow().clone()
     }
 }

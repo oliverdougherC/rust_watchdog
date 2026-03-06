@@ -12,6 +12,40 @@ pub struct LogsTabState {
     pub list_state: ListState,
     pub auto_scroll: bool,
     pub total_lines: usize,
+    pub filter: LogFilter,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LogFilter {
+    All,
+    WarnAndError,
+    ErrorOnly,
+}
+
+impl LogFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::WarnAndError,
+            Self::WarnAndError => Self::ErrorOnly,
+            Self::ErrorOnly => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::WarnAndError => "warn+error",
+            Self::ErrorOnly => "error",
+        }
+    }
+
+    fn keep(self, line: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::WarnAndError => line.contains("WARN") || line.contains("ERROR"),
+            Self::ErrorOnly => line.contains("ERROR") || line.contains("CRITICAL"),
+        }
+    }
 }
 
 impl Default for LogsTabState {
@@ -20,6 +54,7 @@ impl Default for LogsTabState {
             list_state: ListState::default(),
             auto_scroll: true,
             total_lines: 0,
+            filter: LogFilter::All,
         }
     }
 }
@@ -55,23 +90,33 @@ impl LogsTabState {
             self.list_state.select(Some(self.total_lines - 1));
         }
     }
+
+    pub fn cycle_filter(&mut self) {
+        self.filter = self.filter.next();
+        self.auto_scroll = true;
+    }
 }
 
 pub fn render_logs(f: &mut Frame, area: Rect, state: &AppState, tab_state: &mut LogsTabState) {
     let block = Block::default()
-        .title(" Logs ")
+        .title(format!(" Logs [{} | f:filter] ", tab_state.filter.label()))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
-    tab_state.total_lines = state.log_lines.len();
+    let filtered: Vec<String> = state
+        .log_lines
+        .iter()
+        .filter(|line| tab_state.filter.keep(line))
+        .cloned()
+        .collect();
+    tab_state.total_lines = filtered.len();
 
     // Auto-scroll to bottom if enabled
-    if tab_state.auto_scroll && !state.log_lines.is_empty() {
-        tab_state.list_state.select(Some(state.log_lines.len() - 1));
+    if tab_state.auto_scroll && !filtered.is_empty() {
+        tab_state.list_state.select(Some(filtered.len() - 1));
     }
 
-    let items: Vec<ListItem> = state
-        .log_lines
+    let items: Vec<ListItem> = filtered
         .iter()
         .map(|line| {
             let color = log_level_color(line);

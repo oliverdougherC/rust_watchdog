@@ -23,8 +23,28 @@ min_free_space_multiplier = 2.0
 [scan]
 video_extensions = [".mkv", ".mp4", ".avi", ".mov", ".webm"]
 interval_seconds = 300
+include_globs = []
+exclude_globs = []
+max_files_per_pass = 0
+probe_workers = 0
+
+[safety]
+min_file_age_seconds = 0
+pause_file = "watchdog.pause"
+max_failures_before_cooldown = 3
+cooldown_base_seconds = 300
+cooldown_max_seconds = 86400
+in_use_guard_enabled = false
+in_use_guard_command = "lsof"
+recovery_scan_interval_seconds = 43200
+
+[notify]
+webhook_url = ""
+events = ["pass_failure_summary", "replacement_summary", "cooldown_alert"]
+timeout_seconds = 5
 
 [paths]
 transcode_temp = "/Volumes/External/tmp/"
 database = "watchdog.db"
 log_dir = "logs"
+status_snapshot = ""

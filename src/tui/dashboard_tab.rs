@@ -39,6 +39,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     let phase_color = match state.phase {
         crate::state::PipelinePhase::Idle => Color::Gray,
         crate::state::PipelinePhase::Scanning => Color::Yellow,
+        crate::state::PipelinePhase::Paused => Color::LightYellow,
         crate::state::PipelinePhase::Transcoding => Color::Green,
         crate::state::PipelinePhase::Waiting => Color::Blue,
     };
@@ -184,6 +185,7 @@ fn render_current_transcode(f: &mut Frame, area: Rect, state: &AppState) {
         let msg = match state.phase {
             crate::state::PipelinePhase::Idle => "Idle - no active transcode",
             crate::state::PipelinePhase::Scanning => "Scanning media libraries...",
+            crate::state::PipelinePhase::Paused => "Paused (pause file present)",
             crate::state::PipelinePhase::Waiting => "Waiting for next scan interval...",
             _ => "Preparing...",
         };
@@ -208,20 +210,46 @@ fn render_recent_activity(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(block, area);
 
     let max_lines = inner.height as usize;
-    let start = state.log_lines.len().saturating_sub(max_lines);
+    let mut header_lines = Vec::new();
+    header_lines.push(format!(
+        "Skipped this pass: inspected={} young={} cooldown={} filtered={} in_use={}",
+        state.run_skipped_inspected,
+        state.run_skipped_young,
+        state.run_skipped_cooldown,
+        state.run_skipped_filtered,
+        state.run_skipped_in_use
+    ));
+    if !state.top_failure_reasons.is_empty() {
+        let summary = state
+            .top_failure_reasons
+            .iter()
+            .map(|(reason, count)| format!("{} ({})", reason, count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        header_lines.push(format!("Top failure reasons: {}", summary));
+    }
 
-    let items: Vec<ListItem> = state
-        .log_lines
-        .iter()
-        .skip(start)
+    let reserved = header_lines.len();
+    let log_capacity = max_lines.saturating_sub(reserved);
+    let start = state.log_lines.len().saturating_sub(log_capacity);
+
+    let mut items: Vec<ListItem> = header_lines
+        .into_iter()
         .map(|line| {
-            let color = crate::tui::widgets::log_level_color(line);
             ListItem::new(Line::from(Span::styled(
-                line.clone(),
-                Style::default().fg(color),
+                line,
+                Style::default().fg(Color::Yellow),
             )))
         })
         .collect();
+
+    items.extend(state.log_lines.iter().skip(start).map(|line| {
+        let color = crate::tui::widgets::log_level_color(line);
+        ListItem::new(Line::from(Span::styled(
+            line.clone(),
+            Style::default().fg(color),
+        )))
+    }));
 
     f.render_widget(List::new(items), inner);
 }

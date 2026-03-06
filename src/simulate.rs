@@ -1,10 +1,13 @@
 use crate::config::Config;
 use crate::error::Result;
+use crate::in_use::SimulatedInUseDetector;
 use crate::pipeline::PipelineDeps;
 use crate::traits::*;
-use rand::Rng;
-use std::collections::HashMap;
+use rand::{Rng, SeedableRng};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
@@ -25,12 +28,28 @@ struct SimFile {
 pub struct SimulatedFileSystem {
     files: Mutex<HashMap<String, Vec<SimFile>>>,
     temp_files: Mutex<HashMap<PathBuf, SimFile>>,
+    share_roots: HashMap<String, PathBuf>,
+    directories: Mutex<HashSet<PathBuf>>,
 }
 
 impl SimulatedFileSystem {
     pub fn new(config: &Config) -> Self {
-        let mut rng = rand::thread_rng();
+        let seed = std::env::var("WATCHDOG_SIM_SEED")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(rand::random);
+        Self::new_with_seed(config, seed)
+    }
+
+    pub fn new_with_seed(config: &Config, seed: u64) -> Self {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut files = HashMap::new();
+        let mut share_roots = HashMap::new();
+        let mut directories = HashSet::new();
+        let fixed_files_per_share = std::env::var("WATCHDOG_SIM_MAX_FILES_PER_SHARE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0);
 
         let codecs = ["h264", "hevc", "mpeg4", "av1"];
         let movie_names = [
@@ -81,7 +100,10 @@ impl SimulatedFileSystem {
 
         for share in &config.shares {
             let mut share_files = Vec::new();
-            let num_files = rng.gen_range(50..=200);
+            let share_root = PathBuf::from(&share.local_mount);
+            directories.insert(share_root.clone());
+            share_roots.insert(share.name.clone(), share_root);
+            let num_files = fixed_files_per_share.unwrap_or_else(|| rng.gen_range(50..=200));
 
             for i in 0..num_files {
                 let (name, subdir) = if share.name == "tv" {
@@ -115,6 +137,9 @@ impl SimulatedFileSystem {
                 let path = PathBuf::from(&share.local_mount)
                     .join(&subdir)
                     .join(format!("{}{}", name, ext));
+                if let Some(parent) = path.parent() {
+                    directories.insert(parent.to_path_buf());
+                }
 
                 let audio_streams = rng.gen_range(1..=3);
                 let subtitle_streams = rng.gen_range(0..=5);
@@ -137,6 +162,8 @@ impl SimulatedFileSystem {
         Self {
             files: Mutex::new(files),
             temp_files: Mutex::new(HashMap::new()),
+            share_roots,
+            directories: Mutex::new(directories),
         }
     }
 
@@ -155,6 +182,53 @@ impl SimulatedFileSystem {
         // Check temp files
         let temp = self.temp_files.lock().unwrap();
         temp.get(path).cloned()
+    }
+
+    fn find_share_for_path(&self, path: &Path) -> Option<String> {
+        self.share_roots.iter().find_map(|(name, root)| {
+            if path.starts_with(root) {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn track_directory(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.directories
+                .lock()
+                .unwrap()
+                .insert(parent.to_path_buf());
+        }
+    }
+
+    fn remove_from_shares(&self, path: &Path) -> Option<SimFile> {
+        let mut files = self.files.lock().unwrap();
+        for share_files in files.values_mut() {
+            if let Some(idx) = share_files.iter().position(|f| f.path == path) {
+                return Some(share_files.remove(idx));
+            }
+        }
+        None
+    }
+
+    fn insert_path(&self, mut file: SimFile, path: &Path) {
+        file.path = path.to_path_buf();
+        self.track_directory(path);
+        if let Some(share) = self.find_share_for_path(path) {
+            self.files
+                .lock()
+                .unwrap()
+                .entry(share)
+                .or_default()
+                .push(file);
+        } else {
+            self.temp_files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), file);
+        }
     }
 }
 
@@ -201,16 +275,38 @@ impl FileSystem for SimulatedFileSystem {
         self.find_file(path).is_some()
     }
 
-    fn is_dir(&self, _path: &Path) -> bool {
-        true // All share roots "exist" in simulation
+    fn is_dir(&self, path: &Path) -> bool {
+        if self.directories.lock().unwrap().contains(path) {
+            return true;
+        }
+        if self.share_roots.values().any(|root| root == path) {
+            return true;
+        }
+        self.find_file(path).is_some()
     }
 
-    fn rename(&self, _from: &Path, _to: &Path) -> Result<()> {
-        Ok(()) // No-op in simulation
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let moved = self
+            .remove_from_shares(from)
+            .or_else(|| self.temp_files.lock().unwrap().remove(from));
+
+        match moved {
+            Some(mut file) => {
+                file.mtime += 1.0;
+                self.insert_path(file, to);
+                Ok(())
+            }
+            None => Err(crate::error::WatchdogError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "simulated file not found",
+            ))),
+        }
     }
 
     fn remove(&self, path: &Path) -> Result<()> {
-        self.temp_files.lock().unwrap().remove(path);
+        if self.remove_from_shares(path).is_none() {
+            self.temp_files.lock().unwrap().remove(path);
+        }
         Ok(())
     }
 
@@ -218,8 +314,60 @@ impl FileSystem for SimulatedFileSystem {
         Ok(500_000_000_000) // 500 GB
     }
 
-    fn create_dir_all(&self, _path: &Path) -> Result<()> {
+    fn create_dir_all(&self, path: &Path) -> Result<()> {
+        self.directories.lock().unwrap().insert(path.to_path_buf());
         Ok(())
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let files = self.files.lock().unwrap();
+        for share_files in files.values() {
+            for file in share_files {
+                if file.path.parent() == Some(path) {
+                    out.push(file.path.clone());
+                }
+            }
+        }
+        drop(files);
+        let temp_files = self.temp_files.lock().unwrap();
+        for temp_path in temp_files.keys() {
+            if temp_path.parent() == Some(path) {
+                out.push(temp_path.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    fn walk_files_with_suffix(&self, root: &Path, suffix: &str) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let files = self.files.lock().unwrap();
+        for share_files in files.values() {
+            for file in share_files {
+                if file.path.starts_with(root)
+                    && file
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name.ends_with(suffix))
+                {
+                    out.push(file.path.clone());
+                }
+            }
+        }
+        drop(files);
+        let temp_files = self.temp_files.lock().unwrap();
+        for temp_path in temp_files.keys() {
+            if temp_path.starts_with(root)
+                && temp_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.ends_with(suffix))
+            {
+                out.push(temp_path.clone());
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -289,6 +437,7 @@ impl Transcoder for SimulatedTranscoder {
         _preset_name: &str,
         _timeout_secs: u64,
         progress_tx: mpsc::Sender<TranscodeProgress>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<TranscodeResult> {
         let mut rng = rand::thread_rng();
 
@@ -302,6 +451,13 @@ impl Transcoder for SimulatedTranscoder {
         let step_duration = std::time::Duration::from_millis(duration_ms / steps);
 
         for i in 1..=steps {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(crate::error::WatchdogError::TranscodeCancelled {
+                    path: input.to_path_buf(),
+                    reason: "cancel signal received".to_string(),
+                });
+            }
+
             let percent = (i as f64 / steps as f64) * 100.0;
             let fps = rng.gen_range(5.0..=30.0);
             let avg_fps = rng.gen_range(8.0..=25.0);
@@ -448,6 +604,7 @@ pub fn create_simulated_deps(config: &Config) -> PipelineDeps {
         transcoder: Box::new(SimulatedTranscoder::new(fs.clone())),
         transfer: Box::new(SimulatedTransfer::new(fs.clone())),
         mount_manager: Box::new(SimulatedMountManager),
+        in_use_detector: Box::new(SimulatedInUseDetector),
     }
 }
 
@@ -486,5 +643,11 @@ impl FileSystem for SimulatedFileSystemWrapper {
     }
     fn create_dir_all(&self, path: &Path) -> Result<()> {
         self.0.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        self.0.list_dir(path)
+    }
+    fn walk_files_with_suffix(&self, root: &Path, suffix: &str) -> Result<Vec<PathBuf>> {
+        self.0.walk_files_with_suffix(root, suffix)
     }
 }

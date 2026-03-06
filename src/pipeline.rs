@@ -1,20 +1,126 @@
 use crate::config::Config;
-use crate::db::WatchdogDb;
+use crate::db::{TranscodeOutcome, WatchdogDb};
 use crate::error::{Result, WatchdogError};
 use crate::nfs::ensure_all_mounts;
+use crate::notify::{send_webhook, NotifyEvent};
 use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval};
 use crate::state::{PipelinePhase, StateManager};
 use crate::stats::RunStats;
 use crate::traits::*;
-use crate::transfer::safe_replace;
+use crate::transfer::{safe_replace, WATCHDOG_OLD_SUFFIX, WATCHDOG_TMP_SUFFIX};
 use crate::util::{format_bytes, format_bytes_signed};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde_json::json;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
+
+const CANCEL_NONE: u8 = 0;
+const CANCEL_SHUTDOWN: u8 = 1;
+const CANCEL_PAUSE: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    Inspected,
+    Young,
+    Cooldown,
+    Filtered,
+    InUse,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FailureCode {
+    TransferFailedRequeued,
+    TransferErrorRequeued,
+    TransferFailed,
+    TransferError,
+    InsufficientTempSpace,
+    TimeoutRequeued,
+    TimeoutExhausted,
+    InterruptedShutdown,
+    InterruptedPause,
+    Interrupted,
+    TranscodeError,
+    TranscodeFailed,
+    OutputMissing,
+    OutputZeroBytes,
+    VerificationFailed,
+    VerificationError,
+    OutputSuspiciouslySmall,
+    InsufficientNfsSpace,
+    SourceChangedDuringTranscode,
+    FileInUse,
+    SafeReplaceFailed,
+    SafeReplaceError,
+}
+
+impl FailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TransferFailedRequeued => "transfer_failed_requeued",
+            Self::TransferErrorRequeued => "transfer_error_requeued",
+            Self::TransferFailed => "transfer_failed",
+            Self::TransferError => "transfer_error",
+            Self::InsufficientTempSpace => "insufficient_temp_space",
+            Self::TimeoutRequeued => "timeout_requeued",
+            Self::TimeoutExhausted => "timeout_exhausted",
+            Self::InterruptedShutdown => "interrupted_shutdown",
+            Self::InterruptedPause => "interrupted_pause",
+            Self::Interrupted => "interrupted",
+            Self::TranscodeError => "transcode_error",
+            Self::TranscodeFailed => "transcode_failed",
+            Self::OutputMissing => "output_missing",
+            Self::OutputZeroBytes => "output_zero_bytes",
+            Self::VerificationFailed => "verification_failed",
+            Self::VerificationError => "verification_error",
+            Self::OutputSuspiciouslySmall => "output_suspiciously_small",
+            Self::InsufficientNfsSpace => "insufficient_nfs_space",
+            Self::SourceChangedDuringTranscode => "source_changed_during_transcode",
+            Self::FileInUse => "file_in_use",
+            Self::SafeReplaceFailed => "safe_replace_failed",
+            Self::SafeReplaceError => "safe_replace_error",
+        }
+    }
+}
+
+struct GlobMatcher {
+    path_set: Option<GlobSet>,
+    basename_set: Option<GlobSet>,
+}
+
+#[derive(Debug)]
+struct QueueCandidate {
+    size: u64,
+    seq: u64,
+    entry: FileEntry,
+    eval: TranscodeEval,
+}
+
+impl PartialEq for QueueCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.size == other.size && self.seq == other.seq
+    }
+}
+
+impl Eq for QueueCandidate {}
+
+impl PartialOrd for QueueCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueueCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.size.cmp(&other.size).then(self.seq.cmp(&other.seq))
+    }
+}
 
 /// Log a formatted message to both tracing and the TUI state log.
 fn tui_log(state: &StateManager, level: &str, msg: &str) {
@@ -29,6 +135,7 @@ pub struct PipelineDeps {
     pub transcoder: Box<dyn Transcoder>,
     pub transfer: Box<dyn FileTransfer>,
     pub mount_manager: Box<dyn MountManager>,
+    pub in_use_detector: Box<dyn InUseDetector>,
 }
 
 /// Run a single watchdog pass: scan, filter, transcode, replace.
@@ -60,8 +167,19 @@ pub async fn run_watchdog_pass(
         s.run_transcoded = 0;
         s.run_failures = 0;
         s.run_space_saved = 0;
+        s.run_skipped_inspected = 0;
+        s.run_skipped_young = 0;
+        s.run_skipped_cooldown = 0;
+        s.run_skipped_filtered = 0;
+        s.run_skipped_in_use = 0;
     });
     tui_log(state, "INFO", "Starting watchdog scan pass");
+
+    if is_pause_requested(config, base_dir) {
+        state.set_phase(PipelinePhase::Paused);
+        tui_log(state, "WARN", "Pause file present; pausing pipeline");
+        return Err(WatchdogError::Paused);
+    }
 
     // Ensure NFS mounts
     let shares: Vec<(String, String, String)> = config
@@ -71,18 +189,21 @@ pub async fn run_watchdog_pass(
         .collect();
 
     ensure_all_mounts(deps.mount_manager.as_ref(), &config.nfs.server, &shares)?;
-    state.set_nfs_healthy(true);
+    let share_health = config
+        .shares
+        .iter()
+        .map(|share| {
+            let healthy = deps.mount_manager.is_healthy(Path::new(&share.local_mount));
+            (share.name.clone(), healthy)
+        })
+        .collect::<Vec<_>>();
+    state.set_share_health(share_health.clone());
+    state.set_nfs_healthy(share_health.iter().all(|(_, healthy)| *healthy));
     tui_log(
         state,
         "INFO",
         &format!("NFS mounts verified ({} shares)", shares.len()),
     );
-
-    // Recover orphaned .old files from previous crashes.
-    // If a crash occurred between rename(original→.old) and rename(.tmp→original),
-    // the original file is stranded at .old while the source path is gone.
-    // Scan each share for .old files whose original path is missing and restore them.
-    recover_orphaned_files(deps.fs.as_ref(), config, state);
 
     // Prepare paths
     let preset_path = config.resolve_path(base_dir, &config.transcode.preset_file);
@@ -91,16 +212,20 @@ pub async fn run_watchdog_pass(
 
     // Clean up stale temp files from previous crashes (e.g., leftover .av1.* or source copies).
     // Only clean files we own (prefixed with a share name + underscore).
-    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
+    if let Ok(entries) = deps.fs.list_dir(&temp_dir) {
+        for path in entries {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(ToString::to_string)
+                .unwrap_or_default();
             let is_ours = config
                 .shares
                 .iter()
                 .any(|s| name.starts_with(&format!("{}_", s.name)));
             if is_ours {
                 info!("Cleaning stale temp file from previous run: {}", name);
-                let _ = std::fs::remove_file(entry.path());
+                let _ = deps.fs.remove(&path);
             }
         }
     }
@@ -128,18 +253,160 @@ pub async fn run_watchdog_pass(
         share_scan_jobs.push((share.name.clone(), mount_path.to_path_buf()));
     }
 
-    let mut all_entries = scan_shares_parallel(
+    let include_globs = build_glob_matcher(&config.scan.include_globs)?;
+    let exclude_globs = build_glob_matcher(&config.scan.exclude_globs)?;
+    let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
+    let now_ts = chrono::Utc::now().timestamp();
+    let queue_cap = if config.scan.max_files_per_pass > 0 {
+        Some(config.scan.max_files_per_pass as usize)
+    } else {
+        None
+    };
+
+    // Filter out already-inspected files and build transcode queue
+    let mut transcode_queue: Vec<(FileEntry, TranscodeEval)> = Vec::new();
+    let mut capped_queue: Option<BinaryHeap<Reverse<QueueCandidate>>> =
+        queue_cap.map(|_| BinaryHeap::new());
+    let mut queue_seq: u64 = 0;
+    let mut total_transcode_candidates = 0u64;
+    let mut pending_inspected: Vec<(String, u64, f64)> = Vec::new();
+    let mut discovered_count = 0usize;
+    let mut duplicate_count = 0usize;
+    let mut last_scan_log = Instant::now();
+    let mut probe_batch: Vec<FileEntry> = Vec::new();
+    let mut seen_paths = HashSet::<PathBuf>::new();
+
+    let worker_count = if config.scan.probe_workers > 0 {
+        config.scan.probe_workers as usize
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+    .max(1);
+    info!("Probing with {} parallel worker(s)", worker_count);
+    tui_log(
+        state,
+        "INFO",
+        &format!("Probing with {} parallel worker(s)", worker_count),
+    );
+
+    const PROBE_BATCH_SIZE: usize = 512;
+    let scanned_shares = scan_shares_parallel(
         deps.fs.as_ref(),
         &share_scan_jobs,
         &config.scan.video_extensions,
     )?;
+    for (_share_name, entries) in scanned_shares {
+        for entry in entries {
+            discovered_count += 1;
+            let scanned = discovered_count;
+            state.set_queue_info(scanned as u32, scanned as u32);
+            if scanned == 1 || last_scan_log.elapsed().as_secs() >= 2 {
+                tui_log(
+                    state,
+                    "INFO",
+                    &format!(
+                        "Scanning: {} files (pending probe: {}, inspected this pass: {})",
+                        scanned,
+                        probe_batch.len(),
+                        stats.files_inspected
+                    ),
+                );
+                last_scan_log = Instant::now();
+            }
 
-    if all_entries.is_empty() {
+            if shutdown_rx.try_recv().is_ok() {
+                return Err(WatchdogError::Shutdown);
+            }
+            if is_pause_requested(config, base_dir) {
+                state.set_phase(PipelinePhase::Paused);
+                tui_log(state, "WARN", "Pause file detected during scan; pausing");
+                return Err(WatchdogError::Paused);
+            }
+
+            if !seen_paths.insert(entry.path.clone()) {
+                duplicate_count += 1;
+                continue;
+            }
+
+            if !path_matches_filters(&entry.path, include_globs.as_ref(), exclude_globs.as_ref()) {
+                increment_skip_counter(state, SkipReason::Filtered);
+                continue;
+            }
+
+            let file_age_secs = (now_ts as f64 - entry.mtime).max(0.0);
+            if file_age_secs < config.safety.min_file_age_seconds as f64 {
+                increment_skip_counter(state, SkipReason::Young);
+                continue;
+            }
+
+            let path_string = entry.path.to_string_lossy().to_string();
+            if let Some(failure_state) = db.get_file_failure_state(&path_string) {
+                if failure_state.next_eligible_at > now_ts {
+                    increment_skip_counter(state, SkipReason::Cooldown);
+                    continue;
+                }
+            }
+
+            let path_str = entry.path.to_string_lossy();
+            if db.is_inspected(&path_str, entry.size, entry.mtime) {
+                increment_skip_counter(state, SkipReason::Inspected);
+                continue;
+            }
+
+            probe_batch.push(entry);
+            if probe_batch.len() >= PROBE_BATCH_SIZE {
+                process_probe_batch(
+                    &mut probe_batch,
+                    deps.prober.as_ref(),
+                    config,
+                    state,
+                    &mut shutdown_rx,
+                    worker_count,
+                    &mut stats,
+                    &mut transcode_queue,
+                    &mut capped_queue,
+                    &mut queue_seq,
+                    &mut total_transcode_candidates,
+                    &mut pending_inspected,
+                    queue_cap,
+                )?;
+            }
+        }
+    }
+
+    if !probe_batch.is_empty() {
+        process_probe_batch(
+            &mut probe_batch,
+            deps.prober.as_ref(),
+            config,
+            state,
+            &mut shutdown_rx,
+            worker_count,
+            &mut stats,
+            &mut transcode_queue,
+            &mut capped_queue,
+            &mut queue_seq,
+            &mut total_transcode_candidates,
+            &mut pending_inspected,
+            queue_cap,
+        )?;
+    }
+
+    if discovered_count == 0 {
         if available_shares == 0 {
             return Err(WatchdogError::NoMediaDirectories);
         }
         info!("No media files found across healthy shares; ending pass");
         tui_log(state, "INFO", "No media files found this pass");
+        let top_reasons = db.get_top_failure_reasons(3);
+        state.update(|s| {
+            s.top_failure_reasons = top_reasons
+                .iter()
+                .map(|(reason, count)| (reason.clone(), *count as u64))
+                .collect();
+        });
         state.set_phase(PipelinePhase::Idle);
         state.set_last_pass_time();
         state.set_current_file(None);
@@ -147,11 +414,6 @@ pub async fn run_watchdog_pass(
         return Ok(stats);
     }
 
-    // Defensive dedupe: avoid scanning/queueing duplicates if a path appears in multiple roots.
-    let mut seen_paths = HashSet::<PathBuf>::new();
-    let before_dedupe = all_entries.len();
-    all_entries.retain(|entry| seen_paths.insert(entry.path.clone()));
-    let duplicate_count = before_dedupe.saturating_sub(all_entries.len());
     if duplicate_count > 0 {
         warn!(
             "Skipped {} duplicate discovered path(s) during scan",
@@ -164,116 +426,29 @@ pub async fn run_watchdog_pass(
         );
     }
 
-    // Filter out already-inspected files and build transcode queue
-    let mut transcode_queue: Vec<(FileEntry, TranscodeEval)> = Vec::new();
-    let discovered_count = all_entries.len();
-    let mut last_scan_log = Instant::now();
-    let mut probe_candidates: Vec<FileEntry> = Vec::new();
-
-    for (idx, entry) in all_entries.iter().enumerate() {
-        let scanned = idx + 1;
-        state.set_queue_info(scanned as u32, discovered_count as u32);
-        if scanned == 1 || scanned == discovered_count || last_scan_log.elapsed().as_secs() >= 2 {
-            tui_log(
-                state,
-                "INFO",
-                &format!(
-                    "Scanning: {}/{} files (pending probe: {}, inspected this pass: {})",
-                    scanned,
-                    discovered_count,
-                    probe_candidates.len(),
-                    stats.files_inspected
-                ),
-            );
-            last_scan_log = Instant::now();
-        }
-
-        // Check shutdown
-        if shutdown_rx.try_recv().is_ok() {
-            return Err(WatchdogError::Shutdown);
-        }
-
-        let path_str = entry.path.to_string_lossy();
-        if db.is_inspected(&path_str, entry.size, entry.mtime) {
-            continue;
-        }
-        probe_candidates.push(entry.clone());
+    if let Some(heap) = capped_queue.take() {
+        transcode_queue = heap
+            .into_iter()
+            .map(|Reverse(candidate)| (candidate.entry, candidate.eval))
+            .collect();
     }
 
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1);
-    info!(
-        "Probing {} file(s) with {} parallel worker(s)",
-        probe_candidates.len(),
-        worker_count
-    );
-    tui_log(
-        state,
-        "INFO",
-        &format!(
-            "Probing {} file(s) with {} parallel worker(s)",
-            probe_candidates.len(),
-            worker_count
-        ),
-    );
-
-    let probe_results = probe_candidates_parallel(
-        deps.prober.as_ref(),
-        &probe_candidates,
-        worker_count,
-        &mut shutdown_rx,
-        state,
-    )?;
-
-    for (entry, probe_result) in probe_candidates.into_iter().zip(probe_results.into_iter()) {
-        let path_str = entry.path.to_string_lossy().to_string();
-        stats.files_inspected += 1;
-        state.update(|s| {
-            s.total_inspected += 1;
-            s.run_inspected += 1;
-        });
-
-        match probe_result {
-            None => {
-                warn!(
-                    "Skipping file (probe failed, cannot read metadata): {}",
-                    path_str
-                );
-                tui_log(
-                    state,
-                    "WARN",
-                    &format!("Probe failed, skipping: {}", path_str),
-                );
-            }
-            Some(ref probe) => {
-                let eval = evaluate_transcode_need(probe, &config.transcode);
-                if eval.needs_transcode {
-                    info!("QUEUE: {} (reasons: {})", path_str, eval.reasons.join(", "));
-                    stats.files_queued += 1;
-                    transcode_queue.push((entry, eval));
-                } else {
-                    let bitrate_text = if eval.bitrate_mbps > 0.0 {
-                        format!("{:.2} Mbps", eval.bitrate_mbps)
-                    } else {
-                        "unknown bitrate".to_string()
-                    };
-                    info!(
-                        "PASS: {} (codec={}, bitrate={} <= {:.2} Mbps)",
-                        path_str,
-                        eval.video_codec.as_deref().unwrap_or("unknown"),
-                        bitrate_text,
-                        config.transcode.max_average_bitrate_mbps
-                    );
-                    db.mark_inspected(&path_str, entry.size, entry.mtime);
-                }
-            }
-        }
-    }
+    db.mark_inspected_batch(&pending_inspected);
 
     // Sort queue: largest files first
     transcode_queue.sort_by(|a, b| b.0.size.cmp(&a.0.size));
+    stats.files_queued = transcode_queue.len() as u64;
+
+    if queue_cap.is_some() && total_transcode_candidates > transcode_queue.len() as u64 {
+        tui_log(
+            state,
+            "INFO",
+            &format!(
+                "Queue capped at {} files this pass (from {})",
+                config.scan.max_files_per_pass, total_transcode_candidates
+            ),
+        );
+    }
 
     info!(
         "Discovered {} candidate files before filtering",
@@ -324,6 +499,11 @@ pub async fn run_watchdog_pass(
         if shutdown_rx.try_recv().is_ok() {
             info!("Shutdown requested, stopping pipeline");
             return Err(WatchdogError::Shutdown);
+        }
+        if is_pause_requested(config, base_dir) {
+            info!("Pause file present, stopping pipeline before next item");
+            state.set_phase(PipelinePhase::Paused);
+            return Err(WatchdogError::Paused);
         }
 
         let (entry, eval) = &transcode_queue[idx];
@@ -376,6 +556,21 @@ pub async fn run_watchdog_pass(
             original_size,
         );
 
+        if check_file_in_use_best_effort(
+            config,
+            deps,
+            state,
+            path,
+            &path_str,
+            &display_filename,
+            "pre_transfer",
+            db.as_ref(),
+            db_row_id,
+            transcode_start.elapsed().as_secs_f64(),
+        ) {
+            continue;
+        }
+
         // Check disk space
         let required = (original_size as f64 * config.transcode.min_free_space_multiplier) as u64;
         if let Ok(free) = deps.fs.free_space(&temp_dir) {
@@ -395,13 +590,15 @@ pub async fn run_watchdog_pass(
                     &format!("Skipped {}: insufficient disk space", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
                     db_row_id,
-                    false,
-                    0,
-                    0,
                     dur,
-                    Some("insufficient temp space"),
+                    FailureCode::InsufficientTempSpace,
+                    "insufficient_temp_space",
+                    true,
                 );
                 continue;
             }
@@ -441,29 +638,83 @@ pub async fn run_watchdog_pass(
             Ok(r) if r.success => {}
             Ok(_) => {
                 error!("[{}] Failed to rsync source: {}", share_name, path_str);
-                stats.transcode_failures += 1;
-                state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!("Transfer failed: {}", display_filename),
-                );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("rsync failed"));
+                if attempt_num <= config.transcode.max_retries {
+                    tui_log(
+                        state,
+                        "WARN",
+                        &format!("Transfer failed, requeuing: {}", display_filename),
+                    );
+                    transcode_queue.push((entry.clone(), eval.clone()));
+                    db.record_transcode_end_with_code(
+                        db_row_id,
+                        TranscodeOutcome::Failed,
+                        0,
+                        0,
+                        dur,
+                        Some("rsync failed (requeued)"),
+                        Some(FailureCode::TransferFailedRequeued.as_str()),
+                    );
+                } else {
+                    stats.transcode_failures += 1;
+                    state.update(|s| s.run_failures += 1);
+                    tui_log(
+                        state,
+                        "ERROR",
+                        &format!("Transfer failed (retries exhausted): {}", display_filename),
+                    );
+                    record_failure(
+                        db.as_ref(),
+                        config,
+                        &path_str,
+                        db_row_id,
+                        dur,
+                        FailureCode::TransferFailed,
+                        "transfer_failed",
+                        true,
+                    );
+                }
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
             Err(e) => {
                 error!("[{}] rsync error: {}", share_name, e);
-                stats.transcode_failures += 1;
-                state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!("Transfer error: {}", display_filename),
-                );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("rsync error"));
+                if attempt_num <= config.transcode.max_retries {
+                    tui_log(
+                        state,
+                        "WARN",
+                        &format!("Transfer error, requeuing: {}", display_filename),
+                    );
+                    transcode_queue.push((entry.clone(), eval.clone()));
+                    db.record_transcode_end_with_code(
+                        db_row_id,
+                        TranscodeOutcome::Failed,
+                        0,
+                        0,
+                        dur,
+                        Some("rsync error (requeued)"),
+                        Some(FailureCode::TransferErrorRequeued.as_str()),
+                    );
+                } else {
+                    stats.transcode_failures += 1;
+                    state.update(|s| s.run_failures += 1);
+                    tui_log(
+                        state,
+                        "ERROR",
+                        &format!("Transfer error (retries exhausted): {}", display_filename),
+                    );
+                    record_failure(
+                        db.as_ref(),
+                        config,
+                        &path_str,
+                        db_row_id,
+                        dur,
+                        FailureCode::TransferError,
+                        "transfer_error",
+                        true,
+                    );
+                }
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
@@ -471,6 +722,42 @@ pub async fn run_watchdog_pass(
 
         // Step 2: Transcode
         let (progress_tx, mut progress_rx) = mpsc::channel::<TranscodeProgress>(32);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_reason = Arc::new(AtomicU8::new(CANCEL_NONE));
+        let monitor_cancel_flag = Arc::clone(&cancel_flag);
+        let monitor_cancel_reason = Arc::clone(&cancel_reason);
+        let monitor_pause_path = pause_path.clone();
+        let mut monitor_shutdown_rx = shutdown_rx.resubscribe();
+        let monitor_task = tokio::spawn(async move {
+            loop {
+                if monitor_cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                if monitor_pause_path.exists() {
+                    let _ = monitor_cancel_reason.compare_exchange(
+                        CANCEL_NONE,
+                        CANCEL_PAUSE,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                    monitor_cancel_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => {}
+                    _ = monitor_shutdown_rx.recv() => {
+                        let _ = monitor_cancel_reason.compare_exchange(
+                            CANCEL_NONE,
+                            CANCEL_SHUTDOWN,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                        monitor_cancel_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
 
         let transcode_result = tokio::task::block_in_place(|| {
             let mut result: Option<Result<TranscodeResult>> = None;
@@ -489,10 +776,13 @@ pub async fn run_watchdog_pass(
                     &config.transcode.preset_name,
                     config.transcode.timeout_seconds,
                     progress_tx,
+                    Arc::clone(&cancel_flag),
                 ));
             });
             result.unwrap()
         });
+        cancel_flag.store(true, Ordering::Relaxed);
+        let _ = monitor_task.await;
 
         match transcode_result {
             Err(WatchdogError::TranscodeTimeout { .. }) => {
@@ -528,13 +818,14 @@ pub async fn run_watchdog_pass(
                         },
                     ));
                     let dur = transcode_start.elapsed().as_secs_f64();
-                    db.record_transcode_end(
+                    db.record_transcode_end_with_code(
                         db_row_id,
-                        false,
+                        TranscodeOutcome::Failed,
                         0,
                         0,
                         dur,
                         Some("timeout (requeued)"),
+                        Some(FailureCode::TimeoutRequeued.as_str()),
                     );
                 } else {
                     error!(
@@ -549,10 +840,49 @@ pub async fn run_watchdog_pass(
                         &format!("Timeout retries exhausted: {}", display_filename),
                     );
                     let dur = transcode_start.elapsed().as_secs_f64();
-                    db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("timeout exhausted"));
+                    record_failure(
+                        db.as_ref(),
+                        config,
+                        &path_str,
+                        db_row_id,
+                        dur,
+                        FailureCode::TimeoutExhausted,
+                        "timeout_exhausted",
+                        true,
+                    );
                 }
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
+            }
+            Err(WatchdogError::TranscodeCancelled { .. }) => {
+                let dur = transcode_start.elapsed().as_secs_f64();
+                let reason = match cancel_reason.load(Ordering::Relaxed) {
+                    CANCEL_SHUTDOWN => "interrupted_by_shutdown",
+                    CANCEL_PAUSE => "interrupted_by_pause",
+                    _ => "interrupted",
+                };
+                // Operator-driven interruptions are recorded in history but should not
+                // increment per-file cooldown counters.
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    match cancel_reason.load(Ordering::Relaxed) {
+                        CANCEL_SHUTDOWN => FailureCode::InterruptedShutdown,
+                        CANCEL_PAUSE => FailureCode::InterruptedPause,
+                        _ => FailureCode::Interrupted,
+                    },
+                    reason,
+                    false,
+                );
+                cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                if cancel_reason.load(Ordering::Relaxed) == CANCEL_PAUSE {
+                    state.set_phase(PipelinePhase::Paused);
+                    return Err(WatchdogError::Paused);
+                }
+                return Err(WatchdogError::Shutdown);
             }
             Err(e) => {
                 error!("[{}] Transcode error: {}", share_name, e);
@@ -564,7 +894,16 @@ pub async fn run_watchdog_pass(
                     &format!("Transcode error: {}", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some(&e.to_string()));
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::TranscodeError,
+                    "transcode_error",
+                    true,
+                );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
@@ -578,7 +917,16 @@ pub async fn run_watchdog_pass(
                     &format!("Transcode failed: {}", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("handbrake failed"));
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::TranscodeFailed,
+                    "transcode_failed",
+                    true,
+                );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
@@ -600,7 +948,16 @@ pub async fn run_watchdog_pass(
                 &format!("Output missing after transcode: {}", display_filename),
             );
             let dur = transcode_start.elapsed().as_secs_f64();
-            db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("output file missing"));
+            record_failure(
+                db.as_ref(),
+                config,
+                &path_str,
+                db_row_id,
+                dur,
+                FailureCode::OutputMissing,
+                "output_missing",
+                true,
+            );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
             continue;
         }
@@ -619,7 +976,16 @@ pub async fn run_watchdog_pass(
                 &format!("Output is 0 bytes: {}", display_filename),
             );
             let dur = transcode_start.elapsed().as_secs_f64();
-            db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("output 0 bytes"));
+            record_failure(
+                db.as_ref(),
+                config,
+                &path_str,
+                db_row_id,
+                dur,
+                FailureCode::OutputZeroBytes,
+                "output_zero_bytes",
+                true,
+            );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
             continue;
         }
@@ -647,7 +1013,16 @@ pub async fn run_watchdog_pass(
                     &format!("Verification failed: {}", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("verification failed"));
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::VerificationFailed,
+                    "verification_failed",
+                    true,
+                );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
@@ -661,7 +1036,16 @@ pub async fn run_watchdog_pass(
                     &format!("Verification error: {}", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("verification error"));
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::VerificationError,
+                    "verification_error",
+                    true,
+                );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
@@ -689,13 +1073,15 @@ pub async fn run_watchdog_pass(
                 &format!("Output too small, rejecting: {}", display_filename),
             );
             let dur = transcode_start.elapsed().as_secs_f64();
-            db.record_transcode_end(
+            record_failure(
+                db.as_ref(),
+                config,
+                &path_str,
                 db_row_id,
-                false,
-                0,
-                0,
                 dur,
-                Some("output suspiciously small"),
+                FailureCode::OutputSuspiciouslySmall,
+                "output_suspiciously_small",
+                true,
             );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
             continue;
@@ -715,7 +1101,14 @@ pub async fn run_watchdog_pass(
             );
             db.mark_inspected(&path_str, entry.size, entry.mtime);
             let dur = transcode_start.elapsed().as_secs_f64();
-            db.record_transcode_end(db_row_id, true, new_size, 0, dur, None);
+            db.record_transcode_end(
+                db_row_id,
+                TranscodeOutcome::SkippedNoSavings,
+                new_size,
+                0,
+                dur,
+                None,
+            );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
             continue;
         }
@@ -738,13 +1131,15 @@ pub async fn run_watchdog_pass(
                     &format!("Insufficient NFS space, skipping: {}", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
                     db_row_id,
-                    false,
-                    0,
-                    0,
                     dur,
-                    Some("NFS share space insufficient"),
+                    FailureCode::InsufficientNfsSpace,
+                    "insufficient_nfs_space",
+                    true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
@@ -774,12 +1169,37 @@ pub async fn run_watchdog_pass(
                 ),
             );
             let dur = transcode_start.elapsed().as_secs_f64();
-            db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("original file changed"));
+            record_failure(
+                db.as_ref(),
+                config,
+                &path_str,
+                db_row_id,
+                dur,
+                FailureCode::SourceChangedDuringTranscode,
+                "source_changed_during_transcode",
+                true,
+            );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
             continue;
         }
 
         // Step 7: Safe replace
+        if check_file_in_use_best_effort(
+            config,
+            deps,
+            state,
+            path,
+            &path_str,
+            &display_filename,
+            "pre_replace",
+            db.as_ref(),
+            db_row_id,
+            transcode_start.elapsed().as_secs_f64(),
+        ) {
+            cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+            continue;
+        }
+
         let replaced = tokio::task::block_in_place(|| {
             safe_replace(
                 deps.fs.as_ref(),
@@ -801,7 +1221,15 @@ pub async fn run_watchdog_pass(
                     db.mark_inspected(&path_str, new_file_size, new_mtime);
                 }
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, true, new_size, space_saved, dur, None);
+                db.record_transcode_end(
+                    db_row_id,
+                    TranscodeOutcome::Replaced,
+                    new_size,
+                    space_saved,
+                    dur,
+                    None,
+                );
+                db.clear_file_failure_state(&path_str);
 
                 // Log space saved to timeseries
                 let cumulative = db.get_total_space_saved() + space_saved;
@@ -830,6 +1258,18 @@ pub async fn run_watchdog_pass(
                     s.run_transcoded += 1;
                     s.run_space_saved += space_saved;
                 });
+
+                send_webhook(
+                    &config.notify,
+                    NotifyEvent::ReplacementSummary,
+                    &json!({
+                        "path": path_str,
+                        "share": share_name,
+                        "original_size": original_size,
+                        "new_size": new_size,
+                        "space_saved": space_saved,
+                    }),
+                );
             }
             Ok(false) => {
                 error!("[{}] Safe replace failed for {}", share_name, path_str);
@@ -841,7 +1281,16 @@ pub async fn run_watchdog_pass(
                     &format!("Replace failed: {}", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some("safe replace failed"));
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::SafeReplaceFailed,
+                    "safe_replace_failed",
+                    true,
+                );
             }
             Err(e) => {
                 error!("[{}] Replace error: {}", share_name, e);
@@ -853,7 +1302,16 @@ pub async fn run_watchdog_pass(
                     &format!("Replace error: {}", display_filename),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                db.record_transcode_end(db_row_id, false, 0, 0, dur, Some(&e.to_string()));
+                record_failure(
+                    db.as_ref(),
+                    config,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::SafeReplaceError,
+                    "safe_replace_error",
+                    true,
+                );
             }
         }
 
@@ -861,6 +1319,13 @@ pub async fn run_watchdog_pass(
     }
 
     state.set_phase(PipelinePhase::Idle);
+    let top_reasons = db.get_top_failure_reasons(3);
+    state.update(|s| {
+        s.top_failure_reasons = top_reasons
+            .iter()
+            .map(|(reason, count)| (reason.clone(), *count as u64))
+            .collect();
+    });
     state.set_last_pass_time();
     state.set_current_file(None);
     state.set_transcode_progress(0.0, 0.0, 0.0, String::new());
@@ -878,12 +1343,102 @@ pub async fn run_watchdog_pass(
     Ok(stats)
 }
 
-/// Walk all healthy shares concurrently and return discovered entries.
+#[allow(clippy::too_many_arguments)]
+fn process_probe_batch(
+    batch: &mut Vec<FileEntry>,
+    prober: &dyn Prober,
+    config: &Config,
+    state: &StateManager,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    worker_count: usize,
+    stats: &mut RunStats,
+    transcode_queue: &mut Vec<(FileEntry, TranscodeEval)>,
+    capped_queue: &mut Option<BinaryHeap<Reverse<QueueCandidate>>>,
+    queue_seq: &mut u64,
+    total_transcode_candidates: &mut u64,
+    pending_inspected: &mut Vec<(String, u64, f64)>,
+    queue_cap: Option<usize>,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let probe_results = probe_candidates_parallel(prober, batch, worker_count, shutdown_rx, state)?;
+    let entries = std::mem::take(batch);
+    for (entry, probe_result) in entries.into_iter().zip(probe_results.into_iter()) {
+        let path_str = entry.path.to_string_lossy().to_string();
+        stats.files_inspected += 1;
+        state.update(|s| {
+            s.total_inspected += 1;
+            s.run_inspected += 1;
+        });
+
+        match probe_result {
+            None => {
+                warn!(
+                    "Skipping file (probe failed, cannot read metadata): {}",
+                    path_str
+                );
+                tui_log(
+                    state,
+                    "WARN",
+                    &format!("Probe failed, skipping: {}", path_str),
+                );
+            }
+            Some(ref probe) => {
+                let eval = evaluate_transcode_need(probe, &config.transcode);
+                if eval.needs_transcode {
+                    info!("QUEUE: {} (reasons: {})", path_str, eval.reasons.join(", "));
+                    *total_transcode_candidates += 1;
+                    if let Some(cap) = queue_cap {
+                        let candidate = QueueCandidate {
+                            size: entry.size,
+                            seq: *queue_seq,
+                            entry,
+                            eval,
+                        };
+                        *queue_seq = queue_seq.saturating_add(1);
+                        let heap = capped_queue
+                            .as_mut()
+                            .expect("capped queue should exist when queue_cap is set");
+                        if heap.len() < cap {
+                            heap.push(Reverse(candidate));
+                        } else if let Some(Reverse(min)) = heap.peek() {
+                            if candidate.size > min.size {
+                                let _ = heap.pop();
+                                heap.push(Reverse(candidate));
+                            }
+                        }
+                    } else {
+                        transcode_queue.push((entry, eval));
+                    }
+                } else {
+                    let bitrate_text = if eval.bitrate_mbps > 0.0 {
+                        format!("{:.2} Mbps", eval.bitrate_mbps)
+                    } else {
+                        "unknown bitrate".to_string()
+                    };
+                    info!(
+                        "PASS: {} (codec={}, bitrate={} <= {:.2} Mbps)",
+                        path_str,
+                        eval.video_codec.as_deref().unwrap_or("unknown"),
+                        bitrate_text,
+                        config.transcode.max_average_bitrate_mbps
+                    );
+                    pending_inspected.push((path_str, entry.size, entry.mtime));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk healthy shares concurrently and return per-share entries.
 fn scan_shares_parallel(
     fs: &dyn FileSystem,
     jobs: &[(String, PathBuf)],
     extensions: &[String],
-) -> Result<Vec<FileEntry>> {
+) -> Result<Vec<(String, Vec<FileEntry>)>> {
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
@@ -893,7 +1448,6 @@ fn scan_shares_parallel(
 
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::channel::<(String, Result<Vec<FileEntry>>)>();
-
         for (share_name, mount_path) in jobs {
             let tx = tx.clone();
             let share_name = share_name.clone();
@@ -905,23 +1459,22 @@ fn scan_shares_parallel(
             });
         }
         drop(tx);
-
         for received in rx {
             per_share.push(received);
         }
     });
 
-    let mut entries = Vec::new();
+    let mut out = Vec::with_capacity(per_share.len());
     for (share_name, result) in per_share {
         match result {
-            Ok(mut share_entries) => entries.append(&mut share_entries),
+            Ok(entries) => out.push((share_name, entries)),
             Err(e) => {
                 error!("Share scan failed for '{}': {}", share_name, e);
                 return Err(e);
             }
         }
     }
-    Ok(entries)
+    Ok(out)
 }
 
 /// Probe files in parallel using a bounded worker pool.
@@ -1015,57 +1568,72 @@ fn probe_candidates_parallel(
     Ok(final_results)
 }
 
-/// Scan NFS shares for orphaned .old files from interrupted safe_replace operations.
-/// If the original file is missing (crash between rename steps), restore from .old.
-/// If both the original and .old exist (.old cleanup failed), remove the stale .old.
-fn recover_orphaned_files(fs: &dyn FileSystem, config: &Config, state: &StateManager) {
+fn shutdown_requested(shutdown_rx: &mut broadcast::Receiver<()>) -> bool {
+    matches!(
+        shutdown_rx.try_recv(),
+        Ok(_)
+            | Err(broadcast::error::TryRecvError::Closed)
+            | Err(broadcast::error::TryRecvError::Lagged(_))
+    )
+}
+
+/// Scan NFS shares for orphaned watchdog backup files from interrupted safe_replace operations.
+/// If the original file is missing (crash between rename steps), restore from .watchdog.old.
+/// If both the original and backup exist (cleanup failed), remove the stale backup.
+/// Returns false if shutdown is requested during recovery.
+fn recover_orphaned_files(
+    fs: &dyn FileSystem,
+    config: &Config,
+    state: &StateManager,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> bool {
     for share in &config.shares {
+        if shutdown_requested(shutdown_rx) {
+            return false;
+        }
         let mount_path = Path::new(&share.local_mount);
         if !fs.is_dir(mount_path) {
             continue;
         }
 
-        let walker = walkdir::WalkDir::new(mount_path)
-            .follow_links(false)
-            .into_iter();
-
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
+        // Only recover watchdog-owned artifacts.
+        let old_files = match fs.walk_files_with_suffix(mount_path, WATCHDOG_OLD_SUFFIX) {
+            Ok(files) => files,
+            Err(e) => {
+                warn!(
+                    "[{}] Could not scan for watchdog recovery artifacts: {}",
+                    share.name, e
+                );
                 continue;
             }
+        };
 
-            let path = entry.path();
+        for path in old_files {
+            if shutdown_requested(shutdown_rx) {
+                return false;
+            }
             let name = match path.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n,
                 None => continue,
             };
-
-            // Look for files ending in .old (e.g., "Movie.mkv.old")
-            if !name.ends_with(".old") {
-                continue;
-            }
-
-            // Derive the original path by stripping the .old suffix
-            let original_name = &name[..name.len() - 4]; // Remove ".old"
+            let original_name = name.trim_end_matches(WATCHDOG_OLD_SUFFIX);
             let original_path = path.parent().unwrap_or(Path::new(".")).join(original_name);
 
             if fs.exists(&original_path) {
-                // Original exists — .old is stale from a completed replace. Safe to remove.
                 warn!(
-                    "[{}] Removing stale .old (original exists): {}",
+                    "[{}] Removing stale watchdog backup (original exists): {}",
                     share.name,
                     path.display()
                 );
-                let _ = fs.remove(path);
+                let _ = fs.remove(&path);
             } else {
-                // Original is MISSING — crash between rename steps. Restore from .old.
                 error!(
-                    "[{}] RECOVERING orphaned file: {} → {}",
+                    "[{}] RECOVERING orphaned file: {} -> {}",
                     share.name,
                     path.display(),
                     original_path.display()
                 );
-                match fs.rename(path, &original_path) {
+                match fs.rename(&path, &original_path) {
                     Ok(_) => {
                         info!(
                             "[{}] Successfully recovered: {}",
@@ -1080,7 +1648,7 @@ fn recover_orphaned_files(fs: &dyn FileSystem, config: &Config, state: &StateMan
                     }
                     Err(e) => {
                         error!(
-                            "[{}] FAILED to recover orphaned file {} → {}: {}",
+                            "[{}] FAILED to recover orphaned file {} -> {}: {}",
                             share.name,
                             path.display(),
                             original_path.display(),
@@ -1098,19 +1666,40 @@ fn recover_orphaned_files(fs: &dyn FileSystem, config: &Config, state: &StateMan
                 }
             }
 
-            // Also clean up any corresponding .tmp file
-            let tmp_name = format!("{}.tmp", original_name);
+            let tmp_name = format!("{}{}", original_name, WATCHDOG_TMP_SUFFIX);
             let tmp_path = path.parent().unwrap_or(Path::new(".")).join(tmp_name);
             if fs.exists(&tmp_path) {
                 warn!(
-                    "[{}] Removing stale .tmp: {}",
+                    "[{}] Removing stale watchdog temp artifact: {}",
                     share.name,
                     tmp_path.display()
                 );
                 let _ = fs.remove(&tmp_path);
             }
         }
+
+        // Legacy .old files are reported only, never auto-mutated.
+        if let Ok(legacy_old_files) = fs.walk_files_with_suffix(mount_path, ".old") {
+            for legacy in legacy_old_files {
+                if shutdown_requested(shutdown_rx) {
+                    return false;
+                }
+                if legacy
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(WATCHDOG_OLD_SUFFIX))
+                {
+                    continue;
+                }
+                warn!(
+                    "[{}] Legacy .old file detected (left untouched): {}",
+                    share.name,
+                    legacy.display()
+                );
+            }
+        }
     }
+    true
 }
 
 /// Clean up temporary files, logging warnings on failure.
@@ -1124,7 +1713,207 @@ fn cleanup_temp_files(fs: &dyn FileSystem, paths: &[&Path]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_failure(
+    db: &WatchdogDb,
+    config: &Config,
+    path: &str,
+    row_id: i64,
+    duration_seconds: f64,
+    code: FailureCode,
+    reason: &str,
+    apply_cooldown: bool,
+) {
+    db.record_transcode_end_with_code(
+        row_id,
+        TranscodeOutcome::Failed,
+        0,
+        0,
+        duration_seconds,
+        Some(reason),
+        Some(code.as_str()),
+    );
+    if apply_cooldown {
+        if let Some(cooldown) = db.record_file_failure(
+            path,
+            reason,
+            config.safety.max_failures_before_cooldown,
+            config.safety.cooldown_base_seconds,
+            config.safety.cooldown_max_seconds,
+        ) {
+            if cooldown.next_eligible_at > chrono::Utc::now().timestamp() {
+                send_webhook(
+                    &config.notify,
+                    NotifyEvent::CooldownAlert,
+                    &json!({
+                        "path": path,
+                        "failure_reason": reason,
+                        "failure_code": code.as_str(),
+                        "consecutive_failures": cooldown.consecutive_failures,
+                        "next_eligible_at": cooldown.next_eligible_at,
+                    }),
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_file_in_use_best_effort(
+    config: &Config,
+    deps: &PipelineDeps,
+    state: &StateManager,
+    path: &Path,
+    path_str: &str,
+    display_filename: &str,
+    stage: &str,
+    db: &WatchdogDb,
+    row_id: i64,
+    duration_seconds: f64,
+) -> bool {
+    if !config.safety.in_use_guard_enabled {
+        return false;
+    }
+
+    match deps.in_use_detector.check_in_use(path) {
+        Ok(InUseStatus::NotInUse) => false,
+        Ok(InUseStatus::InUse) => {
+            warn!(
+                "Skipping {} at {}: file appears to be in use by another process",
+                path.display(),
+                stage
+            );
+            tui_log(
+                state,
+                "WARN",
+                &format!("Skipped (in use): {} [{}]", display_filename, stage),
+            );
+            record_failure(
+                db,
+                config,
+                path_str,
+                row_id,
+                duration_seconds,
+                FailureCode::FileInUse,
+                "file_in_use",
+                false,
+            );
+            increment_skip_counter(state, SkipReason::InUse);
+            true
+        }
+        Err(e) => {
+            warn!(
+                "In-use guard probe failed for {} at {} (best-effort continue): {}",
+                path.display(),
+                stage,
+                e
+            );
+            tui_log(
+                state,
+                "WARN",
+                &format!("In-use probe failed (continuing): {}", display_filename),
+            );
+            false
+        }
+    }
+}
+
+fn increment_skip_counter(state: &StateManager, reason: SkipReason) {
+    state.update(|s| match reason {
+        SkipReason::Inspected => s.run_skipped_inspected += 1,
+        SkipReason::Young => s.run_skipped_young += 1,
+        SkipReason::Cooldown => s.run_skipped_cooldown += 1,
+        SkipReason::Filtered => s.run_skipped_filtered += 1,
+        SkipReason::InUse => s.run_skipped_in_use += 1,
+    });
+}
+
+fn build_glob_matcher(globs: &[String]) -> Result<Option<GlobMatcher>> {
+    if globs.is_empty() {
+        return Ok(None);
+    }
+
+    let mut path_builder = GlobSetBuilder::new();
+    let mut basename_builder = GlobSetBuilder::new();
+    let mut has_path = false;
+    let mut has_basename = false;
+
+    for glob in globs {
+        let parsed = Glob::new(glob).map_err(|e| WatchdogError::Config(e.to_string()))?;
+        if glob.contains('/') || glob.contains('\\') {
+            path_builder.add(parsed);
+            has_path = true;
+        } else {
+            basename_builder.add(parsed);
+            has_basename = true;
+        }
+    }
+
+    let path_set = if has_path {
+        Some(
+            path_builder
+                .build()
+                .map_err(|e| WatchdogError::Config(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let basename_set = if has_basename {
+        Some(
+            basename_builder
+                .build()
+                .map_err(|e| WatchdogError::Config(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(Some(GlobMatcher {
+        path_set,
+        basename_set,
+    }))
+}
+
+fn matches_glob_matcher(path: &Path, matcher: &GlobMatcher) -> bool {
+    if let Some(path_set) = matcher.path_set.as_ref() {
+        if path_set.is_match(path) {
+            return true;
+        }
+    }
+    if let Some(name_set) = matcher.basename_set.as_ref() {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name_set.is_match(name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn path_matches_filters(
+    path: &Path,
+    include: Option<&GlobMatcher>,
+    exclude: Option<&GlobMatcher>,
+) -> bool {
+    if let Some(exclude_set) = exclude {
+        if matches_glob_matcher(path, exclude_set) {
+            return false;
+        }
+    }
+    if let Some(include_set) = include {
+        matches_glob_matcher(path, include_set)
+    } else {
+        true
+    }
+}
+
+fn is_pause_requested(config: &Config, base_dir: &Path) -> bool {
+    let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
+    pause_path.exists()
+}
+
 /// Run the pipeline in a loop with configurable interval.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline_loop(
     config: Config,
     base_dir: PathBuf,
@@ -1132,11 +1921,31 @@ pub async fn run_pipeline_loop(
     db: Arc<WatchdogDb>,
     state: StateManager,
     dry_run: bool,
+    once: bool,
     mut shutdown_rx: broadcast::Receiver<()>,
-) {
+) -> Result<()> {
     let mut retry_delay = 30u64;
+    let recovery_interval =
+        Duration::from_secs(config.safety.recovery_scan_interval_seconds.max(1));
+    let mut last_recovery_run: Option<Instant> = None;
 
     loop {
+        if shutdown_requested(&mut shutdown_rx) {
+            info!("Pipeline shutting down");
+            return Ok(());
+        }
+
+        if last_recovery_run
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= recovery_interval)
+        {
+            if !recover_orphaned_files(deps.fs.as_ref(), &config, &state, &mut shutdown_rx) {
+                info!("Pipeline shutting down during recovery scan");
+                return Ok(());
+            }
+            last_recovery_run = Some(Instant::now());
+        }
+
         match run_watchdog_pass(
             &config,
             &base_dir,
@@ -1158,23 +1967,70 @@ pub async fn run_pipeline_loop(
                     format_bytes_signed(stats.space_saved_bytes)
                 );
                 retry_delay = 30;
+                if once {
+                    return Ok(());
+                }
             }
             Err(WatchdogError::Shutdown) => {
                 info!("Pipeline shutting down");
-                return;
+                return Ok(());
+            }
+            Err(WatchdogError::Paused) => {
+                if dry_run || once {
+                    return Err(WatchdogError::Paused);
+                }
+                state.set_phase(PipelinePhase::Paused);
+                tui_log(&state, "WARN", "Pipeline paused");
+                loop {
+                    if !is_pause_requested(&config, &base_dir) {
+                        tui_log(&state, "INFO", "Pause lifted, resuming pipeline");
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
+                        _ = shutdown_rx.recv() => {
+                            info!("Pipeline shutting down while paused");
+                            return Ok(());
+                        }
+                    }
+                }
+                continue;
             }
             Err(e) => {
+                if dry_run || once {
+                    return Err(e);
+                }
                 error!("Watchdog pass failed: {}", e);
                 state.set_nfs_healthy(false);
                 tui_log(&state, "ERROR", &format!("Pass failed: {}", e));
-                tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay)).await;
+                send_webhook(
+                    &config.notify,
+                    NotifyEvent::PassFailureSummary,
+                    &json!({
+                        "error": e.to_string(),
+                        "retry_delay_seconds": retry_delay,
+                    }),
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay)) => {}
+                    _ = shutdown_rx.recv() => {
+                        info!("Pipeline shutting down during retry backoff");
+                        return Ok(());
+                    }
+                }
                 retry_delay = (retry_delay * 2).min(300);
                 continue;
             }
         }
 
-        if dry_run {
-            return;
+        if dry_run || once {
+            return Ok(());
+        }
+
+        if is_pause_requested(&config, &base_dir) {
+            state.set_phase(PipelinePhase::Paused);
+            tui_log(&state, "WARN", "Pipeline paused");
+            continue;
         }
 
         // Wait for next scan interval or shutdown
@@ -1191,7 +2047,7 @@ pub async fn run_pipeline_loop(
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(config.scan.interval_seconds)) => {}
             _ = shutdown_rx.recv() => {
                 info!("Pipeline shutting down during wait");
-                return;
+                return Ok(());
             }
         }
     }

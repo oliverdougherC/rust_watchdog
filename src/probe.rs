@@ -1,8 +1,10 @@
 use crate::config::TranscodeConfig;
 use crate::error::{Result, WatchdogError};
+use crate::process::{run_command, RunOptions};
 use crate::traits::{ProbeResult, Prober};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Real ffprobe implementation.
@@ -10,21 +12,36 @@ pub struct FfprobeProber;
 
 impl Prober for FfprobeProber {
     fn probe(&self, path: &Path) -> Result<Option<ProbeResult>> {
-        let output = Command::new("ffprobe")
-            .args([
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-            ])
-            .arg(path)
-            .output()
-            .map_err(|e| WatchdogError::Probe {
+        let mut cmd = Command::new("ffprobe");
+        cmd.args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path);
+        let output = run_command(
+            cmd,
+            RunOptions {
+                timeout: Some(Duration::from_secs(30)),
+                stdout_limit: 32 * 1024 * 1024,
+                stderr_limit: 64 * 1024,
+                ..RunOptions::default()
+            },
+        )
+        .map_err(|e| WatchdogError::Probe {
+            path: path.to_path_buf(),
+            reason: format!("Failed to execute ffprobe: {}", e),
+        })?;
+
+        if output.timed_out {
+            return Err(WatchdogError::Probe {
                 path: path.to_path_buf(),
-                reason: format!("Failed to execute ffprobe: {}", e),
-            })?;
+                reason: "ffprobe timed out after 30s".to_string(),
+            });
+        }
 
         if !output.status.success() {
             return Ok(None);
@@ -40,16 +57,22 @@ impl Prober for FfprobeProber {
     }
 
     fn health_check(&self, path: &Path) -> Result<bool> {
-        let output = Command::new("ffprobe")
-            .args(["-v", "error", "-hide_banner"])
-            .arg(path)
-            .output()
-            .map_err(|e| WatchdogError::Probe {
-                path: path.to_path_buf(),
-                reason: format!("ffprobe health check failed: {}", e),
-            })?;
+        let mut cmd = Command::new("ffprobe");
+        cmd.args(["-v", "error", "-hide_banner"]).arg(path);
+        let output = run_command(
+            cmd,
+            RunOptions {
+                timeout: Some(Duration::from_secs(15)),
+                stderr_limit: 64 * 1024,
+                ..RunOptions::default()
+            },
+        )
+        .map_err(|e| WatchdogError::Probe {
+            path: path.to_path_buf(),
+            reason: format!("ffprobe health check failed: {}", e),
+        })?;
 
-        Ok(output.status.success())
+        Ok(output.status.success() && !output.timed_out)
     }
 }
 
@@ -122,7 +145,7 @@ fn parse_probe_result(data: serde_json::Value) -> ProbeResult {
 
 /// Determine effective bitrate in bps from probe result.
 fn effective_bitrate_bps(probe: &ProbeResult) -> u64 {
-    let bps = if probe.format_bitrate_bps > 0 {
+    if probe.format_bitrate_bps > 0 {
         probe.format_bitrate_bps
     } else if probe.stream_bitrate_bps > 0 {
         probe.stream_bitrate_bps
@@ -130,12 +153,11 @@ fn effective_bitrate_bps(probe: &ProbeResult) -> u64 {
         ((probe.size_bytes * 8) as f64 / probe.duration_seconds) as u64
     } else {
         0
-    };
-    bps
+    }
 }
 
 /// Evaluation result for whether a file needs transcoding.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TranscodeEval {
     pub needs_transcode: bool,
     pub reasons: Vec<String>,
@@ -149,7 +171,10 @@ pub fn evaluate_transcode_need(probe: &ProbeResult, config: &TranscodeConfig) ->
     let mut reasons = Vec::new();
     let bitrate_bps = effective_bitrate_bps(probe);
     let bitrate_mbps = bitrate_bps as f64 / 1_000_000.0;
-    let is_target_codec = probe.video_codec.as_deref() == Some(&config.target_codec);
+    let is_target_codec = probe
+        .video_codec
+        .as_deref()
+        .is_some_and(|codec| codec.eq_ignore_ascii_case(&config.target_codec));
 
     if !is_target_codec {
         reasons.push(format!(
@@ -282,4 +307,53 @@ pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path)
     );
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_probe() -> ProbeResult {
+        ProbeResult {
+            video_codec: Some("av1".to_string()),
+            stream_bitrate_bps: 0,
+            format_bitrate_bps: 0,
+            size_bytes: 1000,
+            duration_seconds: 10.0,
+            video_stream_count: 1,
+            audio_stream_count: 1,
+            subtitle_stream_count: 0,
+            raw_json: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn test_effective_bitrate_prefers_format_then_stream_then_computed() {
+        let mut probe = base_probe();
+        probe.format_bitrate_bps = 7;
+        probe.stream_bitrate_bps = 5;
+        assert_eq!(effective_bitrate_bps(&probe), 7);
+
+        probe.format_bitrate_bps = 0;
+        assert_eq!(effective_bitrate_bps(&probe), 5);
+
+        probe.stream_bitrate_bps = 0;
+        assert_eq!(effective_bitrate_bps(&probe), 800);
+    }
+
+    #[test]
+    fn test_codec_compare_is_case_insensitive() {
+        let probe = ProbeResult {
+            video_codec: Some("AV1".to_string()),
+            ..base_probe()
+        };
+        let cfg = TranscodeConfig {
+            target_codec: "av1".to_string(),
+            max_average_bitrate_mbps: 1000.0,
+            ..TranscodeConfig::default()
+        };
+
+        let eval = evaluate_transcode_need(&probe, &cfg);
+        assert!(!eval.needs_transcode);
+    }
 }

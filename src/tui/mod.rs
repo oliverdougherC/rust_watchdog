@@ -1,3 +1,4 @@
+pub mod cooldown_tab;
 pub mod dashboard_tab;
 pub mod history_tab;
 pub mod logs_tab;
@@ -27,11 +28,12 @@ enum Tab {
     Dashboard,
     Logs,
     History,
+    Cooldown,
 }
 
 impl Tab {
     fn titles() -> Vec<&'static str> {
-        vec!["1 Dashboard", "2 Logs", "3 History"]
+        vec!["1 Dashboard", "2 Logs", "3 History", "4 Cooldown"]
     }
 
     fn index(&self) -> usize {
@@ -39,6 +41,7 @@ impl Tab {
             Tab::Dashboard => 0,
             Tab::Logs => 1,
             Tab::History => 2,
+            Tab::Cooldown => 3,
         }
     }
 
@@ -46,7 +49,8 @@ impl Tab {
         match self {
             Tab::Dashboard => Tab::Logs,
             Tab::Logs => Tab::History,
-            Tab::History => Tab::Dashboard,
+            Tab::History => Tab::Cooldown,
+            Tab::Cooldown => Tab::Dashboard,
         }
     }
 }
@@ -55,6 +59,7 @@ struct TuiApp {
     current_tab: Tab,
     logs_state: logs_tab::LogsTabState,
     history_state: history_tab::HistoryTabState,
+    cooldown_state: cooldown_tab::CooldownTabState,
     last_history_refresh: Instant,
 }
 
@@ -64,6 +69,7 @@ impl TuiApp {
             current_tab: Tab::Dashboard,
             logs_state: logs_tab::LogsTabState::default(),
             history_state: history_tab::HistoryTabState::default(),
+            cooldown_state: cooldown_tab::CooldownTabState::default(),
             last_history_refresh: Instant::now() - Duration::from_secs(10), // Force initial refresh
         }
     }
@@ -119,6 +125,7 @@ async fn run_tui_loop(
         // Refresh history periodically
         if app.last_history_refresh.elapsed() > Duration::from_secs(5) {
             app.history_state.refresh(db);
+            app.cooldown_state.refresh(db);
             app.last_history_refresh = Instant::now();
         }
 
@@ -136,25 +143,35 @@ async fn run_tui_loop(
                     KeyCode::Char('1') => app.current_tab = Tab::Dashboard,
                     KeyCode::Char('2') => app.current_tab = Tab::Logs,
                     KeyCode::Char('3') => app.current_tab = Tab::History,
+                    KeyCode::Char('4') => app.current_tab = Tab::Cooldown,
                     KeyCode::Tab => app.current_tab = app.current_tab.next(),
                     KeyCode::Char('j') | KeyCode::Down => match app.current_tab {
                         Tab::Logs => app.logs_state.scroll_down(),
                         Tab::History => app.history_state.scroll_down(),
+                        Tab::Cooldown => app.cooldown_state.scroll_down(),
                         _ => {}
                     },
                     KeyCode::Char('k') | KeyCode::Up => match app.current_tab {
                         Tab::Logs => app.logs_state.scroll_up(),
                         Tab::History => app.history_state.scroll_up(),
+                        Tab::Cooldown => app.cooldown_state.scroll_up(),
                         _ => {}
                     },
+                    KeyCode::Char('f') => {
+                        if matches!(app.current_tab, Tab::Logs) {
+                            app.logs_state.cycle_filter();
+                        }
+                    }
                     KeyCode::Home => match app.current_tab {
                         Tab::Logs => app.logs_state.scroll_to_top(),
                         Tab::History => app.history_state.scroll_to_top(),
+                        Tab::Cooldown => app.cooldown_state.scroll_to_top(),
                         _ => {}
                     },
                     KeyCode::End => match app.current_tab {
                         Tab::Logs => app.logs_state.scroll_to_bottom(),
                         Tab::History => app.history_state.scroll_to_bottom(),
+                        Tab::Cooldown => app.cooldown_state.scroll_to_bottom(),
                         _ => {}
                     },
                     _ => {}
@@ -184,6 +201,7 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp, state: &AppState) {
         Tab::Dashboard => dashboard_tab::render_dashboard(f, outer_chunks[1], state),
         Tab::Logs => logs_tab::render_logs(f, outer_chunks[1], state, &mut app.logs_state),
         Tab::History => history_tab::render_history(f, outer_chunks[1], &mut app.history_state),
+        Tab::Cooldown => cooldown_tab::render_cooldown(f, outer_chunks[1], &mut app.cooldown_state),
     }
 
     // Footer help
@@ -232,7 +250,7 @@ fn render_footer(f: &mut Frame, area: Rect) {
         ),
         Span::raw(":quit  "),
         Span::styled(
-            "1-3",
+            "1-4",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -252,6 +270,13 @@ fn render_footer(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(":scroll  "),
+        Span::styled(
+            "f",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(":log-filter  "),
         Span::styled(
             "Home/End",
             Style::default()

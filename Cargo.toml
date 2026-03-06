@@ -21,13 +21,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 regex = "1"
+globset = "0.4"
 thiserror = "2"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
-nix = { version = "0.31", features = ["term", "poll", "fs"] }
+nix = { version = "0.31", features = ["term", "poll", "fs", "signal", "process"] }
 which = "7"
 libc = "0.2"
+minreq = { version = "2", features = ["https-rustls"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

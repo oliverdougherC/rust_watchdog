@@ -42,10 +42,11 @@ impl InstanceLock {
                     lock_path.display()
                 ),
             )),
-            Err((_, e)) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to acquire lock on {}: {}", lock_path.display(), e),
-            )),
+            Err((_, e)) => Err(io::Error::other(format!(
+                "Failed to acquire lock on {}: {}",
+                lock_path.display(),
+                e
+            ))),
         }
     }
 

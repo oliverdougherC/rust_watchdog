@@ -1,7 +1,9 @@
 use crate::error::{Result, WatchdogError};
+use crate::process::{run_command, RunOptions};
 use crate::traits::MountManager;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 /// Real NFS mount manager using system commands.
@@ -53,13 +55,20 @@ impl MountManager for SystemMountManager {
                 local_mount.display()
             );
 
-            let output = Command::new("mount_nfs")
-                .arg(&remote)
-                .arg(local_mount)
-                .output();
+            let mut cmd = Command::new("mount_nfs");
+            cmd.arg(&remote).arg(local_mount);
+            let output = run_command(
+                cmd,
+                RunOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    stdout_limit: 16 * 1024,
+                    stderr_limit: 64 * 1024,
+                    ..RunOptions::default()
+                },
+            );
 
             match output {
-                Ok(result) if result.status.success() => {
+                Ok(result) if !result.timed_out && result.status.success() => {
                     if self.is_healthy(local_mount) {
                         info!(
                             "[{}] Remount succeeded at {}",
@@ -70,7 +79,11 @@ impl MountManager for SystemMountManager {
                     }
                 }
                 Ok(result) => {
-                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    if result.timed_out {
+                        warn!("[{}] mount_nfs timed out after 30s", share_name);
+                        continue;
+                    }
+                    let stderr = String::from_utf8_lossy(&result.stderr_tail);
                     warn!(
                         "[{}] mount_nfs failed (rc={}): {}",
                         share_name,

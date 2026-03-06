@@ -30,6 +30,9 @@ pub enum WatchdogError {
     #[error("Transcode timed out after {timeout_secs}s for {path}")]
     TranscodeTimeout { path: PathBuf, timeout_secs: u64 },
 
+    #[error("Transcode cancelled for {path}: {reason}")]
+    TranscodeCancelled { path: PathBuf, reason: String },
+
     #[error("Verification failed for {path}: {reason}")]
     Verification { path: PathBuf, reason: String },
 
@@ -38,6 +41,9 @@ pub enum WatchdogError {
 
     #[error("Probe failed for {path}: {reason}")]
     Probe { path: PathBuf, reason: String },
+
+    #[error("In-use detection failed for {path}: {reason}")]
+    InUse { path: PathBuf, reason: String },
 
     #[error("Missing dependency: {0}")]
     MissingDependency(String),
@@ -54,6 +60,9 @@ pub enum WatchdogError {
 
     #[error("Shutdown requested")]
     Shutdown,
+
+    #[error("Pipeline paused")]
+    Paused,
 
     #[error("Nix error: {0}")]
     Nix(#[from] nix::Error),
