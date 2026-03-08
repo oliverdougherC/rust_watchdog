@@ -509,10 +509,10 @@ impl WatchdogDb {
         original_codec: Option<&str>,
         original_bitrate_bps: i64,
         original_size: i64,
-    ) -> i64 {
+    ) -> rusqlite::Result<i64> {
         let conn = self.lock();
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        match conn.execute(
+        conn.execute(
             "INSERT INTO transcode_history
              (source_path, share_name, original_codec, original_bitrate_bps, original_size, outcome, started_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -525,13 +525,8 @@ impl WatchdogDb {
                 TranscodeOutcome::Failed.as_db_value(),
                 now
             ],
-        ) {
-            Ok(_) => conn.last_insert_rowid(),
-            Err(e) => {
-                error!("DB error in record_transcode_start: {}", e);
-                0
-            }
-        }
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 
     /// Record the completion of a transcode job.
@@ -754,7 +749,8 @@ mod tests {
             Some("h264"),
             30_000_000,
             5_000_000_000,
-        );
+        )
+        .unwrap();
         assert!(row_id > 0);
 
         db.record_transcode_end(
@@ -776,7 +772,8 @@ mod tests {
     #[test]
     fn test_stale_cleanup() {
         let db = WatchdogDb::open_in_memory().unwrap();
-        db.record_transcode_start("/test/stale.mkv", "movies", None, 0, 0);
+        db.record_transcode_start("/test/stale.mkv", "movies", None, 0, 0)
+            .unwrap();
 
         let cleaned = db.close_stale_transcodes();
         assert_eq!(cleaned, 1);
@@ -797,7 +794,9 @@ mod tests {
     #[test]
     fn test_outcome_counts_skips_not_transcodes() {
         let db = WatchdogDb::open_in_memory().unwrap();
-        let row_id = db.record_transcode_start("/test/skip.mkv", "movies", Some("h264"), 0, 1000);
+        let row_id = db
+            .record_transcode_start("/test/skip.mkv", "movies", Some("h264"), 0, 1000)
+            .unwrap();
         db.record_transcode_end(
             row_id,
             TranscodeOutcome::SkippedNoSavings,
@@ -875,7 +874,9 @@ mod tests {
     #[test]
     fn test_record_transcode_end_with_failure_code() {
         let db = WatchdogDb::open_in_memory().unwrap();
-        let row_id = db.record_transcode_start("/x.mkv", "movies", Some("h264"), 0, 10);
+        let row_id = db
+            .record_transcode_start("/x.mkv", "movies", Some("h264"), 0, 10)
+            .unwrap();
         db.record_transcode_end_with_code(
             row_id,
             TranscodeOutcome::Failed,
@@ -887,5 +888,22 @@ mod tests {
         );
         let rec = db.get_recent_transcodes(1);
         assert_eq!(rec[0].failure_code.as_deref(), Some("verification_failed"));
+    }
+
+    #[test]
+    fn test_record_transcode_start_returns_error_when_table_missing() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        {
+            let conn = db.lock();
+            conn.execute("DROP TABLE transcode_history", []).unwrap();
+        }
+
+        let err = db
+            .record_transcode_start("/broken.mkv", "movies", Some("h264"), 0, 10)
+            .unwrap_err();
+        assert!(
+            matches!(err, rusqlite::Error::SqliteFailure(_, _)),
+            "unexpected error: {err}"
+        );
     }
 }

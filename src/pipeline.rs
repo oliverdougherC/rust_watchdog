@@ -548,13 +548,27 @@ pub async fn run_watchdog_pass(
         let original_size = deps.fs.file_size(path).unwrap_or(entry.size) as i64;
 
         // Record in DB
-        let db_row_id = db.record_transcode_start(
+        let db_row_id = match db.record_transcode_start(
             &path_str,
             share_name,
             eval.video_codec.as_deref(),
             eval.bitrate_bps as i64,
             original_size,
-        );
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                error!(
+                    "[{}] Failed to record transcode start for {}: {}",
+                    share_name, path_str, e
+                );
+                tui_log(
+                    state,
+                    "ERROR",
+                    "Database write failed (transcode start); aborting pass",
+                );
+                return Err(WatchdogError::Database(e));
+            }
+        };
 
         if check_file_in_use_best_effort(
             config,
