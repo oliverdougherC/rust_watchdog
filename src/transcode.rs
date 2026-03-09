@@ -183,9 +183,10 @@ fn brace_delta(text: &str) -> i32 {
     opens - closes
 }
 
-fn spawn_stdout_progress_thread<R: Read + Send + 'static>(
+fn spawn_progress_thread<R: Read + Send + 'static>(
     mut reader: R,
     limit: usize,
+    stream_name: &'static str,
     progress_tx: mpsc::Sender<TranscodeProgress>,
 ) -> thread::JoinHandle<CapturedOutput> {
     thread::spawn(move || {
@@ -273,7 +274,7 @@ fn spawn_stdout_progress_thread<R: Read + Send + 'static>(
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    out.stream_error = Some(format!("stdout read error: {}", e));
+                    out.stream_error = Some(format!("{} read error: {}", stream_name, e));
                     break;
                 }
             }
@@ -283,31 +284,6 @@ fn spawn_stdout_progress_thread<R: Read + Send + 'static>(
             process_line(&line_buf, &mut out);
         }
 
-        out
-    })
-}
-
-fn spawn_capture_thread<R: Read + Send + 'static>(
-    mut reader: R,
-    limit: usize,
-) -> thread::JoinHandle<CapturedOutput> {
-    thread::spawn(move || {
-        let mut out = CapturedOutput::default();
-        let mut tmp = [0u8; 4096];
-        loop {
-            match reader.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => {
-                    out.total_bytes = out.total_bytes.saturating_add(n);
-                    out.truncated |= push_tail(&mut out.bytes, &tmp[..n], limit);
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    out.stream_error = Some(format!("stderr read error: {}", e));
-                    break;
-                }
-            }
-        }
         out
     })
 }
@@ -380,8 +356,10 @@ impl Transcoder for HandBrakeTranscoder {
         const STDOUT_LIMIT: usize = 128 * 1024;
         const STDERR_LIMIT: usize = 128 * 1024;
 
-        let stdout_handle = spawn_stdout_progress_thread(stdout, STDOUT_LIMIT, progress_tx);
-        let stderr_handle = spawn_capture_thread(stderr, STDERR_LIMIT);
+        let stderr_progress_tx = progress_tx.clone();
+        let stdout_handle = spawn_progress_thread(stdout, STDOUT_LIMIT, "stdout", progress_tx);
+        let stderr_handle =
+            spawn_progress_thread(stderr, STDERR_LIMIT, "stderr", stderr_progress_tx);
 
         let start = Instant::now();
         let mut timed_out = false;
@@ -421,7 +399,10 @@ impl Transcoder for HandBrakeTranscoder {
         let stdout_capture = stdout_handle.join().unwrap_or_default();
         let stderr_capture = stderr_handle.join().unwrap_or_default();
         let elapsed = start.elapsed().as_secs_f64();
-        let last_progress = stdout_capture.last_progress.as_ref();
+        let last_progress = stdout_capture
+            .last_progress
+            .as_ref()
+            .or(stderr_capture.last_progress.as_ref());
 
         if cancelled {
             warn!(

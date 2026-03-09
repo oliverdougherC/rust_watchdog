@@ -71,28 +71,6 @@ fn parse_rsync_progress(line: &str) -> Option<(f64, f64, String)> {
     Some((percent.clamp(0.0, 100.0), rate_mib, eta))
 }
 
-fn spawn_capture_thread<R: Read + Send + 'static>(
-    mut reader: R,
-    limit: usize,
-) -> thread::JoinHandle<CapturedOutput> {
-    thread::spawn(move || {
-        let mut out = CapturedOutput::default();
-        let mut tmp = [0u8; 4096];
-        loop {
-            match reader.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => {
-                    out.total_bytes = out.total_bytes.saturating_add(n);
-                    out.truncated |= push_tail(&mut out.bytes, &tmp[..n], limit);
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-        out
-    })
-}
-
 fn spawn_rsync_progress_thread<R: Read + Send + 'static>(
     mut reader: R,
     limit: usize,
@@ -201,8 +179,10 @@ impl FileTransfer for RsyncTransfer {
             reason: "Failed to capture rsync stderr".to_string(),
         })?;
 
+        let stderr_progress_tx = progress_tx.clone();
         let stdout_handle = spawn_rsync_progress_thread(stdout, 64 * 1024, stage, progress_tx);
-        let stderr_handle = spawn_capture_thread(stderr, 256 * 1024);
+        let stderr_handle =
+            spawn_rsync_progress_thread(stderr, 256 * 1024, stage, stderr_progress_tx);
 
         let start = Instant::now();
         let mut timed_out = false;
@@ -646,6 +626,15 @@ mod tests {
         let line = "       14385152  98%  992.11KB/s   00:00:00";
         let (percent, rate_mib, eta) = parse_rsync_progress(line).unwrap();
         assert!((percent - 98.0).abs() < 0.01);
+        assert!(rate_mib > 0.0);
+        assert_eq!(eta, "00:00:00");
+    }
+
+    #[test]
+    fn test_parse_rsync_progress_gnu_with_suffix() {
+        let line = "       2097152 100%  296.33MB/s   00:00:00 (xfer#1, to-check=0/1)";
+        let (percent, rate_mib, eta) = parse_rsync_progress(line).unwrap();
+        assert!((percent - 100.0).abs() < 0.01);
         assert!(rate_mib > 0.0);
         assert_eq!(eta, "00:00:00");
     }
