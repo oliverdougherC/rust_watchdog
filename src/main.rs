@@ -190,6 +190,10 @@ struct Cli {
     /// Clear all quarantined files and exit
     #[arg(long)]
     quarantine_clear_all: bool,
+
+    /// Clear cached inspected-file scan state on startup
+    #[arg(long)]
+    clear_scan_cache: bool,
 }
 
 #[tokio::main]
@@ -197,6 +201,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.pause && cli.resume {
         anyhow::bail!("Use only one of --pause or --resume");
+    }
+    if cli.pause && cli.clear_scan_cache {
+        anyhow::bail!("--clear-scan-cache cannot be combined with --pause");
     }
     if cli.once && cli.dry_run {
         anyhow::bail!("Use only one of --once or --dry-run");
@@ -236,6 +243,11 @@ async fn main() -> anyhow::Result<()> {
     if run_status_mode && quarantine_action_count > 0 {
         anyhow::bail!("--status/--status-json cannot be combined with quarantine mutation flags");
     }
+    if cli.clear_scan_cache && (cli.dry_run || run_status_mode || run_healthcheck_mode) {
+        anyhow::bail!(
+            "--clear-scan-cache cannot be combined with --dry-run, --status/--status-json, or --healthcheck/--healthcheck-json"
+        );
+    }
 
     // Set up tracing — suppress stderr output in TUI mode to avoid corrupting the display
     let tui_mode = !cli.headless
@@ -260,14 +272,15 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Jellyfin AV1 Transcoding Watchdog");
     info!(
-        "Runtime flags: simulate={} headless={} dry_run={} once={} doctor={} status_mode={} healthcheck_mode={}",
+        "Runtime flags: simulate={} headless={} dry_run={} once={} doctor={} status_mode={} healthcheck_mode={} clear_scan_cache={}",
         cli.simulate,
         cli.headless,
         cli.dry_run,
         cli.once,
         cli.doctor,
         run_status_mode,
-        run_healthcheck_mode
+        run_healthcheck_mode,
+        cli.clear_scan_cache
     );
 
     // Load or generate config
@@ -401,6 +414,24 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+
+    if cli.clear_scan_cache {
+        let cleared = db.clear_inspected_files();
+        info!(
+            "Cleared {} inspected-file cache entr{} via --clear-scan-cache",
+            cleared,
+            if cleared == 1 { "y" } else { "ies" }
+        );
+        let event_path = resolve_event_journal_path(&config.paths.event_journal, &base_dir);
+        append_event(
+            event_path.as_deref(),
+            "scan_cache_cleared",
+            json!({
+                "source": "clear_scan_cache_flag",
+                "cleared_inspected_rows": cleared,
+            }),
+        );
+    }
 
     if resume_requested {
         db.clear_auto_paused();

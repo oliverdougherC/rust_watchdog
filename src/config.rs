@@ -68,6 +68,9 @@ pub struct TranscodeConfig {
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
 
+    #[serde(default = "default_stall_timeout")]
+    pub stall_timeout_seconds: u64,
+
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
 
@@ -83,6 +86,7 @@ impl Default for TranscodeConfig {
             preset_file: default_preset_file(),
             preset_name: default_preset_name(),
             timeout_seconds: default_timeout(),
+            stall_timeout_seconds: default_stall_timeout(),
             max_retries: default_max_retries(),
             min_free_space_multiplier: default_min_free_space_multiplier(),
         }
@@ -103,6 +107,9 @@ fn default_preset_name() -> String {
 }
 fn default_timeout() -> u64 {
     18000
+}
+fn default_stall_timeout() -> u64 {
+    600
 }
 fn default_max_retries() -> u32 {
     1
@@ -507,6 +514,12 @@ impl Config {
         }
         if self.scan.interval_seconds == 0 {
             errors.push("scan.interval_seconds must be >= 1".to_string());
+        }
+        if self.transcode.timeout_seconds == 0 {
+            errors.push("transcode.timeout_seconds must be >= 1".to_string());
+        }
+        if self.transcode.stall_timeout_seconds == 0 {
+            errors.push("transcode.stall_timeout_seconds must be >= 1".to_string());
         }
         if self.scan.video_extensions.iter().any(|e| e.trim() == ".") {
             errors.push("video_extensions must not contain empty extension entries".to_string());

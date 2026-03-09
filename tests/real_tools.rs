@@ -41,6 +41,7 @@ fn real_tools_transcode_smoke() {
             &preset_file,
             &preset_name,
             300,
+            120,
             tx,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )

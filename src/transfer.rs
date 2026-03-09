@@ -9,7 +9,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -28,6 +28,21 @@ struct CapturedOutput {
     bytes: Vec<u8>,
     total_bytes: usize,
     truncated: bool,
+}
+
+#[derive(Debug)]
+struct TransferProgressSignals {
+    max_parsed_percent: f64,
+    last_parsed_at: Option<Instant>,
+}
+
+impl Default for TransferProgressSignals {
+    fn default() -> Self {
+        Self {
+            max_parsed_percent: -1.0,
+            last_parsed_at: None,
+        }
+    }
 }
 
 fn push_tail(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) -> bool {
@@ -71,11 +86,49 @@ fn parse_rsync_progress(line: &str) -> Option<(f64, f64, String)> {
     Some((percent.clamp(0.0, 100.0), rate_mib, eta))
 }
 
+fn format_eta_clock(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
+fn estimate_percent_from_sizes(source_size: u64, dest_size: u64) -> Option<f64> {
+    if source_size == 0 {
+        return None;
+    }
+    let clamped_dest = dest_size.min(source_size);
+    Some(((clamped_dest as f64 / source_size as f64) * 100.0).clamp(0.0, 99.9))
+}
+
+fn should_emit_preparing_heartbeat(
+    start: Instant,
+    now: Instant,
+    last_emit: Instant,
+    saw_any_progress: bool,
+) -> bool {
+    !saw_any_progress
+        && now.duration_since(start) >= Duration::from_secs(1)
+        && now.duration_since(last_emit) >= Duration::from_secs(1)
+}
+
+fn build_rsync_command(source: &Path, dest: &Path) -> Command {
+    let mut cmd = Command::new("rsync");
+    configure_subprocess_group(&mut cmd);
+    cmd.args(["-avh", "--progress", "--ignore-times"])
+        .arg(source)
+        .arg(dest)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 fn spawn_rsync_progress_thread<R: Read + Send + 'static>(
     mut reader: R,
     limit: usize,
     stage: TransferStage,
     progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    signals: Arc<Mutex<TransferProgressSignals>>,
 ) -> thread::JoinHandle<CapturedOutput> {
     thread::spawn(move || {
         let mut out = CapturedOutput::default();
@@ -96,6 +149,12 @@ fn spawn_rsync_progress_thread<R: Read + Send + 'static>(
                 let line = String::from_utf8_lossy(buf);
                 if let Some((percent, rate_mib_per_sec, eta)) = parse_rsync_progress(&line) {
                     let now = Instant::now();
+                    if let Ok(mut shared) = signals.lock() {
+                        if percent > shared.max_parsed_percent {
+                            shared.max_parsed_percent = percent;
+                        }
+                        shared.last_parsed_at = Some(now);
+                    }
                     let should_emit = percent >= 100.0
                         || (percent - last_percent).abs() >= 0.5
                         || now.duration_since(last_emit) >= Duration::from_millis(250);
@@ -150,13 +209,7 @@ impl FileTransfer for RsyncTransfer {
         stage: TransferStage,
         progress_tx: Option<mpsc::Sender<TransferProgress>>,
     ) -> Result<TransferResult> {
-        let mut cmd = Command::new("rsync");
-        configure_subprocess_group(&mut cmd);
-        cmd.args(["-avh", "--progress", "--checksum"])
-            .arg(source)
-            .arg(dest)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut cmd = build_rsync_command(source, dest);
         let command_repr = format_command_for_log(&cmd);
         info!(
             "Starting rsync transfer: stage={} source={} dest={} timeout={}s",
@@ -179,12 +232,34 @@ impl FileTransfer for RsyncTransfer {
             reason: "Failed to capture rsync stderr".to_string(),
         })?;
 
+        let progress_signals = Arc::new(Mutex::new(TransferProgressSignals::default()));
         let stderr_progress_tx = progress_tx.clone();
-        let stdout_handle = spawn_rsync_progress_thread(stdout, 64 * 1024, stage, progress_tx);
-        let stderr_handle =
-            spawn_rsync_progress_thread(stderr, 256 * 1024, stage, stderr_progress_tx);
+        let stdout_handle = spawn_rsync_progress_thread(
+            stdout,
+            64 * 1024,
+            stage,
+            progress_tx.clone(),
+            Arc::clone(&progress_signals),
+        );
+        let stderr_handle = spawn_rsync_progress_thread(
+            stderr,
+            256 * 1024,
+            stage,
+            stderr_progress_tx,
+            Arc::clone(&progress_signals),
+        );
 
         let start = Instant::now();
+        let source_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let mut last_fallback_percent = -1.0f64;
+        let mut last_dest_size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        let mut last_dest_growth_at = start;
+        let mut last_rate_sample: Option<(Instant, u64)> = None;
+        let mut estimated_rate_mib_per_sec = 0.0f64;
+        let mut saw_any_progress = false;
         let mut timed_out = false;
         let status = loop {
             if timeout_secs > 0 && start.elapsed().as_secs() > timeout_secs {
@@ -195,6 +270,87 @@ impl FileTransfer for RsyncTransfer {
                     reason: format!("Failed to wait for timed out rsync process: {}", e),
                 })?;
             }
+
+            let now = Instant::now();
+            let dest_size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+            if dest_size > last_dest_size {
+                if let Some((sample_at, sample_size)) = last_rate_sample {
+                    let delta_bytes = dest_size.saturating_sub(sample_size);
+                    let delta_secs = now.duration_since(sample_at).as_secs_f64();
+                    if delta_secs > 0.0 && delta_bytes > 0 {
+                        estimated_rate_mib_per_sec =
+                            (delta_bytes as f64 / (1024.0 * 1024.0)) / delta_secs;
+                    }
+                }
+                last_dest_growth_at = now;
+                last_dest_size = dest_size;
+                last_rate_sample = Some((now, dest_size));
+                saw_any_progress = true;
+            } else if last_rate_sample.is_none() && dest_size > 0 {
+                last_rate_sample = Some((now, dest_size));
+                last_dest_size = dest_size;
+                saw_any_progress = true;
+            }
+
+            if let Some(ref tx) = progress_tx {
+                let (parsed_percent, parsed_recent) = progress_signals
+                    .lock()
+                    .ok()
+                    .map(|shared| {
+                        let recent = shared
+                            .last_parsed_at
+                            .is_some_and(|t| now.duration_since(t) <= Duration::from_secs(1));
+                        (shared.max_parsed_percent, recent)
+                    })
+                    .unwrap_or((-1.0, false));
+                if parsed_percent >= 0.0 {
+                    saw_any_progress = true;
+                }
+
+                if !parsed_recent
+                    && source_size > 0
+                    && now.duration_since(last_dest_growth_at) <= Duration::from_secs(2)
+                {
+                    if let Some(percent) = estimate_percent_from_sizes(source_size, dest_size) {
+                        let baseline = parsed_percent.max(last_fallback_percent);
+                        let should_emit = percent >= 100.0
+                            || (percent - baseline).abs() >= 0.5
+                            || now.duration_since(last_emit) >= Duration::from_secs(1);
+                        if should_emit {
+                            let eta = if estimated_rate_mib_per_sec > 0.0 && dest_size < source_size
+                            {
+                                let remaining = source_size - dest_size;
+                                let eta_secs = ((remaining as f64 / (1024.0 * 1024.0))
+                                    / estimated_rate_mib_per_sec)
+                                    .max(0.0)
+                                    .round() as u64;
+                                format_eta_clock(eta_secs)
+                            } else {
+                                "preparing".to_string()
+                            };
+                            let _ = tx.try_send(TransferProgress {
+                                stage,
+                                percent,
+                                rate_mib_per_sec: estimated_rate_mib_per_sec.max(0.0),
+                                eta,
+                            });
+                            last_emit = now;
+                            last_fallback_percent = percent;
+                        }
+                    }
+                }
+
+                if should_emit_preparing_heartbeat(start, now, last_emit, saw_any_progress) {
+                    let _ = tx.try_send(TransferProgress {
+                        stage,
+                        percent: 0.0,
+                        rate_mib_per_sec: 0.0,
+                        eta: "preparing".to_string(),
+                    });
+                    last_emit = now;
+                }
+            }
+
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => thread::sleep(Duration::from_millis(100)),
@@ -296,7 +452,14 @@ pub fn safe_replace(
             "Removing stale watchdog temp from previous run: {}",
             temp_remote.display()
         );
-        let _ = fs.remove(&temp_remote);
+        if let Err(e) = fs.remove(&temp_remote) {
+            error!(
+                "Failed to remove stale watchdog temp {}: {}; aborting replace to fail closed",
+                temp_remote.display(),
+                e
+            );
+            return Ok(false);
+        }
     }
     // If .watchdog.old exists AND source_path exists, it is from a previous successful
     // replace where cleanup (step 4) failed — safe to remove.
@@ -305,7 +468,14 @@ pub fn safe_replace(
             "Removing stale watchdog backup from previous run: {}",
             old_remote.display()
         );
-        let _ = fs.remove(&old_remote);
+        if let Err(e) = fs.remove(&old_remote) {
+            error!(
+                "Failed to remove stale watchdog backup {}: {}; aborting replace to fail closed",
+                old_remote.display(),
+                e
+            );
+            return Ok(false);
+        }
     }
     // Legacy suffixes from older versions are detected but never mutated automatically.
     if fs.exists(&legacy_temp_remote) {
@@ -321,7 +491,7 @@ pub fn safe_replace(
         );
     }
 
-    // Step 1: rsync new file to temp path on remote (with --checksum for integrity)
+    // Step 1: rsync new file to temp path on remote.
     let file_size = fs.file_size(new_local_path).unwrap_or(0);
     let timeout = if file_size > 0 {
         (file_size / (1024 * 1024)).max(300)
@@ -643,5 +813,37 @@ mod tests {
     fn test_parse_rsync_progress_ignores_non_progress_lines() {
         assert!(parse_rsync_progress("Transfer starting: 1 files").is_none());
         assert!(parse_rsync_progress("sent 13309k bytes  received 42 bytes").is_none());
+    }
+
+    #[test]
+    fn test_preparing_heartbeat_when_no_progress_yet() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(2);
+        let last_emit = start + Duration::from_millis(500);
+        assert!(should_emit_preparing_heartbeat(
+            start, now, last_emit, false
+        ));
+        assert!(!should_emit_preparing_heartbeat(
+            start, now, last_emit, true
+        ));
+    }
+
+    #[test]
+    fn test_estimate_percent_from_dest_size_growth() {
+        let percent = estimate_percent_from_sizes(1000, 550).unwrap();
+        assert!((percent - 55.0).abs() < 0.01);
+        let capped = estimate_percent_from_sizes(1000, 2000).unwrap();
+        assert!(capped < 100.0);
+    }
+
+    #[test]
+    fn test_rsync_command_uses_ignore_times_not_checksum() {
+        let cmd = build_rsync_command(Path::new("/src.mkv"), Path::new("/dst.mkv"));
+        let args = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|a| a == "--ignore-times"));
+        assert!(!args.iter().any(|a| a == "--checksum"));
     }
 }

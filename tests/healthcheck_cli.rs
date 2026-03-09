@@ -1,3 +1,4 @@
+use rusqlite::Connection;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -94,6 +95,19 @@ status_snapshot = ""
         _dir: dir,
         path: config_path,
     }
+}
+
+fn inspected_count(config_path: &std::path::Path) -> i64 {
+    let cfg_text = std::fs::read_to_string(config_path).unwrap();
+    let value: toml::Value = toml::from_str(&cfg_text).unwrap();
+    let db_path = value
+        .get("paths")
+        .and_then(|v| v.get("database"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM inspected_files", [], |row| row.get(0))
+        .unwrap()
 }
 
 fn write_invalid_config() -> TestConfigFile {
@@ -309,4 +323,54 @@ fn status_json_missing_snapshot_returns_degraded() {
     let json = parse_json_output(&output);
     assert_eq!(json["status"], "degraded");
     assert_eq!(json["status_freshness"], "missing");
+}
+
+#[test]
+fn clear_scan_cache_flag_clears_inspected_files() {
+    let cfg = write_basic_config();
+    let db_path = cfg.path.parent().unwrap().join("watchdog.db");
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS inspected_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT UNIQUE NOT NULL,
+                file_size INTEGER,
+                file_mtime REAL,
+                inspected_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO inspected_files (file_path, file_size, file_mtime, inspected_at)
+             VALUES ('/a.mkv', 1, 1.0, '2026-01-01T00:00:00')",
+            [],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(inspected_count(&cfg.path), 1);
+    let output = Command::new(bin_path())
+        .args([
+            "--config",
+            cfg.path.to_str().unwrap(),
+            "--clear-scan-cache",
+            "--quarantine-list",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(inspected_count(&cfg.path), 0);
+}
+
+#[test]
+fn clear_scan_cache_rejected_in_read_only_modes() {
+    let output = Command::new(bin_path())
+        .args(["--simulate", "--dry-run", "--clear-scan-cache"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--clear-scan-cache"));
 }

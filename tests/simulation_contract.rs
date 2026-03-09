@@ -93,6 +93,7 @@ fn simulated_transcoder_honors_cancel_signal() {
         Path::new("preset.json"),
         "preset",
         10,
+        5,
         tx,
         cancel,
     );

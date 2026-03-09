@@ -36,6 +36,12 @@ pub enum WatchdogError {
     #[error("Transcode timed out after {timeout_secs}s for {path}")]
     TranscodeTimeout { path: PathBuf, timeout_secs: u64 },
 
+    #[error("Transcode stalled after {stall_timeout_secs}s with no progress for {path}")]
+    TranscodeStalled {
+        path: PathBuf,
+        stall_timeout_secs: u64,
+    },
+
     #[error("Transcode cancelled for {path}: {reason}")]
     TranscodeCancelled { path: PathBuf, reason: String },
 

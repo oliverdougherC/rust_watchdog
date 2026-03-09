@@ -48,6 +48,8 @@ enum FailureCode {
     TempSpaceProbeError,
     TimeoutRequeued,
     TimeoutExhausted,
+    StalledRequeued,
+    StalledExhausted,
     ScanTimeout,
     InterruptedShutdown,
     InterruptedPause,
@@ -79,6 +81,8 @@ impl FailureCode {
             Self::TempSpaceProbeError => "temp_space_probe_error",
             Self::TimeoutRequeued => "timeout_requeued",
             Self::TimeoutExhausted => "timeout_exhausted",
+            Self::StalledRequeued => "stalled_requeued",
+            Self::StalledExhausted => "stalled_exhausted",
             Self::ScanTimeout => "scan_timeout",
             Self::InterruptedShutdown => "interrupted_shutdown",
             Self::InterruptedPause => "interrupted_pause",
@@ -310,7 +314,14 @@ pub async fn run_watchdog_pass(
                     .any(|s| name.starts_with(&format!("{}_", s.name)));
                 if is_ours {
                     info!("Cleaning stale temp file from previous run: {}", name);
-                    let _ = deps.fs.remove(&path);
+                    if let Err(e) = deps.fs.remove(&path) {
+                        error!(
+                            "Failed to remove stale temp artifact {}: {}; aborting pass to fail closed",
+                            path.display(),
+                            e
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -961,6 +972,7 @@ pub async fn run_watchdog_pass(
                     &preset_path,
                     &config.transcode.preset_name,
                     config.transcode.timeout_seconds,
+                    config.transcode.stall_timeout_seconds,
                     progress_tx,
                     Arc::clone(&cancel_flag),
                 ));
@@ -1036,6 +1048,76 @@ pub async fn run_watchdog_pass(
                         dur,
                         FailureCode::TimeoutExhausted,
                         "timeout_exhausted",
+                        true,
+                    );
+                }
+                cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                continue;
+            }
+            Err(WatchdogError::TranscodeStalled {
+                stall_timeout_secs, ..
+            }) => {
+                warn!(
+                    "[{}] Transcode stalled after {}s with no progress: {}",
+                    share_name, stall_timeout_secs, path_str
+                );
+
+                if attempt_num <= config.transcode.max_retries {
+                    info!(
+                        "[{}] Requeueing after stall (attempt {}/{}): {}",
+                        share_name,
+                        attempt_num,
+                        config.transcode.max_retries + 1,
+                        path_str
+                    );
+                    tui_log(
+                        state,
+                        "WARN",
+                        &format!(
+                            "Stalled, requeuing: {} (attempt {})",
+                            display_filename, attempt_num
+                        ),
+                    );
+                    transcode_queue.push((
+                        entry.clone(),
+                        TranscodeEval {
+                            needs_transcode: true,
+                            reasons: vec!["retry after stall".to_string()],
+                            bitrate_mbps: eval.bitrate_mbps,
+                            video_codec: eval.video_codec.clone(),
+                            bitrate_bps: eval.bitrate_bps,
+                        },
+                    ));
+                    let dur = transcode_start.elapsed().as_secs_f64();
+                    db.record_transcode_end_with_code(
+                        db_row_id,
+                        TranscodeOutcome::Failed,
+                        0,
+                        0,
+                        dur,
+                        Some("stalled (requeued)"),
+                        Some(FailureCode::StalledRequeued.as_str()),
+                    );
+                } else {
+                    error!("[{}] Stall retries exhausted for {}", share_name, path_str);
+                    stats.transcode_failures += 1;
+                    state.update(|s| s.run_failures += 1);
+                    tui_log(
+                        state,
+                        "ERROR",
+                        &format!("Stall retries exhausted: {}", display_filename),
+                    );
+                    let dur = transcode_start.elapsed().as_secs_f64();
+                    record_failure(
+                        state,
+                        db.as_ref(),
+                        config,
+                        base_dir,
+                        &path_str,
+                        db_row_id,
+                        dur,
+                        FailureCode::StalledExhausted,
+                        "stalled_exhausted",
                         true,
                     );
                 }

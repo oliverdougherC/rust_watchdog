@@ -161,6 +161,7 @@ pub trait Transcoder: Send + Sync {
         preset_file: &Path,
         preset_name: &str,
         timeout_secs: u64,
+        stall_timeout_secs: u64,
         progress_tx: mpsc::Sender<TranscodeProgress>,
         cancel: Arc<AtomicBool>,
     ) -> Result<TranscodeResult>;

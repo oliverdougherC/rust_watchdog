@@ -436,6 +436,7 @@ impl Transcoder for SimulatedTranscoder {
         _preset_file: &Path,
         _preset_name: &str,
         _timeout_secs: u64,
+        _stall_timeout_secs: u64,
         progress_tx: mpsc::Sender<TranscodeProgress>,
         cancel: Arc<AtomicBool>,
     ) -> Result<TranscodeResult> {

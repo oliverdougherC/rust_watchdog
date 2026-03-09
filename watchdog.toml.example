@@ -17,6 +17,7 @@ target_codec = "av1"
 preset_file = "AV1_MKV.json"
 preset_name = "AV1_MKV"
 timeout_seconds = 18000
+stall_timeout_seconds = 600
 max_retries = 1
 min_free_space_multiplier = 2.0
 

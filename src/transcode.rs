@@ -10,8 +10,8 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -60,6 +60,21 @@ struct CapturedOutput {
     truncated: bool,
     stream_error: Option<String>,
     last_progress: Option<TranscodeProgress>,
+}
+
+#[derive(Debug)]
+struct ProgressActivity {
+    last_percent: f64,
+    last_forward_progress_at: Option<Instant>,
+}
+
+impl Default for ProgressActivity {
+    fn default() -> Self {
+        Self {
+            last_percent: -1.0,
+            last_forward_progress_at: None,
+        }
+    }
 }
 
 fn push_tail(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) -> bool {
@@ -188,6 +203,7 @@ fn spawn_progress_thread<R: Read + Send + 'static>(
     limit: usize,
     stream_name: &'static str,
     progress_tx: mpsc::Sender<TranscodeProgress>,
+    activity: Arc<Mutex<ProgressActivity>>,
 ) -> thread::JoinHandle<CapturedOutput> {
     thread::spawn(move || {
         let mut out = CapturedOutput::default();
@@ -206,6 +222,12 @@ fn spawn_progress_thread<R: Read + Send + 'static>(
                 || (progress.percent - last_percent).abs() >= 0.2
                 || now.duration_since(last_emit) >= Duration::from_millis(250);
             out.last_progress = Some(progress.clone());
+            if let Ok(mut shared) = activity.lock() {
+                if progress.percent > shared.last_percent {
+                    shared.last_percent = progress.percent;
+                    shared.last_forward_progress_at = Some(now);
+                }
+            }
             if should_emit {
                 let _ = progress_tx.try_send(progress.clone());
                 last_emit = now;
@@ -299,6 +321,7 @@ impl Transcoder for HandBrakeTranscoder {
         preset_file: &Path,
         preset_name: &str,
         timeout_secs: u64,
+        stall_timeout_secs: u64,
         progress_tx: mpsc::Sender<TranscodeProgress>,
         cancel: Arc<AtomicBool>,
     ) -> Result<TranscodeResult> {
@@ -322,11 +345,12 @@ impl Transcoder for HandBrakeTranscoder {
 
         let command_repr = format_command_for_log(&cmd);
         info!(
-            "Starting HandBrake transcode: input={} output={} preset={} timeout={}s json_progress={}",
+            "Starting HandBrake transcode: input={} output={} preset={} timeout={}s stall_timeout={}s json_progress={}",
             input.display(),
             output.display(),
             preset_name,
             timeout_secs,
+            stall_timeout_secs.max(1),
             use_json
         );
 
@@ -356,13 +380,29 @@ impl Transcoder for HandBrakeTranscoder {
         const STDOUT_LIMIT: usize = 128 * 1024;
         const STDERR_LIMIT: usize = 128 * 1024;
 
+        let progress_activity = Arc::new(Mutex::new(ProgressActivity::default()));
         let stderr_progress_tx = progress_tx.clone();
-        let stdout_handle = spawn_progress_thread(stdout, STDOUT_LIMIT, "stdout", progress_tx);
-        let stderr_handle =
-            spawn_progress_thread(stderr, STDERR_LIMIT, "stderr", stderr_progress_tx);
+        let stdout_handle = spawn_progress_thread(
+            stdout,
+            STDOUT_LIMIT,
+            "stdout",
+            progress_tx,
+            Arc::clone(&progress_activity),
+        );
+        let stderr_handle = spawn_progress_thread(
+            stderr,
+            STDERR_LIMIT,
+            "stderr",
+            stderr_progress_tx,
+            Arc::clone(&progress_activity),
+        );
 
         let start = Instant::now();
+        let stall_timeout = Duration::from_secs(stall_timeout_secs.max(1));
+        let mut last_output_growth_at = start;
+        let mut last_output_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
         let mut timed_out = false;
+        let mut stalled = false;
         let mut cancelled = false;
 
         let status = loop {
@@ -381,6 +421,32 @@ impl Transcoder for HandBrakeTranscoder {
                 break child.wait().map_err(|e| WatchdogError::Transcode {
                     path: input.to_path_buf(),
                     reason: format!("Failed to wait for timed out HandBrakeCLI process: {}", e),
+                })?;
+            }
+
+            let now = Instant::now();
+            let output_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+            if output_size > last_output_size {
+                last_output_size = output_size;
+                last_output_growth_at = now;
+            }
+
+            let last_forward_progress_at = progress_activity
+                .lock()
+                .ok()
+                .and_then(|shared| shared.last_forward_progress_at);
+            if should_mark_transcode_stalled(
+                start,
+                last_forward_progress_at,
+                last_output_growth_at,
+                now,
+                stall_timeout,
+            ) {
+                stalled = true;
+                terminate_subprocess(&mut child, Duration::from_secs(2));
+                break child.wait().map_err(|e| WatchdogError::Transcode {
+                    path: input.to_path_buf(),
+                    reason: format!("Failed to wait for stalled HandBrakeCLI process: {}", e),
                 })?;
             }
 
@@ -444,6 +510,33 @@ impl Transcoder for HandBrakeTranscoder {
             });
         }
 
+        if stalled {
+            let stderr_summary = summarize_output_tail(&stderr_capture.bytes, 420);
+            let hint_suffix = infer_failure_hint(&stderr_summary)
+                .map(|hint| format!(" likely_cause={}", hint))
+                .unwrap_or_default();
+            warn!(
+                "HandBrake stalled: input={} stall_timeout={}s elapsed={:.1}s output_bytes={} progress={} stderr={}{}{} command={}",
+                input.display(),
+                stall_timeout_secs.max(1),
+                elapsed,
+                last_output_size,
+                summarize_progress(last_progress),
+                stderr_summary,
+                if stderr_capture.truncated {
+                    " [stderr tail truncated]"
+                } else {
+                    ""
+                },
+                hint_suffix,
+                command_repr
+            );
+            return Err(WatchdogError::TranscodeStalled {
+                path: input.to_path_buf(),
+                stall_timeout_secs: stall_timeout_secs.max(1),
+            });
+        }
+
         if let Some(err) = stdout_capture.stream_error.as_deref() {
             warn!(
                 "HandBrake stdout stream issue for {}: {} (elapsed={:.1}s, status={})",
@@ -493,9 +586,28 @@ impl Transcoder for HandBrakeTranscoder {
     }
 }
 
+fn should_mark_transcode_stalled(
+    start: Instant,
+    last_forward_progress_at: Option<Instant>,
+    last_output_growth_at: Instant,
+    now: Instant,
+    stall_timeout: Duration,
+) -> bool {
+    let mut last_activity = start;
+    if let Some(progress_at) = last_forward_progress_at {
+        last_activity = last_activity.max(progress_at);
+    }
+    last_activity = last_activity.max(last_output_growth_at);
+    now.duration_since(last_activity) > stall_timeout
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_handbrake_progress_json_block, parse_handbrake_progress_text};
+    use super::{
+        parse_handbrake_progress_json_block, parse_handbrake_progress_text,
+        should_mark_transcode_stalled,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parse_progress_line_with_stats() {
@@ -546,5 +658,35 @@ mod tests {
 }"#;
         let p = parse_handbrake_progress_json_block(block).unwrap();
         assert!((p.percent - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn stall_detection_uses_latest_activity_signal() {
+        let now = Instant::now();
+        let start = now - Duration::from_secs(100);
+        let progress_at = Some(now - Duration::from_secs(8));
+        let output_growth_at = now - Duration::from_secs(15);
+        assert!(!should_mark_transcode_stalled(
+            start,
+            progress_at,
+            output_growth_at,
+            now,
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn stall_detection_triggers_when_all_signals_idle() {
+        let now = Instant::now();
+        let start = now - Duration::from_secs(200);
+        let progress_at = Some(now - Duration::from_secs(30));
+        let output_growth_at = now - Duration::from_secs(25);
+        assert!(should_mark_transcode_stalled(
+            start,
+            progress_at,
+            output_growth_at,
+            now,
+            Duration::from_secs(10)
+        ));
     }
 }

@@ -330,6 +330,7 @@ impl Prober for TestProber {
 
 enum TranscodeMode {
     TimeoutAlways,
+    StalledAlways,
     SuccessWithOutputSize(u64),
     WaitForCancel,
     MutateSourceDuringTranscode { output_size: u64, mtime_delta: f64 },
@@ -359,6 +360,7 @@ impl Transcoder for TestTranscoder {
         _preset_file: &Path,
         _preset_name: &str,
         timeout_secs: u64,
+        _stall_timeout_secs: u64,
         _progress_tx: mpsc::Sender<TranscodeProgress>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<TranscodeResult> {
@@ -367,6 +369,10 @@ impl Transcoder for TestTranscoder {
             TranscodeMode::TimeoutAlways => Err(WatchdogError::TranscodeTimeout {
                 path: input.to_path_buf(),
                 timeout_secs,
+            }),
+            TranscodeMode::StalledAlways => Err(WatchdogError::TranscodeStalled {
+                path: input.to_path_buf(),
+                stall_timeout_secs: 10,
             }),
             TranscodeMode::SuccessWithOutputSize(size) => {
                 self.fs.insert(output, size, 1000.0);
@@ -692,6 +698,45 @@ async fn timeout_retries_up_to_max_retries() {
     let recent = db.get_recent_transcodes(10);
     assert_eq!(stats.transcode_failures, 1);
     assert_eq!(recent.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_retries_up_to_max_retries() {
+    let cfg = base_config();
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Test.Stalled.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let transcoder = TestTranscoder::new(fs.clone(), TranscodeMode::StalledAlways);
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(transcoder),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+    let stats = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+
+    let recent = db.get_recent_transcodes(10);
+    assert_eq!(stats.transcode_failures, 1);
+    assert_eq!(recent.len(), 3);
+    assert_eq!(recent[0].failure_code.as_deref(), Some("stalled_exhausted"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

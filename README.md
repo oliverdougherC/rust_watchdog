@@ -136,6 +136,7 @@ WATCHDOG_LOCAL_TUI_HEADLESS_LOG_LEVEL=debug ./local_tui.sh --headless-once
 | `--quarantine-list` | List quarantined files |
 | `--quarantine-clear <path>` | Clear one quarantined file |
 | `--quarantine-clear-all` | Clear all quarantined files |
+| `--clear-scan-cache` | Clear `inspected_files` cache on startup (full rescan) |
 | `--config <path>` | Config file path (default: `watchdog.toml`) |
 | `--version` | Print version and exit |
 
@@ -145,7 +146,7 @@ See [`watchdog.toml.example`](watchdog.toml.example) for a complete example. Key
 
 - **`[nfs]`** — NFS server IP
 - **`[[shares]]`** — media share definitions (name, remote path, local mount point)
-- **`[transcode]`** — codec target, bitrate threshold, HandBrake preset, timeout, retries
+- **`[transcode]`** — codec target, bitrate threshold, HandBrake preset, timeout, stall timeout, retries
 - **`[scan]`** — video extensions, optional include/exclude globs (path-aware or basename-only patterns), scan interval, per-pass queue cap, optional `probe_workers`
 - **`[safety]`** — min file age, pause file path, failure cooldown policy, pass-failure tripwire thresholds, quarantine thresholds/codes, optional in-use guard command, periodic recovery scan interval, bounded share scan timeout, status snapshot freshness threshold
 - **`[paths]`** — temp directory for transcoding, database location, optional status snapshot output path, optional NDJSON event journal path

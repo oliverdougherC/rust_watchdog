@@ -217,17 +217,7 @@ fn render_current_transcode(f: &mut Frame, area: Rect, state: &AppState) {
         }
 
         let detail = match state.progress_stage {
-            ProgressStage::Import | ProgressStage::Export => {
-                let eta = if state.transfer_eta.is_empty() {
-                    "-".to_string()
-                } else {
-                    state.transfer_eta.clone()
-                };
-                format!(
-                    "Transfer {:.2} MiB/s  ETA {}",
-                    state.transfer_rate_mib_per_sec, eta
-                )
-            }
+            ProgressStage::Import | ProgressStage::Export => transfer_detail_text(state),
             ProgressStage::Transcode => {
                 let eta = if state.transcode_eta.is_empty() {
                     "-".to_string()
@@ -269,6 +259,26 @@ fn render_current_transcode(f: &mut Frame, area: Rect, state: &AppState) {
             inner,
         );
     }
+}
+
+fn transfer_detail_text(state: &AppState) -> String {
+    let transfer_percent = match state.progress_stage {
+        ProgressStage::Import => state.import_percent,
+        ProgressStage::Export => state.export_percent,
+        _ => 0.0,
+    };
+
+    let eta = state.transfer_eta.trim();
+    let eta_is_preparing = eta.is_empty() || eta.eq_ignore_ascii_case("preparing");
+    if transfer_percent <= 0.0 && eta_is_preparing {
+        return "Rsync preparing/checking...".to_string();
+    }
+
+    let eta_display = if eta.is_empty() { "-" } else { eta };
+    format!(
+        "Transfer {:.2} MiB/s  ETA {}",
+        state.transfer_rate_mib_per_sec, eta_display
+    )
 }
 
 fn composite_percent(import_percent: f64, transcode_percent: f64, export_percent: f64) -> f64 {
@@ -574,7 +584,8 @@ fn render_recent_activity(f: &mut Frame, area: Rect, state: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{composite_percent, compute_segment_widths, truncate_to_width};
+    use super::{composite_percent, compute_segment_widths, transfer_detail_text, truncate_to_width};
+    use crate::state::{AppState, ProgressStage};
 
     #[test]
     fn truncate_to_width_respects_bounds() {
@@ -597,5 +608,14 @@ mod tests {
         assert!((composite_percent(100.0, 100.0, 0.0) - 80.0).abs() < 0.0001);
         assert!((composite_percent(50.0, 0.0, 50.0) - 20.0).abs() < 0.0001);
         assert!((composite_percent(0.0, 50.0, 0.0) - 30.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn transfer_detail_shows_preparing_message_at_zero_percent() {
+        let mut state = AppState::default();
+        state.progress_stage = ProgressStage::Import;
+        state.import_percent = 0.0;
+        state.transfer_eta = "preparing".to_string();
+        assert_eq!(transfer_detail_text(&state), "Rsync preparing/checking...");
     }
 }

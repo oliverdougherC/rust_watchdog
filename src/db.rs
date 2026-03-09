@@ -307,6 +307,8 @@ impl WatchdogDb {
                  WHEN failure_reason IN ('interrupted_by_pause') THEN 'interrupted_pause'
                  WHEN failure_reason IN ('timeout (requeued)', 'timeout_requeued') THEN 'timeout_requeued'
                  WHEN failure_reason IN ('timeout_exhausted') OR failure_reason LIKE 'timeout%' THEN 'timeout_exhausted'
+                 WHEN failure_reason IN ('stalled (requeued)', 'stalled_requeued') THEN 'stalled_requeued'
+                 WHEN failure_reason IN ('stalled_exhausted') OR failure_reason LIKE 'stalled%' THEN 'stalled_exhausted'
                  WHEN failure_reason IN ('transcode_failed') THEN 'transcode_failed'
                  WHEN failure_reason IN ('transcode_error') THEN 'transcode_error'
                  WHEN failure_reason IN ('verification_failed') THEN 'verification_failed'
@@ -346,6 +348,8 @@ impl WatchdogDb {
                  WHEN last_failure_reason IN ('interrupted_by_pause') THEN 'interrupted_pause'
                  WHEN last_failure_reason IN ('timeout (requeued)', 'timeout_requeued') THEN 'timeout_requeued'
                  WHEN last_failure_reason IN ('timeout_exhausted') OR last_failure_reason LIKE 'timeout%' THEN 'timeout_exhausted'
+                 WHEN last_failure_reason IN ('stalled (requeued)', 'stalled_requeued') THEN 'stalled_requeued'
+                 WHEN last_failure_reason IN ('stalled_exhausted') OR last_failure_reason LIKE 'stalled%' THEN 'stalled_exhausted'
                  WHEN last_failure_reason IN ('transcode_failed') THEN 'transcode_failed'
                  WHEN last_failure_reason IN ('transcode_error') THEN 'transcode_error'
                  WHEN last_failure_reason IN ('verification_failed') THEN 'verification_failed'
@@ -1064,6 +1068,18 @@ impl WatchdogDb {
             .unwrap_or(0)
     }
 
+    /// Clear all inspected-file cache entries and return number of rows removed.
+    pub fn clear_inspected_files(&self) -> usize {
+        let conn = self.lock();
+        match conn.execute("DELETE FROM inspected_files", []) {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("DB error in clear_inspected_files: {}", e);
+                0
+            }
+        }
+    }
+
     /// Lightweight DB sanity check for health/doctor flows.
     pub fn healthcheck_query_ok(&self) -> bool {
         let conn = self.lock();
@@ -1155,6 +1171,16 @@ mod tests {
         assert!(db.is_inspected("/test/file.mkv", 1000, 1234567890.0));
         // Different size should not match
         assert!(!db.is_inspected("/test/file.mkv", 2000, 1234567890.0));
+    }
+
+    #[test]
+    fn test_clear_inspected_files() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        db.mark_inspected("/test/a.mkv", 1, 1.0);
+        db.mark_inspected("/test/b.mkv", 2, 2.0);
+        assert_eq!(db.get_inspected_count(), 2);
+        assert_eq!(db.clear_inspected_files(), 2);
+        assert_eq!(db.get_inspected_count(), 0);
     }
 
     #[test]
@@ -1262,6 +1288,60 @@ mod tests {
         assert_eq!(db.get_outcome_count(TranscodeOutcome::Replaced), 1);
         assert_eq!(db.get_outcome_count(TranscodeOutcome::SkippedNoSavings), 1);
         assert_eq!(db.get_outcome_count(TranscodeOutcome::Failed), 1);
+    }
+
+    #[test]
+    fn test_migration_backfills_stalled_failure_codes() {
+        let temp = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(temp.path()).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE transcode_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_path TEXT NOT NULL,
+                    share_name TEXT,
+                    original_codec TEXT,
+                    original_bitrate_bps INTEGER,
+                    original_size INTEGER,
+                    output_size INTEGER,
+                    space_saved INTEGER,
+                    duration_seconds REAL,
+                    outcome TEXT NOT NULL DEFAULT 'failed',
+                    success INTEGER NOT NULL DEFAULT 0,
+                    failure_reason TEXT,
+                    failure_code TEXT,
+                    started_at TEXT,
+                    completed_at TEXT
+                );
+                INSERT INTO transcode_history (source_path, outcome, success, failure_reason, failure_code)
+                VALUES ('/stalled.mkv', 'failed', 0, 'stalled_exhausted', NULL);
+
+                CREATE TABLE file_failure_state (
+                    file_path TEXT PRIMARY KEY,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    last_failure_reason TEXT,
+                    last_failure_code TEXT,
+                    next_eligible_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT
+                );
+                INSERT INTO file_failure_state (file_path, consecutive_failures, last_failure_reason, last_failure_code, next_eligible_at)
+                VALUES ('/stalled.mkv', 3, 'stalled_exhausted', NULL, 0);
+                ",
+            )
+            .unwrap();
+        }
+
+        let db = WatchdogDb::open(temp.path()).unwrap();
+        let recent = db.get_recent_transcodes(1);
+        assert_eq!(recent[0].failure_code.as_deref(), Some("stalled_exhausted"));
+        let failure_state = db
+            .get_file_failure_state("/stalled.mkv")
+            .expect("missing file failure state");
+        assert_eq!(
+            failure_state.last_failure_code.as_deref(),
+            Some("stalled_exhausted")
+        );
     }
 
     #[test]
