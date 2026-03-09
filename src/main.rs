@@ -17,9 +17,7 @@ use watchdog::process::{run_command, RunOptions};
 use watchdog::scanner::RealFileSystem;
 use watchdog::simulate::create_simulated_deps;
 use watchdog::state::StateManager;
-use watchdog::status_snapshot::{
-    resolve_status_snapshot_path, run_status_snapshot_task, write_snapshot,
-};
+use watchdog::status_snapshot::{resolve_status_snapshot_path, run_status_snapshot_task};
 use watchdog::traits::MountManager;
 use watchdog::transcode::HandBrakeTranscoder;
 use watchdog::transfer::RsyncTransfer;
@@ -273,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Load or generate config
-    let config = if cli.simulate {
+    let mut config = if cli.simulate {
         info!("Simulation mode: using default config with in-memory database");
         Config::default_config()
     } else {
@@ -291,6 +289,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+    if cli.dry_run {
+        // Enforce strict read-only dry-run execution.
+        config.paths.event_journal.clear();
+        config.paths.status_snapshot.clear();
+    }
 
     // Determine base directory (config file's parent, or cwd)
     let base_dir = if cli.simulate {
@@ -358,21 +361,43 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(WatchdogDb::open_in_memory()?)
     } else {
         let db_path = config.resolve_path(&base_dir, &config.paths.database);
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         info!("Database: {}", db_path.display());
-        match WatchdogDb::open(&db_path) {
-            Ok(db) => Arc::new(db),
-            Err(e) => {
-                error!("Failed to open database at {}: {}", db_path.display(), e);
-                if run_healthcheck_mode {
-                    std::process::exit(HC_DB_FAIL);
+        if cli.dry_run {
+            if db_path.exists() {
+                match WatchdogDb::open_read_only(&db_path) {
+                    Ok(db) => Arc::new(db),
+                    Err(e) => {
+                        error!(
+                            "Failed to open database read-only at {}: {}",
+                            db_path.display(),
+                            e
+                        );
+                        return Err(e.into());
+                    }
                 }
-                if run_status_mode {
-                    std::process::exit(STATUS_INTERNAL_FAIL);
+            } else {
+                warn!(
+                    "Dry-run database does not exist at {}; using in-memory read-only state",
+                    db_path.display()
+                );
+                Arc::new(WatchdogDb::open_in_memory()?)
+            }
+        } else {
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match WatchdogDb::open(&db_path) {
+                Ok(db) => Arc::new(db),
+                Err(e) => {
+                    error!("Failed to open database at {}: {}", db_path.display(), e);
+                    if run_healthcheck_mode {
+                        std::process::exit(HC_DB_FAIL);
+                    }
+                    if run_status_mode {
+                        std::process::exit(STATUS_INTERNAL_FAIL);
+                    }
+                    return Err(e.into());
                 }
-                return Err(e.into());
             }
         }
     };
@@ -483,7 +508,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Acquire instance lock (skip in simulation mode)
-    let _instance_lock = if !cli.simulate {
+    let _instance_lock = if !cli.simulate && !cli.dry_run {
         let lock_path = config
             .resolve_path(&base_dir, &config.paths.database)
             .with_extension("lock");
@@ -661,21 +686,6 @@ async fn main() -> anyhow::Result<()> {
 
         if let Err(e) = tui_result {
             error!("TUI error: {}", e);
-        }
-    }
-
-    if cli.dry_run {
-        if let Some(snapshot_path) = status_snapshot_path.as_ref() {
-            let cooldown = db.get_cooldown_active_count(chrono::Utc::now().timestamp());
-            let latest_failure = db.get_latest_failure();
-            if let Err(e) = write_snapshot(
-                snapshot_path,
-                &state.snapshot(),
-                cooldown,
-                latest_failure.as_ref(),
-            ) {
-                warn!("Failed to write dry-run status snapshot: {}", e);
-            }
         }
     }
 

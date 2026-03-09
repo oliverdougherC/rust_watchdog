@@ -10,9 +10,17 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 fn allow_local_mounts_for_testing() -> bool {
-    std::env::var("WATCHDOG_ALLOW_LOCAL_MOUNTS")
+    let allow_requested = std::env::var("WATCHDOG_ALLOW_LOCAL_MOUNTS")
         .ok()
-        .is_some_and(|v| v == "1")
+        .is_some_and(|v| v == "1");
+    if !allow_requested {
+        return false;
+    }
+
+    matches!(
+        std::env::var("WATCHDOG_RUNTIME_MODE").ok().as_deref(),
+        Some("simulate") | Some("local_test")
+    )
 }
 
 /// Real NFS mount manager using system commands.

@@ -94,6 +94,20 @@ pub trait FileSystem: Send + Sync {
         extensions: &[String],
     ) -> Result<Vec<FileEntry>>;
 
+    /// Walk a directory and return video entries, with optional cooperative cancellation.
+    /// Default implementation falls back to `walk_share` for implementations that do not
+    /// support cancellation-aware walking.
+    fn walk_share_cancellable(
+        &self,
+        share_name: &str,
+        root: &Path,
+        extensions: &[String],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<FileEntry>> {
+        let _ = cancel;
+        self.walk_share(share_name, root, extensions)
+    }
+
     /// Get file size in bytes.
     fn file_size(&self, path: &Path) -> Result<u64>;
 

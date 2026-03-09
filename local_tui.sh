@@ -214,7 +214,7 @@ fi
 if [[ "$HEADLESS_ONCE" -eq 1 ]]; then
   echo "==> Launching headless once pass"
   echo "    config: $CONFIG_PATH"
-  RUST_LOG="$HEADLESS_LOG_LEVEL" WATCHDOG_ALLOW_LOCAL_MOUNTS=1 cargo run --release -- --config "$CONFIG_PATH" --once --headless
+  RUST_LOG="$HEADLESS_LOG_LEVEL" WATCHDOG_ALLOW_LOCAL_MOUNTS=1 WATCHDOG_RUNTIME_MODE=local_test cargo run --release -- --config "$CONFIG_PATH" --once --headless
   echo
   echo "==> Headless pass summary (transcode_history by outcome)"
   sqlite3 "$DB_PATH" "select outcome, count(*) from transcode_history group by outcome order by count(*) desc;"
@@ -226,4 +226,4 @@ echo "    config: $CONFIG_PATH"
 echo "    videos staged: $VIDEO_COUNT"
 echo "    press q to quit"
 
-WATCHDOG_ALLOW_LOCAL_MOUNTS=1 cargo run --release -- --config "$CONFIG_PATH"
+WATCHDOG_ALLOW_LOCAL_MOUNTS=1 WATCHDOG_RUNTIME_MODE=local_test cargo run --release -- --config "$CONFIG_PATH"

@@ -424,6 +424,7 @@ fn render_composite_bar_row(f: &mut Frame, row: Rect, state: &AppState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_stage_segment(
     f: &mut Frame,
     area: Rect,

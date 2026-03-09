@@ -1,2 +1,0 @@
-{"event":"pass_start","payload":{"dry_run":false,"share_count":1},"timestamp":"2026-03-09T02:09:38.543832+00:00"}
-{"event":"shutdown","payload":{"phase":"pass_shutdown"},"timestamp":"2026-03-09T02:09:47.650285+00:00"}

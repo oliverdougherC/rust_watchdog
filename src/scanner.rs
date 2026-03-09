@@ -2,18 +2,20 @@ use crate::error::Result;
 use crate::traits::{FileEntry, FileSystem};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, trace, warn};
 use walkdir::WalkDir;
 
 /// Real filesystem implementation using actual OS calls.
 pub struct RealFileSystem;
 
-impl FileSystem for RealFileSystem {
-    fn walk_share(
+impl RealFileSystem {
+    fn walk_share_impl(
         &self,
         share_name: &str,
         root: &Path,
         extensions: &[String],
+        cancel: Option<&AtomicBool>,
     ) -> Result<Vec<FileEntry>> {
         let mut entries = Vec::new();
         let ext_set: HashSet<String> = extensions
@@ -24,6 +26,10 @@ impl FileSystem for RealFileSystem {
         info!("Scanning share '{}' at {}", share_name, root.display());
 
         for entry in WalkDir::new(root).follow_links(false).into_iter() {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                break;
+            }
+
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -92,6 +98,27 @@ impl FileSystem for RealFileSystem {
 
         info!("[{}] Found {} video files", share_name, entries.len());
         Ok(entries)
+    }
+}
+
+impl FileSystem for RealFileSystem {
+    fn walk_share(
+        &self,
+        share_name: &str,
+        root: &Path,
+        extensions: &[String],
+    ) -> Result<Vec<FileEntry>> {
+        self.walk_share_impl(share_name, root, extensions, None)
+    }
+
+    fn walk_share_cancellable(
+        &self,
+        share_name: &str,
+        root: &Path,
+        extensions: &[String],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<FileEntry>> {
+        self.walk_share_impl(share_name, root, extensions, cancel)
     }
 
     fn file_size(&self, path: &Path) -> Result<u64> {

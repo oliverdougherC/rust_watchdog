@@ -23,3 +23,4 @@ logs/
 .env
 
 test_videos/*
+.local_tui_run/

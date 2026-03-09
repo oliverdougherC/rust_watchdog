@@ -134,6 +134,40 @@ impl WatchdogDb {
         Ok(db)
     }
 
+    /// Open an existing database in read-only mode.
+    /// This is used for strict dry-run execution paths that must not mutate state.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn default_service_state() -> ServiceState {
+        ServiceState {
+            consecutive_pass_failures: 0,
+            last_pass_failure_code: None,
+            auto_paused_at: None,
+            auto_pause_reason: None,
+        }
+    }
+
+    fn read_service_state(conn: &Connection) -> rusqlite::Result<ServiceState> {
+        conn.query_row(
+            "SELECT consecutive_pass_failures, last_pass_failure_code, auto_paused_at, auto_pause_reason
+             FROM service_state WHERE id = 1",
+            [],
+            |row| {
+                Ok(ServiceState {
+                    consecutive_pass_failures: row.get::<_, i64>(0)?.max(0) as u32,
+                    last_pass_failure_code: row.get(1)?,
+                    auto_paused_at: row.get(2)?,
+                    auto_pause_reason: row.get(3)?,
+                })
+            },
+        )
+    }
+
     fn init(&self) -> rusqlite::Result<()> {
         let conn = self.lock();
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -555,25 +589,7 @@ impl WatchdogDb {
     /// Current service-level safety state for tripwire enforcement.
     pub fn get_service_state(&self) -> ServiceState {
         let conn = self.lock();
-        conn.query_row(
-            "SELECT consecutive_pass_failures, last_pass_failure_code, auto_paused_at, auto_pause_reason
-             FROM service_state WHERE id = 1",
-            [],
-            |row| {
-                Ok(ServiceState {
-                    consecutive_pass_failures: row.get::<_, i64>(0)?.max(0) as u32,
-                    last_pass_failure_code: row.get(1)?,
-                    auto_paused_at: row.get(2)?,
-                    auto_pause_reason: row.get(3)?,
-                })
-            },
-        )
-        .unwrap_or(ServiceState {
-            consecutive_pass_failures: 0,
-            last_pass_failure_code: None,
-            auto_paused_at: None,
-            auto_pause_reason: None,
-        })
+        Self::read_service_state(&conn).unwrap_or_else(|_| Self::default_service_state())
     }
 
     /// Increment pass-failure streak and capture failure code.
@@ -589,7 +605,8 @@ impl WatchdogDb {
                 "DB error ensuring service_state in note_pass_failure: {}",
                 e
             );
-            return self.get_service_state();
+            return Self::read_service_state(&conn)
+                .unwrap_or_else(|_| Self::default_service_state());
         }
         if let Err(e) = conn.execute(
             "UPDATE service_state
@@ -600,25 +617,7 @@ impl WatchdogDb {
         ) {
             error!("DB error in note_pass_failure update: {}", e);
         }
-        conn.query_row(
-            "SELECT consecutive_pass_failures, last_pass_failure_code, auto_paused_at, auto_pause_reason
-             FROM service_state WHERE id = 1",
-            [],
-            |row| {
-                Ok(ServiceState {
-                    consecutive_pass_failures: row.get::<_, i64>(0)?.max(0) as u32,
-                    last_pass_failure_code: row.get(1)?,
-                    auto_paused_at: row.get(2)?,
-                    auto_pause_reason: row.get(3)?,
-                })
-            },
-        )
-        .unwrap_or(ServiceState {
-            consecutive_pass_failures: 0,
-            last_pass_failure_code: None,
-            auto_paused_at: None,
-            auto_pause_reason: None,
-        })
+        Self::read_service_state(&conn).unwrap_or_else(|_| Self::default_service_state())
     }
 
     /// Reset pass-failure streak after a successful pass.
@@ -1135,6 +1134,9 @@ impl WatchdogDb {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -1371,6 +1373,28 @@ mod tests {
         assert!(reset.last_pass_failure_code.is_none());
         assert!(reset.auto_paused_at.is_none());
         assert!(reset.auto_pause_reason.is_none());
+    }
+
+    #[test]
+    fn test_note_pass_failure_returns_when_service_state_missing() {
+        let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+        {
+            let conn = db.lock();
+            conn.execute("DROP TABLE service_state", []).unwrap();
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let db_thread = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let state = db_thread.note_pass_failure("scan_timeout");
+            let _ = tx.send(state);
+        });
+
+        let state = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("note_pass_failure did not return in time");
+        assert_eq!(state.consecutive_pass_failures, 0);
+        assert!(state.last_pass_failure_code.is_none());
     }
 
     #[test]

@@ -201,13 +201,15 @@ pub async fn run_watchdog_pass(
 ) -> Result<RunStats> {
     let mut stats = RunStats::default();
 
-    // Close stale transcodes from previous crash
-    let stale = db.close_stale_transcodes();
-    if stale > 0 {
-        info!(
-            "Cleaned up {} stale transcode row(s) from previous run",
-            stale
-        );
+    if !dry_run {
+        // Close stale transcodes from previous crash
+        let stale = db.close_stale_transcodes();
+        if stale > 0 {
+            info!(
+                "Cleaned up {} stale transcode row(s) from previous run",
+                stale
+            );
+        }
     }
 
     state.set_phase(PipelinePhase::Scanning);
@@ -243,14 +245,32 @@ pub async fn run_watchdog_pass(
         return Err(WatchdogError::Paused);
     }
 
-    // Ensure NFS mounts
+    // Ensure NFS mounts (dry-run is read-only: do not perform remount attempts)
     let shares: Vec<(String, String, String)> = config
         .shares
         .iter()
         .map(|s| (s.name.clone(), s.remote_path.clone(), s.local_mount.clone()))
         .collect();
 
-    ensure_all_mounts(deps.mount_manager.as_ref(), &config.nfs.server, &shares)?;
+    if dry_run {
+        let unhealthy: Vec<String> = shares
+            .iter()
+            .filter_map(|(name, _remote, local_mount)| {
+                (!deps.mount_manager.is_healthy(Path::new(local_mount))).then_some(name.clone())
+            })
+            .collect();
+        if let Some(first) = unhealthy.first() {
+            return Err(WatchdogError::NfsMount {
+                share: first.clone(),
+                reason: format!(
+                    "Dry-run mode is read-only and will not remount unhealthy shares ({} unhealthy)",
+                    unhealthy.len()
+                ),
+            });
+        }
+    } else {
+        ensure_all_mounts(deps.mount_manager.as_ref(), &config.nfs.server, &shares)?;
+    }
     let share_health = config
         .shares
         .iter()
@@ -270,24 +290,28 @@ pub async fn run_watchdog_pass(
     // Prepare paths
     let preset_path = config.resolve_path(base_dir, &config.transcode.preset_file);
     let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
-    deps.fs.create_dir_all(&temp_dir)?;
+    if !dry_run {
+        deps.fs.create_dir_all(&temp_dir)?;
+    }
 
     // Clean up stale temp files from previous crashes (e.g., leftover .av1.* or source copies).
     // Only clean files we own (prefixed with a share name + underscore).
-    if let Ok(entries) = deps.fs.list_dir(&temp_dir) {
-        for path in entries {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            let is_ours = config
-                .shares
-                .iter()
-                .any(|s| name.starts_with(&format!("{}_", s.name)));
-            if is_ours {
-                info!("Cleaning stale temp file from previous run: {}", name);
-                let _ = deps.fs.remove(&path);
+    if !dry_run {
+        if let Ok(entries) = deps.fs.list_dir(&temp_dir) {
+            for path in entries {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let is_ours = config
+                    .shares
+                    .iter()
+                    .any(|s| name.starts_with(&format!("{}_", s.name)));
+                if is_ours {
+                    info!("Cleaning stale temp file from previous run: {}", name);
+                    let _ = deps.fs.remove(&path);
+                }
             }
         }
     }
@@ -408,7 +432,9 @@ pub async fn run_watchdog_pass(
             let path_string = entry.path.to_string_lossy().to_string();
             if db.is_quarantined(&path_string) {
                 increment_skip_counter(state, SkipReason::Quarantined);
-                db.record_quarantine_skip(&path_string, "quarantined_file");
+                if !dry_run {
+                    db.record_quarantine_skip(&path_string, "quarantined_file");
+                }
                 let quarantined_count = db.quarantine_count().max(0) as u64;
                 state.update(|s| {
                     s.last_failure_code = Some(FailureCode::QuarantinedFile.as_str().to_string());
@@ -521,7 +547,9 @@ pub async fn run_watchdog_pass(
             .collect();
     }
 
-    db.mark_inspected_batch(&pending_inspected);
+    if !dry_run {
+        db.mark_inspected_batch(&pending_inspected);
+    }
 
     // Sort queue: largest files first
     transcode_queue.sort_by(|a, b| b.0.size.cmp(&a.0.size));
@@ -1310,6 +1338,8 @@ pub async fn run_watchdog_pass(
                     "WARN",
                     &format!("Insufficient NFS space, skipping: {}", display_filename),
                 );
+                stats.transcode_failures += 1;
+                state.update(|s| s.run_failures += 1);
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
                     state,
@@ -1379,6 +1409,8 @@ pub async fn run_watchdog_pass(
                     display_filename
                 ),
             );
+            stats.transcode_failures += 1;
+            state.update(|s| s.run_failures += 1);
             let dur = transcode_start.elapsed().as_secs_f64();
             record_failure(
                 state,
@@ -1692,12 +1724,14 @@ fn scan_shares_parallel(
 
     let extensions = extensions.to_vec();
     let mut per_share: Vec<(String, Result<Vec<FileEntry>>)> = Vec::new();
+    let cancel_scan = Arc::new(AtomicBool::new(false));
     let pending = Arc::new(std::sync::Mutex::new(
         jobs.iter()
             .map(|(name, _)| name.clone())
             .collect::<HashSet<_>>(),
     ));
     let (tx, rx) = std::sync::mpsc::channel::<(String, Result<Vec<FileEntry>>)>();
+    let mut handles = Vec::with_capacity(jobs.len());
     for (share_name, mount_path) in jobs {
         let tx = tx.clone();
         let share_name = share_name.clone();
@@ -1705,41 +1739,37 @@ fn scan_shares_parallel(
         let extensions = extensions.clone();
         let fs = Arc::clone(&fs);
         let pending = Arc::clone(&pending);
-        std::thread::spawn(move || {
-            let result = fs.walk_share(&share_name, &mount_path, &extensions);
+        let cancel_scan = Arc::clone(&cancel_scan);
+        handles.push(std::thread::spawn(move || {
+            let result = fs.walk_share_cancellable(
+                &share_name,
+                &mount_path,
+                &extensions,
+                Some(cancel_scan.as_ref()),
+            );
             if let Ok(mut pending) = pending.lock() {
                 pending.remove(&share_name);
             }
             let _ = tx.send((share_name, result));
-        });
+        }));
     }
     drop(tx);
 
     let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let mut shutdown = false;
     while per_share.len() < jobs.len() {
         if shutdown_requested(shutdown_rx) {
-            return Err(WatchdogError::Shutdown);
+            shutdown = true;
+            cancel_scan.store(true, Ordering::Relaxed);
+            break;
         }
 
         let now = Instant::now();
         if now >= deadline {
-            let (pending_count, pending_list) = pending
-                .lock()
-                .map(|s| (s.len(), s.iter().cloned().collect::<Vec<_>>()))
-                .unwrap_or_default();
-            error!(
-                "Share scan timed out after {}s; pending shares: {}",
-                timeout.as_secs().max(1),
-                if pending_list.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    pending_list.join(", ")
-                }
-            );
-            return Err(WatchdogError::ScanTimeout {
-                timeout_secs: timeout.as_secs().max(1),
-                pending_shares: pending_count.max(1),
-            });
+            timed_out = true;
+            cancel_scan.store(true, Ordering::Relaxed);
+            break;
         }
 
         let wait = deadline
@@ -1752,6 +1782,54 @@ fn scan_shares_parallel(
                 break;
             }
         }
+    }
+
+    cancel_scan.store(true, Ordering::Relaxed);
+    while per_share.len() < jobs.len() {
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(received) => per_share.push(received),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if shutdown {
+        return Err(WatchdogError::Shutdown);
+    }
+
+    if timed_out {
+        let (pending_count, pending_list) = pending
+            .lock()
+            .map(|s| (s.len(), s.iter().cloned().collect::<Vec<_>>()))
+            .unwrap_or_default();
+        error!(
+            "Share scan timed out after {}s; pending shares: {}",
+            timeout.as_secs().max(1),
+            if pending_list.is_empty() {
+                "unknown".to_string()
+            } else {
+                pending_list.join(", ")
+            }
+        );
+        return Err(WatchdogError::ScanTimeout {
+            timeout_secs: timeout.as_secs().max(1),
+            pending_shares: pending_count.max(1),
+        });
+    }
+
+    if per_share.len() < jobs.len() {
+        let pending_count = jobs.len().saturating_sub(per_share.len()).max(1);
+        error!(
+            "Share scan worker ended early; treating as timeout with {} pending share(s)",
+            pending_count
+        );
+        return Err(WatchdogError::ScanTimeout {
+            timeout_secs: timeout.as_secs().max(1),
+            pending_shares: pending_count,
+        });
     }
 
     let mut out = Vec::with_capacity(per_share.len());
@@ -2396,9 +2474,10 @@ pub async fn run_pipeline_loop(
             return Ok(());
         }
 
-        if last_recovery_run
-            .as_ref()
-            .is_none_or(|last| last.elapsed() >= recovery_interval)
+        if !dry_run
+            && last_recovery_run
+                .as_ref()
+                .is_none_or(|last| last.elapsed() >= recovery_interval)
         {
             if !recover_orphaned_files(
                 deps.fs.as_ref(),
@@ -2439,8 +2518,10 @@ pub async fn run_pipeline_loop(
                     stats.transcode_failures,
                     format_bytes_signed(stats.space_saved_bytes)
                 );
-                db.note_pass_success();
-                sync_service_state(&state, db.as_ref());
+                if !dry_run {
+                    db.note_pass_success();
+                    sync_service_state(&state, db.as_ref());
+                }
                 retry_delay = 30;
                 if once {
                     return Ok(());
