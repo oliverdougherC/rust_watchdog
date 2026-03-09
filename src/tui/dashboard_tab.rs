@@ -1,4 +1,4 @@
-use crate::state::{AppState, ProgressStage};
+use crate::state::{AppState, PipelinePhase, ProgressStage};
 use crate::tui::widgets::{StatCard, StatusBadge};
 use crate::util::format_bytes_signed;
 use ratatui::{
@@ -37,11 +37,12 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(block, area);
 
     let phase_color = match state.phase {
-        crate::state::PipelinePhase::Idle => Color::Gray,
-        crate::state::PipelinePhase::Scanning => Color::Yellow,
-        crate::state::PipelinePhase::Paused => Color::LightYellow,
-        crate::state::PipelinePhase::Transcoding => Color::Green,
-        crate::state::PipelinePhase::Waiting => Color::Blue,
+        PipelinePhase::Idle => Color::Gray,
+        PipelinePhase::Scanning => Color::Yellow,
+        PipelinePhase::Transferring => Color::Cyan,
+        PipelinePhase::Paused => Color::LightYellow,
+        PipelinePhase::Transcoding => Color::Green,
+        PipelinePhase::Waiting => Color::Blue,
     };
 
     let nfs_color = if state.nfs_healthy {
@@ -252,11 +253,12 @@ fn render_current_transcode(f: &mut Frame, area: Rect, state: &AppState) {
         }
     } else {
         let msg = match state.phase {
-            crate::state::PipelinePhase::Idle => "Idle - no active transcode",
-            crate::state::PipelinePhase::Scanning => "Scanning media libraries...",
-            crate::state::PipelinePhase::Paused => "Paused (pause file present)",
-            crate::state::PipelinePhase::Waiting => "Waiting for next scan interval...",
-            _ => "Preparing...",
+            PipelinePhase::Idle => "Idle - no active transcode",
+            PipelinePhase::Scanning => "Scanning media libraries...",
+            PipelinePhase::Transferring => "Transferring media file...",
+            PipelinePhase::Paused => "Paused (pause file present)",
+            PipelinePhase::Transcoding => "Transcoding media file...",
+            PipelinePhase::Waiting => "Waiting for next scan interval...",
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -493,50 +495,56 @@ fn render_recent_activity(f: &mut Frame, area: Rect, state: &AppState) {
 
     let max_lines = inner.height as usize;
     let mut header_lines = Vec::new();
-    header_lines.push(format!(
-        "Skipped this pass: inspected={} young={} cooldown={} filtered={} in_use={} quarantined={}",
-        state.run_skipped_inspected,
-        state.run_skipped_young,
-        state.run_skipped_cooldown,
-        state.run_skipped_filtered,
-        state.run_skipped_in_use,
-        state.run_skipped_quarantined
-    ));
-    if !state.top_failure_reasons.is_empty() {
-        let summary = state
-            .top_failure_reasons
-            .iter()
-            .map(|(reason, count)| format!("{} ({})", reason, count))
-            .collect::<Vec<_>>()
-            .join(", ");
-        header_lines.push(format!("Top failure reasons: {}", summary));
-    }
-    if state.scan_timeout_count > 0 {
+    let show_pass_summary = matches!(
+        state.phase,
+        PipelinePhase::Idle | PipelinePhase::Waiting | PipelinePhase::Paused
+    );
+    if show_pass_summary {
         header_lines.push(format!(
-            "Scan timeouts (runtime): {}",
-            state.scan_timeout_count
+            "Skipped this pass: inspected={} young={} cooldown={} filtered={} in_use={} quarantined={}",
+            state.run_skipped_inspected,
+            state.run_skipped_young,
+            state.run_skipped_cooldown,
+            state.run_skipped_filtered,
+            state.run_skipped_in_use,
+            state.run_skipped_quarantined
         ));
-    }
-    if let Some(code) = state.last_failure_code.as_deref() {
-        header_lines.push(format!("Last failure code: {}", code));
-    }
-    if state.consecutive_pass_failures > 0 {
-        header_lines.push(format!(
-            "Consecutive pass failures: {}",
-            state.consecutive_pass_failures
-        ));
-    }
-    if state.auto_paused {
-        header_lines.push(format!(
-            "Auto-paused: {}",
-            state
-                .auto_pause_reason
-                .as_deref()
-                .unwrap_or("safety tripwire")
-        ));
-    }
-    if state.quarantined_files > 0 {
-        header_lines.push(format!("Quarantined files: {}", state.quarantined_files));
+        if !state.top_failure_reasons.is_empty() {
+            let summary = state
+                .top_failure_reasons
+                .iter()
+                .map(|(reason, count)| format!("{} ({})", reason, count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            header_lines.push(format!("Top failure reasons: {}", summary));
+        }
+        if state.scan_timeout_count > 0 {
+            header_lines.push(format!(
+                "Scan timeouts (runtime): {}",
+                state.scan_timeout_count
+            ));
+        }
+        if let Some(code) = state.last_failure_code.as_deref() {
+            header_lines.push(format!("Last failure code: {}", code));
+        }
+        if state.consecutive_pass_failures > 0 {
+            header_lines.push(format!(
+                "Consecutive pass failures: {}",
+                state.consecutive_pass_failures
+            ));
+        }
+        if state.auto_paused {
+            header_lines.push(format!(
+                "Auto-paused: {}",
+                state
+                    .auto_pause_reason
+                    .as_deref()
+                    .unwrap_or("safety tripwire")
+            ));
+        }
+        if state.quarantined_files > 0 {
+            header_lines.push(format!("Quarantined files: {}", state.quarantined_files));
+        }
     }
 
     let reserved = header_lines.len();

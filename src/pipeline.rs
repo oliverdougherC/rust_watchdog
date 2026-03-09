@@ -601,8 +601,7 @@ pub async fn run_watchdog_pass(
         return Ok(stats);
     }
 
-    // Transcode loop
-    state.set_phase(PipelinePhase::Transcoding);
+    // Per-file processing loop (import -> transcode -> export)
 
     let mut attempt_counts: std::collections::HashMap<PathBuf, u32> =
         std::collections::HashMap::new();
@@ -652,7 +651,7 @@ pub async fn run_watchdog_pass(
             state,
             "INFO",
             &format!(
-                "Transcoding {}/{}: {}",
+                "Processing {}/{}: {}",
                 processed, progress_total, display_filename
             ),
         );
@@ -769,6 +768,7 @@ pub async fn run_watchdog_pass(
         let (local_source, local_output) = build_local_temp_paths(&temp_dir, share_name, path);
 
         // Step 1: rsync source to temp
+        state.set_phase(PipelinePhase::Transferring);
         tui_log(
             state,
             "INFO",
@@ -900,6 +900,7 @@ pub async fn run_watchdog_pass(
         }
 
         // Step 2: Transcode
+        state.set_phase(PipelinePhase::Transcoding);
         tui_log(
             state,
             "INFO",
@@ -1429,6 +1430,7 @@ pub async fn run_watchdog_pass(
         }
 
         // Step 7: Safe replace
+        state.set_phase(PipelinePhase::Transferring);
         if check_file_in_use_best_effort(
             config,
             base_dir,

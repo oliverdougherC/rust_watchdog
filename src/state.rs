@@ -7,6 +7,7 @@ use tokio::sync::watch;
 pub enum PipelinePhase {
     Idle,
     Scanning,
+    Transferring,
     Paused,
     Transcoding,
     Waiting,
@@ -17,6 +18,7 @@ impl std::fmt::Display for PipelinePhase {
         match self {
             PipelinePhase::Idle => write!(f, "Idle"),
             PipelinePhase::Scanning => write!(f, "Scanning"),
+            PipelinePhase::Transferring => write!(f, "Rsyncing"),
             PipelinePhase::Paused => write!(f, "Paused"),
             PipelinePhase::Transcoding => write!(f, "Transcoding"),
             PipelinePhase::Waiting => write!(f, "Waiting"),
