@@ -37,6 +37,20 @@ cooldown_max_seconds = 86400
 in_use_guard_enabled = false
 in_use_guard_command = "lsof"
 recovery_scan_interval_seconds = 43200
+share_scan_timeout_seconds = 180
+max_consecutive_pass_failures = 3
+auto_pause_on_pass_failures = true
+quarantine_after_failures = 8
+quarantine_failure_codes = [
+  "transcode_failed",
+  "transcode_error",
+  "verification_failed",
+  "verification_error",
+  "safe_replace_failed",
+  "safe_replace_error",
+  "source_changed_during_transcode",
+]
+status_snapshot_stale_seconds = 30
 
 [notify]
 webhook_url = ""
@@ -48,3 +62,4 @@ transcode_temp = "/Volumes/External/tmp/"
 database = "watchdog.db"
 log_dir = "logs"
 status_snapshot = ""
+event_journal = ""

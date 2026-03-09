@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
@@ -15,7 +15,9 @@ struct TestFs {
     files: Mutex<HashMap<PathBuf, (u64, f64)>>,
     share_roots: HashMap<String, PathBuf>,
     free_space: u64,
+    free_space_error: AtomicBool,
     recovery_walk_calls: AtomicUsize,
+    walk_delay: Mutex<Option<Duration>>,
 }
 
 #[derive(Clone)]
@@ -31,7 +33,9 @@ impl TestFs {
             files: Mutex::new(HashMap::new()),
             share_roots,
             free_space: u64::MAX / 2,
+            free_space_error: AtomicBool::new(false),
             recovery_walk_calls: AtomicUsize::new(0),
+            walk_delay: Mutex::new(None),
         }
     }
 
@@ -57,6 +61,14 @@ impl TestFs {
     fn recovery_walk_calls(&self) -> usize {
         self.recovery_walk_calls.load(Ordering::Relaxed)
     }
+
+    fn set_walk_delay(&self, delay: Duration) {
+        *self.walk_delay.lock().unwrap() = Some(delay);
+    }
+
+    fn set_free_space_error(&self, enabled: bool) {
+        self.free_space_error.store(enabled, Ordering::Relaxed);
+    }
 }
 
 impl FileSystem for FsHandle {
@@ -66,6 +78,9 @@ impl FileSystem for FsHandle {
         root: &Path,
         extensions: &[String],
     ) -> Result<Vec<FileEntry>> {
+        if let Some(delay) = *self.0.walk_delay.lock().unwrap() {
+            std::thread::sleep(delay);
+        }
         let files = self.0.files.lock().unwrap();
         let mut out = Vec::new();
         for (path, (size, mtime)) in files.iter() {
@@ -155,6 +170,11 @@ impl FileSystem for FsHandle {
     }
 
     fn free_space(&self, _path: &Path) -> Result<u64> {
+        if self.0.free_space_error.load(Ordering::Relaxed) {
+            return Err(WatchdogError::Io(std::io::Error::other(
+                "free space probe failed",
+            )));
+        }
         Ok(self.0.free_space)
     }
 
@@ -298,7 +318,14 @@ struct TestTransfer {
 }
 
 impl FileTransfer for TestTransfer {
-    fn transfer(&self, source: &Path, dest: &Path, _timeout_secs: u64) -> Result<TransferResult> {
+    fn transfer(
+        &self,
+        source: &Path,
+        dest: &Path,
+        _timeout_secs: u64,
+        stage: TransferStage,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    ) -> Result<TransferResult> {
         let size = self
             .fs
             .get_size(source)
@@ -314,6 +341,14 @@ impl FileTransfer for TestTransfer {
                 reason: "source missing".to_string(),
             })?;
         self.fs.insert(dest, size, mtime);
+        if let Some(tx) = progress_tx {
+            let _ = tx.try_send(TransferProgress {
+                stage,
+                percent: 100.0,
+                rate_mib_per_sec: 0.0,
+                eta: String::new(),
+            });
+        }
         Ok(TransferResult { success: true })
     }
 }
@@ -407,7 +442,7 @@ async fn dry_run_success_exits_once() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -444,7 +479,7 @@ async fn dry_run_error_returns_immediately() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -485,7 +520,7 @@ async fn timeout_retries_up_to_max_retries() {
     let (state, _rx) = StateManager::new();
     let transcoder = TestTranscoder::new(fs.clone(), TranscodeMode::TimeoutAlways);
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(transcoder),
         transfer: Box::new(TestTransfer { fs: fs.clone() }),
@@ -522,7 +557,7 @@ async fn no_space_savings_recorded_as_skipped() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -564,7 +599,7 @@ async fn orphan_recovery_only_touches_watchdog_suffix() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -605,7 +640,7 @@ async fn orphan_recovery_runs_on_startup() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -644,7 +679,7 @@ async fn orphan_recovery_runs_periodically() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -693,7 +728,7 @@ async fn pause_file_blocks_scan_and_returns_paused() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -723,7 +758,8 @@ async fn cooldown_skips_file_before_probe() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let _ = db.record_file_failure(
         &source.to_string_lossy(),
-        "verification failed",
+        "verification_failed",
+        "verification_failed",
         1,
         600,
         600,
@@ -731,7 +767,7 @@ async fn cooldown_skips_file_before_probe() {
 
     let (state, mut rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -771,7 +807,7 @@ async fn max_files_per_pass_caps_queue() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -812,7 +848,7 @@ async fn pause_during_transcode_records_interrupted_by_pause() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -863,7 +899,7 @@ async fn include_exclude_filters_apply_with_exclude_precedence() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, mut rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -905,7 +941,7 @@ async fn include_glob_without_path_matches_basename() {
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, mut rx) = StateManager::new();
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -947,7 +983,7 @@ async fn in_use_guard_skips_before_transfer_without_cooldown() {
     let (state, _rx) = StateManager::new();
 
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -992,7 +1028,7 @@ async fn in_use_guard_skips_before_replace_and_cleans_temp() {
     let (state, _rx) = StateManager::new();
 
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -1037,7 +1073,7 @@ async fn in_use_detector_error_is_best_effort_continue() {
     let (state, _rx) = StateManager::new();
 
     let deps = PipelineDeps {
-        fs: Box::new(FsHandle(fs.clone())),
+        fs: Arc::new(FsHandle(fs.clone())),
         prober: Box::new(TestProber { fs: fs.clone() }),
         transcoder: Box::new(TestTranscoder::new(
             fs.clone(),
@@ -1066,4 +1102,449 @@ async fn in_use_detector_error_is_best_effort_continue() {
     assert_eq!(stats.files_transcoded, 1);
     assert_eq!(db.get_transcode_count(), 1);
     assert_eq!(state.snapshot().run_skipped_in_use, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_timeout_aborts_pass_before_transcode() {
+    let mut cfg = base_config();
+    cfg.safety.share_scan_timeout_seconds = 1;
+    let fs = Arc::new(TestFs::new(&cfg));
+    fs.set_walk_delay(Duration::from_millis(1500));
+    fs.insert(Path::new("/mnt/movies/Slow.Scan.mkv"), 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+    let err = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, WatchdogError::ScanTimeout { .. }));
+    assert!(db.get_recent_transcodes(10).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn temp_space_probe_error_is_fail_closed_and_persisted() {
+    let cfg = base_config();
+    let fs = Arc::new(TestFs::new(&cfg));
+    fs.set_free_space_error(true);
+    let source = PathBuf::from("/mnt/movies/Space.Probe.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+    let stats = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stats.files_transcoded, 0);
+    assert_eq!(db.get_transcode_count(), 0);
+    let recent = db.get_recent_transcodes(1);
+    assert_eq!(
+        recent[0].failure_code.as_deref(),
+        Some("temp_space_probe_error")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_during_transcode_cleans_temp_and_finalizes_row() {
+    let mut cfg = base_config();
+    cfg.paths.transcode_temp = "/tmp/watchdog-test-temp".to_string();
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Shutdown.Cancel.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::WaitForCancel,
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (shutdown_tx, _) = broadcast::channel(1);
+
+    std::thread::spawn({
+        let shutdown_tx = shutdown_tx.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let _ = shutdown_tx.send(());
+        }
+    });
+
+    let err = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        shutdown_tx.subscribe(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, WatchdogError::Shutdown));
+
+    let temp_entries = deps
+        .fs
+        .list_dir(Path::new(&cfg.paths.transcode_temp))
+        .unwrap();
+    assert!(
+        temp_entries.is_empty(),
+        "temp files not cleaned: {temp_entries:?}"
+    );
+
+    let recent = db.get_recent_transcodes(1);
+    assert_eq!(
+        recent[0].failure_reason.as_deref(),
+        Some("interrupted_by_shutdown")
+    );
+    assert!(recent[0].completed_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pipeline_loop_records_scan_timeout_in_state() {
+    let mut cfg = base_config();
+    cfg.safety.share_scan_timeout_seconds = 1;
+    cfg.scan.interval_seconds = 1;
+    let fs = Arc::new(TestFs::new(&cfg));
+    fs.set_walk_delay(Duration::from_millis(1500));
+    fs.insert(
+        Path::new("/mnt/movies/State.Timeout.mkv"),
+        50_000_000,
+        1000.0,
+    );
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let assert_db = db.clone();
+    let (state, _rx) = StateManager::new();
+    let assert_state = state.clone();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (shutdown_tx, _) = broadcast::channel(1);
+    let handle = tokio::spawn(run_pipeline_loop(
+        cfg,
+        PathBuf::from("."),
+        deps,
+        db,
+        state,
+        false,
+        false,
+        shutdown_tx.subscribe(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let _ = shutdown_tx.send(());
+    let result = handle.await.unwrap();
+    assert!(result.is_ok());
+
+    let snapshot = assert_state.snapshot();
+    assert!(snapshot.scan_timeout_count >= 1);
+    assert_eq!(snapshot.last_failure_code.as_deref(), Some("scan_timeout"));
+    let recent = assert_db.get_recent_transcodes(1);
+    assert_eq!(recent[0].source_path, "[pipeline]");
+    assert_eq!(recent[0].failure_code.as_deref(), Some("scan_timeout"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_scan_timeouts_trigger_auto_pause_tripwire() {
+    let mut cfg = base_config();
+    cfg.safety.share_scan_timeout_seconds = 1;
+    cfg.safety.max_consecutive_pass_failures = 1;
+    cfg.safety.auto_pause_on_pass_failures = true;
+    cfg.scan.interval_seconds = 1;
+    cfg.safety.pause_file = "watchdog.pause".to_string();
+    let base = tempfile::tempdir().unwrap();
+    let pause_path = base.path().join("watchdog.pause");
+
+    let fs = Arc::new(TestFs::new(&cfg));
+    fs.set_walk_delay(Duration::from_millis(1500));
+    fs.insert(
+        Path::new("/mnt/movies/Tripwire.Timeout.mkv"),
+        50_000_000,
+        1000.0,
+    );
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let assert_db = db.clone();
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (shutdown_tx, _) = broadcast::channel(1);
+
+    let handle = tokio::spawn(run_pipeline_loop(
+        cfg,
+        base.path().to_path_buf(),
+        deps,
+        db,
+        state,
+        false,
+        false,
+        shutdown_tx.subscribe(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(
+        pause_path.exists(),
+        "expected auto-pause marker to be created"
+    );
+    let _ = shutdown_tx.send(());
+    let result = handle.await.unwrap();
+    assert!(result.is_ok());
+
+    let recent = assert_db.get_recent_transcodes(20);
+    assert!(recent
+        .iter()
+        .any(|r| r.failure_code.as_deref() == Some("auto_paused_safety_trip")));
+    let service = assert_db.get_service_state();
+    assert!(service.auto_paused_at.is_some());
+    assert_eq!(assert_db.get_transcode_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantined_file_is_skipped_until_cleared() {
+    let mut cfg = base_config();
+    cfg.transcode.max_retries = 0;
+    cfg.safety.quarantine_after_failures = 2;
+    cfg.safety.quarantine_failure_codes = vec!["timeout_exhausted".to_string()];
+
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Quarantine.Target.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state_a, _rx_a) = StateManager::new();
+    let deps_a = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::TimeoutAlways,
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let _ = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps_a,
+        &db,
+        &state_a,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert!(!db.is_quarantined(&source.to_string_lossy()));
+
+    let (state_b, _rx_b) = StateManager::new();
+    let deps_b = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::TimeoutAlways,
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let _ = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps_b,
+        &db,
+        &state_b,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert!(db.is_quarantined(&source.to_string_lossy()));
+
+    let (state_c, _rx_c) = StateManager::new();
+    let deps_c = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let _ = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps_c,
+        &db,
+        &state_c,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    let recent = db.get_recent_transcodes(5);
+    assert!(recent
+        .iter()
+        .any(|r| r.failure_code.as_deref() == Some("quarantined_file")));
+
+    assert!(db.clear_quarantine_file(&source.to_string_lossy()));
+    db.clear_file_failure_state(&source.to_string_lossy());
+    let (state_d, _rx_d) = StateManager::new();
+    let deps_d = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::TimeoutAlways,
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let _ = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps_d,
+        &db,
+        &state_d,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    let latest = db.get_recent_transcodes(1);
+    assert_ne!(latest[0].failure_code.as_deref(), Some("quarantined_file"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn event_journal_writes_pass_start_and_end_rows() {
+    let mut cfg = base_config();
+    cfg.paths.event_journal = "events.ndjson".to_string();
+    let base = tempfile::tempdir().unwrap();
+    let fs = Arc::new(TestFs::new(&cfg));
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let _ = run_watchdog_pass(&cfg, base.path(), &deps, &db, &state, true, tx.subscribe())
+        .await
+        .unwrap();
+
+    let journal = std::fs::read_to_string(base.path().join("events.ndjson")).unwrap();
+    let mut events = Vec::new();
+    for line in journal.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        events.push(
+            value
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    assert!(events.iter().any(|e| e == "pass_start"));
+    assert!(events.iter().any(|e| e == "pass_end"));
 }

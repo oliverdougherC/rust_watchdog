@@ -1,6 +1,9 @@
 use crate::config::TranscodeConfig;
 use crate::error::{Result, WatchdogError};
-use crate::process::{run_command, RunOptions};
+use crate::process::{
+    describe_exit_status, format_command_for_log, infer_failure_hint, run_command,
+    summarize_output_tail, RunOptions,
+};
 use crate::traits::{ProbeResult, Prober};
 use std::path::Path;
 use std::process::Command;
@@ -22,6 +25,7 @@ impl Prober for FfprobeProber {
             "-show_streams",
         ])
         .arg(path);
+        let command_repr = format_command_for_log(&cmd);
         let output = run_command(
             cmd,
             RunOptions {
@@ -37,6 +41,12 @@ impl Prober for FfprobeProber {
         })?;
 
         if output.timed_out {
+            warn!(
+                "ffprobe timed out while probing {}: timeout=30s elapsed={:.1}s command={}",
+                path.display(),
+                output.elapsed.as_secs_f64(),
+                command_repr
+            );
             return Err(WatchdogError::Probe {
                 path: path.to_path_buf(),
                 reason: "ffprobe timed out after 30s".to_string(),
@@ -44,13 +54,52 @@ impl Prober for FfprobeProber {
         }
 
         if !output.status.success() {
+            let stderr_summary = summarize_output_tail(&output.stderr_tail, 320);
+            let hint_suffix = infer_failure_hint(&stderr_summary)
+                .map(|hint| format!(" likely_cause={}", hint))
+                .unwrap_or_default();
+            let trunc_suffix = if output.stderr_truncated {
+                format!(
+                    " [stderr tail truncated; captured {} of {} bytes]",
+                    output.stderr_tail.len(),
+                    output.stderr_total_bytes
+                )
+            } else {
+                String::new()
+            };
+            warn!(
+                "ffprobe failed for {}: status={} elapsed={:.1}s stderr={}{}{}",
+                path.display(),
+                describe_exit_status(&output.status),
+                output.elapsed.as_secs_f64(),
+                stderr_summary,
+                trunc_suffix,
+                hint_suffix
+            );
             return Ok(None);
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
         let data: serde_json::Value = match serde_json::from_str(&json_str) {
             Ok(v) => v,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                warn!(
+                    "ffprobe JSON parse failed for {}: {} | stdout_excerpt={}{}",
+                    path.display(),
+                    e,
+                    summarize_output_tail(&output.stdout, 320),
+                    if output.stdout_truncated {
+                        format!(
+                            " [stdout tail truncated; captured {} of {} bytes]",
+                            output.stdout.len(),
+                            output.stdout_total_bytes
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+                return Ok(None);
+            }
         };
 
         Ok(Some(parse_probe_result(data)))
@@ -59,6 +108,7 @@ impl Prober for FfprobeProber {
     fn health_check(&self, path: &Path) -> Result<bool> {
         let mut cmd = Command::new("ffprobe");
         cmd.args(["-v", "error", "-hide_banner"]).arg(path);
+        let command_repr = format_command_for_log(&cmd);
         let output = run_command(
             cmd,
             RunOptions {
@@ -72,7 +122,32 @@ impl Prober for FfprobeProber {
             reason: format!("ffprobe health check failed: {}", e),
         })?;
 
-        Ok(output.status.success() && !output.timed_out)
+        if output.timed_out {
+            warn!(
+                "ffprobe health-check timed out for {} after 15s (elapsed={:.1}s): command={}",
+                path.display(),
+                output.elapsed.as_secs_f64(),
+                command_repr
+            );
+            return Ok(false);
+        }
+
+        if !output.status.success() {
+            let stderr_summary = summarize_output_tail(&output.stderr_tail, 320);
+            let hint_suffix = infer_failure_hint(&stderr_summary)
+                .map(|hint| format!(" likely_cause={}", hint))
+                .unwrap_or_default();
+            warn!(
+                "ffprobe health-check failed for {}: status={} stderr={}{}",
+                path.display(),
+                describe_exit_status(&output.status),
+                stderr_summary,
+                hint_suffix
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 }
 

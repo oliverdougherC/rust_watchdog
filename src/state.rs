@@ -24,6 +24,26 @@ impl std::fmt::Display for PipelinePhase {
     }
 }
 
+/// Fine-grained stage for the per-file progress bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressStage {
+    Idle,
+    Import,
+    Transcode,
+    Export,
+}
+
+impl std::fmt::Display for ProgressStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProgressStage::Idle => write!(f, "Idle"),
+            ProgressStage::Import => write!(f, "Import"),
+            ProgressStage::Transcode => write!(f, "Transcode"),
+            ProgressStage::Export => write!(f, "Export"),
+        }
+    }
+}
+
 /// Snapshot of the entire application state, shared between pipeline and TUI.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -35,7 +55,12 @@ pub struct AppState {
     pub current_file: Option<String>,
     pub queue_position: u32,
     pub queue_total: u32,
+    pub progress_stage: ProgressStage,
+    pub import_percent: f64,
     pub transcode_percent: f64,
+    pub export_percent: f64,
+    pub transfer_rate_mib_per_sec: f64,
+    pub transfer_eta: String,
     pub transcode_fps: f64,
     pub transcode_avg_fps: f64,
     pub transcode_eta: String,
@@ -55,9 +80,17 @@ pub struct AppState {
     pub run_skipped_cooldown: u64,
     pub run_skipped_filtered: u64,
     pub run_skipped_in_use: u64,
+    pub run_skipped_quarantined: u64,
+    pub scan_timeout_count: u64,
+    pub consecutive_pass_failures: u32,
+    pub auto_paused: bool,
+    pub auto_pause_reason: Option<String>,
+    pub auto_paused_at: Option<String>,
+    pub quarantined_files: u64,
 
     // Failure insights
     pub top_failure_reasons: Vec<(String, u64)>,
+    pub last_failure_code: Option<String>,
     pub share_health: Vec<(String, bool)>,
 
     // Timing
@@ -76,7 +109,12 @@ impl Default for AppState {
             current_file: None,
             queue_position: 0,
             queue_total: 0,
+            progress_stage: ProgressStage::Idle,
+            import_percent: 0.0,
             transcode_percent: 0.0,
+            export_percent: 0.0,
+            transfer_rate_mib_per_sec: 0.0,
+            transfer_eta: String::new(),
             transcode_fps: 0.0,
             transcode_avg_fps: 0.0,
             transcode_eta: String::new(),
@@ -92,7 +130,15 @@ impl Default for AppState {
             run_skipped_cooldown: 0,
             run_skipped_filtered: 0,
             run_skipped_in_use: 0,
+            run_skipped_quarantined: 0,
+            scan_timeout_count: 0,
+            consecutive_pass_failures: 0,
+            auto_paused: false,
+            auto_pause_reason: None,
+            auto_paused_at: None,
+            quarantined_files: 0,
             top_failure_reasons: Vec::new(),
+            last_failure_code: None,
             share_health: Vec::new(),
             last_pass_time: None,
             log_lines: VecDeque::with_capacity(500),
@@ -157,10 +203,53 @@ impl StateManager {
         });
     }
 
+    /// Reset all per-file progress fields.
+    pub fn reset_file_progress(&self) {
+        self.tx.send_modify(|state| {
+            state.progress_stage = ProgressStage::Idle;
+            state.import_percent = 0.0;
+            state.transcode_percent = 0.0;
+            state.export_percent = 0.0;
+            state.transfer_rate_mib_per_sec = 0.0;
+            state.transfer_eta.clear();
+            state.transcode_fps = 0.0;
+            state.transcode_avg_fps = 0.0;
+            state.transcode_eta.clear();
+        });
+    }
+
+    /// Set import transfer progress.
+    pub fn set_import_progress(&self, percent: f64, rate_mib_per_sec: f64, eta: String) {
+        self.tx.send_modify(|state| {
+            state.progress_stage = ProgressStage::Import;
+            state.import_percent = percent.clamp(0.0, 100.0);
+            state.transfer_rate_mib_per_sec = rate_mib_per_sec.max(0.0);
+            state.transfer_eta = eta;
+        });
+    }
+
+    /// Set export transfer progress.
+    pub fn set_export_progress(&self, percent: f64, rate_mib_per_sec: f64, eta: String) {
+        self.tx.send_modify(|state| {
+            state.progress_stage = ProgressStage::Export;
+            state.export_percent = percent.clamp(0.0, 100.0);
+            state.transfer_rate_mib_per_sec = rate_mib_per_sec.max(0.0);
+            state.transfer_eta = eta;
+        });
+    }
+
+    /// Set the active per-file progress stage without changing percentages.
+    pub fn set_progress_stage(&self, stage: ProgressStage) {
+        self.tx.send_modify(|state| {
+            state.progress_stage = stage;
+        });
+    }
+
     /// Set transcode progress.
     pub fn set_transcode_progress(&self, percent: f64, fps: f64, avg_fps: f64, eta: String) {
         self.tx.send_modify(|state| {
-            state.transcode_percent = percent;
+            state.progress_stage = ProgressStage::Transcode;
+            state.transcode_percent = percent.clamp(0.0, 100.0);
             state.transcode_fps = fps;
             state.transcode_avg_fps = avg_fps;
             state.transcode_eta = eta;

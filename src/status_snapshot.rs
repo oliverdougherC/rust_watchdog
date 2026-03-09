@@ -18,15 +18,23 @@ struct SnapshotPayload<'a> {
     queue_position: u32,
     queue_total: u32,
     current_file: Option<&'a str>,
+    progress_stage: String,
+    import_percent: f64,
     transcode_percent: f64,
+    export_percent: f64,
+    composite_percent: f64,
+    transfer_rate_mib_per_sec: f64,
+    transfer_eta: &'a str,
     transcode_fps: f64,
     transcode_avg_fps: f64,
     transcode_eta: &'a str,
     totals: SnapshotTotals,
     run: SnapshotRun,
+    reliability: SnapshotReliability<'a>,
     cooldown_files: i64,
     top_failure_reasons: &'a [(String, u64)],
     share_health: Vec<SnapshotShareHealth>,
+    unhealthy_shares: Vec<String>,
     latest_failure: Option<SnapshotLatestFailure>,
 }
 
@@ -48,6 +56,18 @@ struct SnapshotRun {
     skipped_cooldown: u64,
     skipped_filtered: u64,
     skipped_in_use: u64,
+    skipped_quarantined: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SnapshotReliability<'a> {
+    scan_timeouts: u64,
+    last_failure_code: Option<&'a str>,
+    consecutive_pass_failures: u32,
+    auto_paused: bool,
+    auto_pause_reason: Option<&'a str>,
+    auto_paused_at: Option<&'a str>,
+    quarantined_files: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,7 +111,15 @@ pub fn write_snapshot(
         queue_position: state.queue_position,
         queue_total: state.queue_total,
         current_file: state.current_file.as_deref(),
+        progress_stage: state.progress_stage.to_string(),
+        import_percent: state.import_percent,
         transcode_percent: state.transcode_percent,
+        export_percent: state.export_percent,
+        composite_percent: (state.import_percent * 0.20)
+            + (state.transcode_percent * 0.60)
+            + (state.export_percent * 0.20),
+        transfer_rate_mib_per_sec: state.transfer_rate_mib_per_sec,
+        transfer_eta: &state.transfer_eta,
         transcode_fps: state.transcode_fps,
         transcode_avg_fps: state.transcode_avg_fps,
         transcode_eta: &state.transcode_eta,
@@ -110,6 +138,16 @@ pub fn write_snapshot(
             skipped_cooldown: state.run_skipped_cooldown,
             skipped_filtered: state.run_skipped_filtered,
             skipped_in_use: state.run_skipped_in_use,
+            skipped_quarantined: state.run_skipped_quarantined,
+        },
+        reliability: SnapshotReliability {
+            scan_timeouts: state.scan_timeout_count,
+            last_failure_code: state.last_failure_code.as_deref(),
+            consecutive_pass_failures: state.consecutive_pass_failures,
+            auto_paused: state.auto_paused,
+            auto_pause_reason: state.auto_pause_reason.as_deref(),
+            auto_paused_at: state.auto_paused_at.as_deref(),
+            quarantined_files: state.quarantined_files,
         },
         cooldown_files,
         top_failure_reasons: &state.top_failure_reasons,
@@ -120,6 +158,11 @@ pub fn write_snapshot(
                 name: name.clone(),
                 healthy: *healthy,
             })
+            .collect(),
+        unhealthy_shares: state
+            .share_health
+            .iter()
+            .filter_map(|(name, healthy)| (!*healthy).then_some(name.clone()))
             .collect(),
         latest_failure: latest_failure.map(|failure| SnapshotLatestFailure {
             source_path: failure.source_path.clone(),
@@ -213,8 +256,11 @@ mod tests {
         assert_eq!(json["cooldown_files"], 5);
         assert_eq!(json["run"]["skipped_in_use"], 2);
         assert_eq!(json["totals"]["transcoded"], 3);
+        assert_eq!(json["reliability"]["scan_timeouts"], 0);
+        assert!(json["reliability"]["last_failure_code"].is_null());
         assert_eq!(json["share_health"][0]["name"], "movies");
         assert_eq!(json["share_health"][1]["healthy"], false);
+        assert_eq!(json["unhealthy_shares"][0], "tv");
         assert!(json["latest_failure"].is_null());
     }
 

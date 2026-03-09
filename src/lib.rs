@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod event_journal;
 pub mod in_use;
 pub mod nfs;
 pub mod notify;

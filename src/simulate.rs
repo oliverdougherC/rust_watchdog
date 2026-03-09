@@ -539,7 +539,14 @@ impl SimulatedTransfer {
 }
 
 impl FileTransfer for SimulatedTransfer {
-    fn transfer(&self, source: &Path, dest: &Path, _timeout_secs: u64) -> Result<TransferResult> {
+    fn transfer(
+        &self,
+        source: &Path,
+        dest: &Path,
+        _timeout_secs: u64,
+        stage: TransferStage,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    ) -> Result<TransferResult> {
         // Copy the source's metadata to dest in temp_files
         let source_file = self.fs.find_file(source);
         let sim_file = match source_file {
@@ -569,6 +576,14 @@ impl FileTransfer for SimulatedTransfer {
             .lock()
             .unwrap()
             .insert(dest.to_path_buf(), sim_file);
+        if let Some(tx) = &progress_tx {
+            let _ = tx.try_send(TransferProgress {
+                stage,
+                percent: 100.0,
+                rate_mib_per_sec: 0.0,
+                eta: String::new(),
+            });
+        }
         // Brief delay to simulate transfer
         std::thread::sleep(std::time::Duration::from_millis(100));
         Ok(TransferResult { success: true })
@@ -599,7 +614,7 @@ pub fn create_simulated_deps(config: &Config) -> PipelineDeps {
     let fs = std::sync::Arc::new(SimulatedFileSystem::new(config));
 
     PipelineDeps {
-        fs: Box::new(SimulatedFileSystemWrapper(fs.clone())),
+        fs: std::sync::Arc::new(SimulatedFileSystemWrapper(fs.clone())),
         prober: Box::new(SimulatedProber::new(fs.clone())),
         transcoder: Box::new(SimulatedTranscoder::new(fs.clone())),
         transfer: Box::new(SimulatedTransfer::new(fs.clone())),

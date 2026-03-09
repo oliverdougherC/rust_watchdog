@@ -24,6 +24,12 @@ pub enum WatchdogError {
     #[error("NFS mount failed for share '{share}': {reason}")]
     NfsMount { share: String, reason: String },
 
+    #[error("Share scan timed out after {timeout_secs}s ({pending_shares} share(s) pending)")]
+    ScanTimeout {
+        timeout_secs: u64,
+        pending_shares: usize,
+    },
+
     #[error("Transcode failed for {path}: {reason}")]
     Transcode { path: PathBuf, reason: String },
 

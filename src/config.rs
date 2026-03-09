@@ -184,6 +184,24 @@ pub struct SafetyConfig {
 
     #[serde(default = "default_recovery_scan_interval_seconds")]
     pub recovery_scan_interval_seconds: u64,
+
+    #[serde(default = "default_share_scan_timeout_seconds")]
+    pub share_scan_timeout_seconds: u64,
+
+    #[serde(default = "default_max_consecutive_pass_failures")]
+    pub max_consecutive_pass_failures: u32,
+
+    #[serde(default = "default_auto_pause_on_pass_failures")]
+    pub auto_pause_on_pass_failures: bool,
+
+    #[serde(default = "default_quarantine_after_failures")]
+    pub quarantine_after_failures: u32,
+
+    #[serde(default = "default_quarantine_failure_codes")]
+    pub quarantine_failure_codes: Vec<String>,
+
+    #[serde(default = "default_status_snapshot_stale_seconds")]
+    pub status_snapshot_stale_seconds: u64,
 }
 
 impl Default for SafetyConfig {
@@ -197,6 +215,12 @@ impl Default for SafetyConfig {
             in_use_guard_enabled: false,
             in_use_guard_command: default_in_use_guard_command(),
             recovery_scan_interval_seconds: default_recovery_scan_interval_seconds(),
+            share_scan_timeout_seconds: default_share_scan_timeout_seconds(),
+            max_consecutive_pass_failures: default_max_consecutive_pass_failures(),
+            auto_pause_on_pass_failures: default_auto_pause_on_pass_failures(),
+            quarantine_after_failures: default_quarantine_after_failures(),
+            quarantine_failure_codes: default_quarantine_failure_codes(),
+            status_snapshot_stale_seconds: default_status_snapshot_stale_seconds(),
         }
     }
 }
@@ -223,6 +247,38 @@ fn default_recovery_scan_interval_seconds() -> u64 {
     43_200
 }
 
+fn default_share_scan_timeout_seconds() -> u64 {
+    180
+}
+
+fn default_max_consecutive_pass_failures() -> u32 {
+    3
+}
+
+fn default_auto_pause_on_pass_failures() -> bool {
+    true
+}
+
+fn default_quarantine_after_failures() -> u32 {
+    8
+}
+
+fn default_quarantine_failure_codes() -> Vec<String> {
+    vec![
+        "transcode_failed".to_string(),
+        "transcode_error".to_string(),
+        "verification_failed".to_string(),
+        "verification_error".to_string(),
+        "safe_replace_failed".to_string(),
+        "safe_replace_error".to_string(),
+        "source_changed_during_transcode".to_string(),
+    ]
+}
+
+fn default_status_snapshot_stale_seconds() -> u64 {
+    30
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PathsConfig {
     #[serde(default = "default_transcode_temp")]
@@ -237,6 +293,9 @@ pub struct PathsConfig {
 
     #[serde(default)]
     pub status_snapshot: String,
+
+    #[serde(default)]
+    pub event_journal: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +339,7 @@ impl Default for PathsConfig {
             database: default_database(),
             log_dir: default_log_dir(),
             status_snapshot: String::new(),
+            event_journal: String::new(),
         }
     }
 }
@@ -365,7 +425,15 @@ impl Config {
             .collect();
         self.safety.pause_file = self.safety.pause_file.trim().to_string();
         self.safety.in_use_guard_command = self.safety.in_use_guard_command.trim().to_string();
+        self.safety.quarantine_failure_codes = self
+            .safety
+            .quarantine_failure_codes
+            .iter()
+            .map(|code| code.trim().to_lowercase())
+            .filter(|code| !code.is_empty())
+            .collect();
         self.paths.status_snapshot = self.paths.status_snapshot.trim().to_string();
+        self.paths.event_journal = self.paths.event_journal.trim().to_string();
         self.notify.webhook_url = self.notify.webhook_url.trim().to_string();
         self.notify.events = self
             .notify
@@ -458,11 +526,34 @@ impl Config {
         if self.safety.recovery_scan_interval_seconds == 0 {
             errors.push("safety.recovery_scan_interval_seconds must be >= 1".to_string());
         }
+        if self.safety.share_scan_timeout_seconds == 0 {
+            errors.push("safety.share_scan_timeout_seconds must be >= 1".to_string());
+        }
+        if self.safety.max_consecutive_pass_failures == 0 {
+            errors.push("safety.max_consecutive_pass_failures must be >= 1".to_string());
+        }
+        if self.safety.quarantine_after_failures == 0 {
+            errors.push("safety.quarantine_after_failures must be >= 1".to_string());
+        }
+        if self.safety.status_snapshot_stale_seconds < 5 {
+            errors.push("safety.status_snapshot_stale_seconds must be >= 5".to_string());
+        }
         if self.safety.in_use_guard_enabled && self.safety.in_use_guard_command.is_empty() {
             errors.push(
                 "safety.in_use_guard_command must not be empty when in_use_guard_enabled=true"
                     .to_string(),
             );
+        }
+        for code in &self.safety.quarantine_failure_codes {
+            let valid = code
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if !valid {
+                errors.push(format!(
+                    "safety.quarantine_failure_codes contains invalid code '{}'",
+                    code
+                ));
+            }
         }
         if !(self.notify.webhook_url.is_empty()
             || self.notify.webhook_url.starts_with("http://")
@@ -512,14 +603,22 @@ mod tests {
         cfg.scan.video_extensions = vec!["MKV".to_string(), ".Mp4".to_string()];
         cfg.scan.include_globs = vec!["  *.mkv  ".to_string()];
         cfg.safety.in_use_guard_command = "  lsof  ".to_string();
+        cfg.safety.quarantine_failure_codes =
+            vec!["  TRANSCode_Failed ".to_string(), " ".to_string()];
         cfg.paths.status_snapshot = "  status.json  ".to_string();
+        cfg.paths.event_journal = "  events.ndjson  ".to_string();
         cfg.normalize();
 
         assert_eq!(cfg.transcode.target_codec, "av1");
         assert_eq!(cfg.scan.video_extensions, vec![".mkv", ".mp4"]);
         assert_eq!(cfg.scan.include_globs, vec!["*.mkv"]);
         assert_eq!(cfg.safety.in_use_guard_command, "lsof");
+        assert_eq!(
+            cfg.safety.quarantine_failure_codes,
+            vec!["transcode_failed".to_string()]
+        );
         assert_eq!(cfg.paths.status_snapshot, "status.json");
+        assert_eq!(cfg.paths.event_journal, "events.ndjson");
     }
 
     #[test]
@@ -552,6 +651,10 @@ mod tests {
         cfg.safety.cooldown_base_seconds = 100;
         cfg.safety.cooldown_max_seconds = 10;
         cfg.safety.recovery_scan_interval_seconds = 0;
+        cfg.safety.share_scan_timeout_seconds = 0;
+        cfg.safety.max_consecutive_pass_failures = 0;
+        cfg.safety.quarantine_after_failures = 0;
+        cfg.safety.status_snapshot_stale_seconds = 4;
         let errs = cfg.validate();
         assert!(errs
             .iter()
@@ -560,6 +663,24 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| e.contains("recovery_scan_interval_seconds")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("share_scan_timeout_seconds")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("max_consecutive_pass_failures")));
+        assert!(errs.iter().any(|e| e.contains("quarantine_after_failures")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("status_snapshot_stale_seconds")));
+    }
+
+    #[test]
+    fn test_validate_quarantine_failure_code_format() {
+        let mut cfg = Config::default_config();
+        cfg.safety.quarantine_failure_codes = vec!["bad-code".to_string()];
+        let errs = cfg.validate();
+        assert!(errs.iter().any(|e| e.contains("quarantine_failure_codes")));
     }
 
     #[test]

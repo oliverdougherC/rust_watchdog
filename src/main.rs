@@ -1,5 +1,6 @@
 use clap::Parser;
-use std::path::PathBuf;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use watchdog::config::Config;
 use watchdog::db::WatchdogDb;
+use watchdog::event_journal::{append_event, resolve_event_journal_path};
 use watchdog::in_use::CommandInUseDetector;
 use watchdog::nfs::SystemMountManager;
 use watchdog::pipeline::{run_pipeline_loop, PipelineDeps};
@@ -29,6 +31,10 @@ const HC_DB_FAIL: i32 = 21;
 const HC_DEPS_FAIL: i32 = 22;
 const HC_NFS_FAIL: i32 = 23;
 const HC_INTERNAL_FAIL: i32 = 24;
+const STATUS_OK: i32 = 0;
+const STATUS_DEGRADED: i32 = 30;
+const STATUS_UNHEALTHY: i32 = 31;
+const STATUS_INTERNAL_FAIL: i32 = 32;
 
 #[derive(Debug, serde::Serialize)]
 struct HealthcheckChecks {
@@ -51,6 +57,12 @@ struct HealthcheckResult {
     db_query_ok: bool,
     dependency_diagnostics: Vec<HealthcheckDependency>,
     mount_checks: Vec<HealthcheckMountCheck>,
+    latest_failure_code: Option<String>,
+    snapshot_age_seconds: Option<u64>,
+    status_freshness: String,
+    consecutive_pass_failures: u32,
+    auto_pause_reason: Option<String>,
+    quarantine_count: i64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -80,6 +92,38 @@ struct DoctorMountCheck {
     mount: String,
     healthy: bool,
     latency_ms: u128,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StatusResult {
+    status: String,
+    exit_code: i32,
+    mode: String,
+    paused: bool,
+    auto_paused: bool,
+    auto_pause_reason: Option<String>,
+    nfs_healthy: Option<bool>,
+    unhealthy_shares: Vec<String>,
+    phase: Option<String>,
+    queue_position: Option<u64>,
+    queue_total: Option<u64>,
+    current_file: Option<String>,
+    cooldown_files: i64,
+    scan_timeouts: u64,
+    last_failure_code: Option<String>,
+    quarantine_count: i64,
+    consecutive_pass_failures: u32,
+    status_freshness: String,
+    snapshot_age_seconds: Option<u64>,
+    snapshot_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct SnapshotDiagnostics {
+    freshness: String,
+    age_seconds: Option<u64>,
+    snapshot: Option<Value>,
+    snapshot_path: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -128,6 +172,26 @@ struct Cli {
     /// Guided diagnostics mode (config, deps, mounts, DB)
     #[arg(long)]
     doctor: bool,
+
+    /// Read-only service status for SSH operators
+    #[arg(long)]
+    status: bool,
+
+    /// Emit service status output as JSON (implies --status)
+    #[arg(long)]
+    status_json: bool,
+
+    /// List quarantined files and exit
+    #[arg(long)]
+    quarantine_list: bool,
+
+    /// Clear one quarantined file path and exit
+    #[arg(long)]
+    quarantine_clear: Option<String>,
+
+    /// Clear all quarantined files and exit
+    #[arg(long)]
+    quarantine_clear_all: bool,
 }
 
 #[tokio::main]
@@ -139,9 +203,40 @@ async fn main() -> anyhow::Result<()> {
     if cli.once && cli.dry_run {
         anyhow::bail!("Use only one of --once or --dry-run");
     }
+    let run_status_mode = cli.status || cli.status_json;
     let run_healthcheck_mode = cli.healthcheck || cli.healthcheck_json;
-    if cli.doctor && (run_healthcheck_mode || cli.pause || cli.resume) {
-        anyhow::bail!("--doctor cannot be combined with healthcheck/pause/resume flags");
+    if run_status_mode && run_healthcheck_mode {
+        anyhow::bail!("Use only one of --status/--status-json or --healthcheck/--healthcheck-json");
+    }
+    if cli.doctor && (run_healthcheck_mode || run_status_mode || cli.pause || cli.resume) {
+        anyhow::bail!("--doctor cannot be combined with healthcheck/status/pause/resume flags");
+    }
+    if cli.pause
+        && (run_status_mode
+            || cli.quarantine_list
+            || cli.quarantine_clear.is_some()
+            || cli.quarantine_clear_all)
+    {
+        anyhow::bail!("--pause cannot be combined with status/quarantine commands");
+    }
+    if cli.resume
+        && (run_status_mode
+            || cli.quarantine_list
+            || cli.quarantine_clear.is_some()
+            || cli.quarantine_clear_all)
+    {
+        anyhow::bail!("--resume cannot be combined with status/quarantine commands");
+    }
+    let quarantine_action_count = (cli.quarantine_list as u8)
+        + (cli.quarantine_clear.is_some() as u8)
+        + (cli.quarantine_clear_all as u8);
+    if quarantine_action_count > 1 {
+        anyhow::bail!(
+            "Use only one of --quarantine-list, --quarantine-clear, --quarantine-clear-all"
+        );
+    }
+    if run_status_mode && quarantine_action_count > 0 {
+        anyhow::bail!("--status/--status-json cannot be combined with quarantine mutation flags");
     }
 
     // Set up tracing — suppress stderr output in TUI mode to avoid corrupting the display
@@ -149,6 +244,10 @@ async fn main() -> anyhow::Result<()> {
         && !cli.dry_run
         && !cli.once
         && !cli.doctor
+        && !run_status_mode
+        && !cli.quarantine_list
+        && !cli.quarantine_clear_all
+        && cli.quarantine_clear.is_none()
         && !run_healthcheck_mode
         && !cli.pause
         && !cli.resume;
@@ -162,6 +261,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("Starting Jellyfin AV1 Transcoding Watchdog");
+    info!(
+        "Runtime flags: simulate={} headless={} dry_run={} once={} doctor={} status_mode={} healthcheck_mode={}",
+        cli.simulate,
+        cli.headless,
+        cli.dry_run,
+        cli.once,
+        cli.doctor,
+        run_status_mode,
+        run_healthcheck_mode
+    );
 
     // Load or generate config
     let config = if cli.simulate {
@@ -174,6 +283,9 @@ async fn main() -> anyhow::Result<()> {
                 error!("Failed to load config from {}: {}", cli.config.display(), e);
                 if run_healthcheck_mode {
                     std::process::exit(HC_CONFIG_FAIL);
+                }
+                if run_status_mode {
+                    std::process::exit(STATUS_INTERNAL_FAIL);
                 }
                 anyhow::bail!("Config load failed: {}", e);
             }
@@ -191,41 +303,55 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_path_buf()
     };
+    info!("Resolved base directory: {}", base_dir.display());
 
+    let mut resume_requested = false;
     if cli.pause || cli.resume {
         let pause_path = config.resolve_path(&base_dir, &config.safety.pause_file);
         if cli.pause {
             if let Some(parent) = pause_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let marker = format!("paused_at={}\n", chrono::Utc::now().to_rfc3339());
+            let marker = format!(
+                "paused_at={}\nreason=manual_cli\nsource=operator\n",
+                chrono::Utc::now().to_rfc3339()
+            );
             std::fs::write(&pause_path, marker.as_bytes())?;
             println!("pause file created: {}", pause_path.display());
-        } else if pause_path.exists() {
-            std::fs::remove_file(&pause_path)?;
-            println!("pause file removed: {}", pause_path.display());
         } else {
-            println!("pause file already absent: {}", pause_path.display());
+            if pause_path.exists() {
+                std::fs::remove_file(&pause_path)?;
+                println!("pause file removed: {}", pause_path.display());
+            } else {
+                println!("pause file already absent: {}", pause_path.display());
+            }
+            resume_requested = true;
         }
-        return Ok(());
+        if cli.pause {
+            return Ok(());
+        }
     }
 
-    // Validate config
     let validation_errors = config.validate();
-    if !validation_errors.is_empty() && !cli.simulate {
+    if run_healthcheck_mode && !cli.simulate && !validation_errors.is_empty() {
         for err in &validation_errors {
             error!("Config validation error: {}", err);
         }
-        if run_healthcheck_mode {
-            std::process::exit(HC_CONFIG_FAIL);
+        std::process::exit(HC_CONFIG_FAIL);
+    }
+    if run_status_mode && !cli.simulate && !validation_errors.is_empty() {
+        for err in &validation_errors {
+            error!("Config validation error: {}", err);
         }
-        anyhow::bail!(
-            "Configuration validation failed with {} error(s)",
-            validation_errors.len()
-        );
+        std::process::exit(STATUS_INTERNAL_FAIL);
     }
 
     let status_snapshot_path = resolve_status_snapshot_path(&config, &base_dir);
+    if let Some(path) = status_snapshot_path.as_ref() {
+        info!("Status snapshot path: {}", path.display());
+    } else {
+        info!("Status snapshot path: disabled");
+    }
 
     // Open database
     let db = if cli.simulate {
@@ -243,10 +369,90 @@ async fn main() -> anyhow::Result<()> {
                 if run_healthcheck_mode {
                     std::process::exit(HC_DB_FAIL);
                 }
+                if run_status_mode {
+                    std::process::exit(STATUS_INTERNAL_FAIL);
+                }
                 return Err(e.into());
             }
         }
     };
+
+    if resume_requested {
+        db.clear_auto_paused();
+        db.note_pass_success();
+        let event_path = resolve_event_journal_path(&config.paths.event_journal, &base_dir);
+        append_event(
+            event_path.as_deref(),
+            "auto_pause_cleared",
+            json!({"source": "manual_resume"}),
+        );
+        return Ok(());
+    }
+
+    if cli.quarantine_list {
+        let records = db.list_quarantined_files(500);
+        if records.is_empty() {
+            println!("No quarantined files");
+        } else {
+            println!("quarantined_files: {}", records.len());
+            for rec in records {
+                println!(
+                    "- {} | at={} | code={} | reason={}",
+                    rec.file_path,
+                    rec.quarantined_at,
+                    rec.last_failure_code.as_deref().unwrap_or("-"),
+                    rec.reason.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(path) = cli.quarantine_clear.as_deref() {
+        let removed = db.clear_quarantine_file(path);
+        if removed {
+            db.clear_file_failure_state(path);
+            let event_path = resolve_event_journal_path(&config.paths.event_journal, &base_dir);
+            append_event(
+                event_path.as_deref(),
+                "quarantine_clear",
+                json!({
+                    "path": path,
+                    "scope": "single",
+                }),
+            );
+            println!("cleared quarantine: {}", path);
+        } else {
+            println!("path was not quarantined: {}", path);
+        }
+        return Ok(());
+    }
+
+    if cli.quarantine_clear_all {
+        let removed = db.clear_all_quarantine_files();
+        let event_path = resolve_event_journal_path(&config.paths.event_journal, &base_dir);
+        append_event(
+            event_path.as_deref(),
+            "quarantine_clear",
+            json!({
+                "scope": "all",
+                "cleared": removed,
+            }),
+        );
+        println!("cleared quarantined entries: {}", removed);
+        return Ok(());
+    }
+
+    if run_status_mode {
+        let exit_code = match run_status(&config, &base_dir, &db, cli.simulate, cli.status_json) {
+            Ok(code) => code,
+            Err(e) => {
+                error!("Status internal error: {}", e);
+                STATUS_INTERNAL_FAIL
+            }
+        };
+        std::process::exit(exit_code);
+    }
 
     if run_healthcheck_mode {
         let exit_code =
@@ -261,8 +467,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if cli.doctor {
-        let exit_code = run_doctor(&config, &base_dir, &db, cli.simulate)?;
+        let exit_code = run_doctor(&config, &base_dir, &db, cli.simulate, &validation_errors)?;
         std::process::exit(exit_code);
+    }
+
+    // Validate config (doctor mode handles diagnostics itself)
+    if !validation_errors.is_empty() && !cli.simulate {
+        for err in &validation_errors {
+            error!("Config validation error: {}", err);
+        }
+        anyhow::bail!(
+            "Configuration validation failed with {} error(s)",
+            validation_errors.len()
+        );
     }
 
     // Acquire instance lock (skip in simulation mode)
@@ -301,11 +518,18 @@ async fn main() -> anyhow::Result<()> {
         let total_transcoded = db.get_transcode_count();
         let total_inspected = db.get_inspected_count();
         let top_reasons = db.get_top_failure_reasons(3);
+        let service_state = db.get_service_state();
+        let quarantined = db.quarantine_count();
         state.update(|s| {
             s.total_space_saved = total_saved;
             s.total_transcoded = total_transcoded as u64;
             s.total_inspected = total_inspected as u64;
             s.simulate_mode = cli.simulate;
+            s.consecutive_pass_failures = service_state.consecutive_pass_failures;
+            s.auto_paused = service_state.auto_paused_at.is_some();
+            s.auto_paused_at = service_state.auto_paused_at.clone();
+            s.auto_pause_reason = service_state.auto_pause_reason.clone();
+            s.quarantined_files = quarantined.max(0) as u64;
             s.top_failure_reasons = top_reasons
                 .iter()
                 .map(|(reason, count)| (reason.clone(), *count as u64))
@@ -321,7 +545,7 @@ async fn main() -> anyhow::Result<()> {
         create_simulated_deps(&config)
     } else {
         PipelineDeps {
-            fs: Box::new(RealFileSystem),
+            fs: Arc::new(RealFileSystem),
             prober: Box::new(FfprobeProber),
             transcoder: Box::new(HandBrakeTranscoder),
             transfer: Box::new(RsyncTransfer),
@@ -516,6 +740,25 @@ fn run_healthcheck(
                 );
             }
         }
+        if let Some(code) = result.latest_failure_code.as_deref() {
+            println!("  latest_failure_code: {}", code);
+        }
+        println!("  status_freshness: {}", result.status_freshness);
+        println!(
+            "  snapshot_age_seconds: {}",
+            result
+                .snapshot_age_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "  consecutive_pass_failures: {}",
+            result.consecutive_pass_failures
+        );
+        if let Some(reason) = result.auto_pause_reason.as_deref() {
+            println!("  auto_pause_reason: {}", reason);
+        }
+        println!("  quarantine_count: {}", result.quarantine_count);
     }
 
     Ok(result.exit_code)
@@ -531,6 +774,10 @@ fn evaluate_healthcheck(
     let paused = pause_path.exists();
     let cooldown_files = db.get_cooldown_active_count(chrono::Utc::now().timestamp());
     let db_query_ok = db.healthcheck_query_ok();
+    let latest_failure = db.get_latest_failure();
+    let service_state = db.get_service_state();
+    let quarantine_count = db.quarantine_count();
+    let snapshot_diag = collect_snapshot_diagnostics(config, base_dir);
 
     let dep_names = ["ffprobe", "HandBrakeCLI", "rsync"];
     let forced_missing = read_list_env("WATCHDOG_HEALTHCHECK_FORCE_MISSING_DEPS");
@@ -627,6 +874,57 @@ fn evaluate_healthcheck(
         db_query_ok,
         dependency_diagnostics,
         mount_checks,
+        latest_failure_code: latest_failure.and_then(|f| f.failure_code),
+        snapshot_age_seconds: snapshot_diag.age_seconds,
+        status_freshness: snapshot_diag.freshness,
+        consecutive_pass_failures: service_state.consecutive_pass_failures,
+        auto_pause_reason: service_state.auto_pause_reason,
+        quarantine_count,
+    }
+}
+
+fn collect_snapshot_diagnostics(config: &Config, base_dir: &Path) -> SnapshotDiagnostics {
+    let snapshot_path = resolve_status_snapshot_path(config, base_dir);
+    let Some(path) = snapshot_path else {
+        return SnapshotDiagnostics {
+            freshness: "missing".to_string(),
+            age_seconds: None,
+            snapshot: None,
+            snapshot_path: None,
+        };
+    };
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return SnapshotDiagnostics {
+                freshness: "missing".to_string(),
+                age_seconds: None,
+                snapshot: None,
+                snapshot_path: Some(path),
+            };
+        }
+    };
+    let age_seconds = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+        .map(|age| age.as_secs());
+    let freshness = match age_seconds {
+        Some(age) if age <= config.safety.status_snapshot_stale_seconds => "fresh",
+        Some(_) => "stale",
+        None => "stale",
+    }
+    .to_string();
+
+    let snapshot = match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str::<Value>(&content).ok(),
+        Err(_) => None,
+    };
+    SnapshotDiagnostics {
+        freshness,
+        age_seconds,
+        snapshot,
+        snapshot_path: Some(path),
     }
 }
 
@@ -664,13 +962,212 @@ fn tool_version(tool: &str) -> Option<String> {
     text.lines().next().map(|line| line.trim().to_string())
 }
 
+fn run_status(
+    config: &Config,
+    base_dir: &Path,
+    db: &WatchdogDb,
+    simulate: bool,
+    json_output: bool,
+) -> anyhow::Result<i32> {
+    if !db.healthcheck_query_ok() {
+        let result = StatusResult {
+            status: "error".to_string(),
+            exit_code: STATUS_INTERNAL_FAIL,
+            mode: if simulate {
+                "simulate".to_string()
+            } else {
+                "live".to_string()
+            },
+            paused: false,
+            auto_paused: false,
+            auto_pause_reason: None,
+            nfs_healthy: None,
+            unhealthy_shares: Vec::new(),
+            phase: None,
+            queue_position: None,
+            queue_total: None,
+            current_file: None,
+            cooldown_files: 0,
+            scan_timeouts: 0,
+            last_failure_code: None,
+            quarantine_count: 0,
+            consecutive_pass_failures: 0,
+            status_freshness: "missing".to_string(),
+            snapshot_age_seconds: None,
+            snapshot_path: None,
+        };
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("watchdog_status");
+            println!("  status: error");
+            println!("  exit_code: {}", STATUS_INTERNAL_FAIL);
+            println!("  db_query_ok: false");
+        }
+        return Ok(STATUS_INTERNAL_FAIL);
+    }
+
+    let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
+    let paused = pause_path.exists();
+    let cooldown_files = db.get_cooldown_active_count(chrono::Utc::now().timestamp());
+    let latest_failure = db.get_latest_failure();
+    let service_state = db.get_service_state();
+    let quarantine_count = db.quarantine_count();
+    let snapshot_diag = collect_snapshot_diagnostics(config, base_dir);
+
+    let snapshot = snapshot_diag.snapshot.as_ref();
+    let phase = snapshot
+        .and_then(|s| s.get("phase"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let queue_position = snapshot
+        .and_then(|s| s.get("queue_position"))
+        .and_then(Value::as_u64);
+    let queue_total = snapshot
+        .and_then(|s| s.get("queue_total"))
+        .and_then(Value::as_u64);
+    let current_file = snapshot
+        .and_then(|s| s.get("current_file"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let nfs_healthy = snapshot
+        .and_then(|s| s.get("nfs_healthy"))
+        .and_then(Value::as_bool);
+    let unhealthy_shares = snapshot
+        .and_then(|s| s.get("unhealthy_shares"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let scan_timeouts = snapshot
+        .and_then(|s| s.get("reliability"))
+        .and_then(|r| r.get("scan_timeouts"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let last_failure_code = snapshot
+        .and_then(|s| s.get("reliability"))
+        .and_then(|r| r.get("last_failure_code"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| latest_failure.and_then(|f| f.failure_code));
+
+    let auto_paused = service_state.auto_paused_at.is_some();
+    let unhealthy = auto_paused
+        || service_state.consecutive_pass_failures
+            >= config.safety.max_consecutive_pass_failures.max(1)
+        || nfs_healthy == Some(false);
+    let degraded = snapshot_diag.freshness == "stale" || snapshot_diag.freshness == "missing";
+    let exit_code = if unhealthy {
+        STATUS_UNHEALTHY
+    } else if degraded {
+        STATUS_DEGRADED
+    } else {
+        STATUS_OK
+    };
+    let status = if exit_code == STATUS_OK {
+        "ok"
+    } else if exit_code == STATUS_DEGRADED {
+        "degraded"
+    } else {
+        "unhealthy"
+    }
+    .to_string();
+
+    let result = StatusResult {
+        status,
+        exit_code,
+        mode: if simulate {
+            "simulate".to_string()
+        } else {
+            "live".to_string()
+        },
+        paused,
+        auto_paused,
+        auto_pause_reason: service_state.auto_pause_reason,
+        nfs_healthy,
+        unhealthy_shares,
+        phase,
+        queue_position,
+        queue_total,
+        current_file,
+        cooldown_files,
+        scan_timeouts,
+        last_failure_code,
+        quarantine_count,
+        consecutive_pass_failures: service_state.consecutive_pass_failures,
+        status_freshness: snapshot_diag.freshness,
+        snapshot_age_seconds: snapshot_diag.age_seconds,
+        snapshot_path: snapshot_diag
+            .snapshot_path
+            .map(|p| p.to_string_lossy().to_string()),
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("watchdog_status");
+        println!("  status: {}", result.status);
+        println!("  exit_code: {}", result.exit_code);
+        println!("  mode: {}", result.mode);
+        println!("  paused: {}", result.paused);
+        println!("  auto_paused: {}", result.auto_paused);
+        if let Some(reason) = result.auto_pause_reason.as_deref() {
+            println!("  auto_pause_reason: {}", reason);
+        }
+        println!("  phase: {}", result.phase.as_deref().unwrap_or("unknown"));
+        println!(
+            "  queue: {}/{}",
+            result.queue_position.unwrap_or(0),
+            result.queue_total.unwrap_or(0)
+        );
+        if let Some(file) = result.current_file.as_deref() {
+            println!("  current_file: {}", file);
+        }
+        println!(
+            "  nfs_healthy: {}",
+            result
+                .nfs_healthy
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        if !result.unhealthy_shares.is_empty() {
+            println!("  unhealthy_shares: {}", result.unhealthy_shares.join(", "));
+        }
+        println!("  cooldown_files: {}", result.cooldown_files);
+        println!("  scan_timeouts: {}", result.scan_timeouts);
+        println!("  quarantine_count: {}", result.quarantine_count);
+        println!(
+            "  consecutive_pass_failures: {}",
+            result.consecutive_pass_failures
+        );
+        if let Some(code) = result.last_failure_code.as_deref() {
+            println!("  last_failure_code: {}", code);
+        }
+        println!("  status_freshness: {}", result.status_freshness);
+        println!(
+            "  snapshot_age_seconds: {}",
+            result
+                .snapshot_age_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+
+    Ok(exit_code)
+}
+
 fn run_doctor(
     config: &Config,
     base_dir: &std::path::Path,
     db: &WatchdogDb,
     simulate: bool,
+    validation_errors: &[String],
 ) -> anyhow::Result<i32> {
-    let validation_errors = config.validate();
     let db_ok = db.healthcheck_query_ok();
     let deps = ["ffprobe", "HandBrakeCLI", "rsync"];
     let dep_results: Vec<DoctorDependency> = deps
@@ -710,6 +1207,9 @@ fn run_doctor(
             latency_ms: started.elapsed().as_millis(),
         });
     }
+    let snapshot_diag = collect_snapshot_diagnostics(config, base_dir);
+    let service_state = db.get_service_state();
+    let quarantine_count = db.quarantine_count();
 
     println!("watchdog_doctor");
     println!("  mode: {}", if simulate { "simulate" } else { "live" });
@@ -755,17 +1255,42 @@ fn run_doctor(
             mount.latency_ms
         );
     }
+    println!("  status_freshness: {}", snapshot_diag.freshness);
+    println!(
+        "  snapshot_age_seconds: {}",
+        snapshot_diag
+            .age_seconds
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "  consecutive_pass_failures: {}",
+        service_state.consecutive_pass_failures
+    );
+    if let Some(reason) = service_state.auto_pause_reason.as_deref() {
+        println!("  auto_pause_reason: {}", reason);
+    }
+    println!("  quarantine_count: {}", quarantine_count);
     if !validation_errors.is_empty() {
         println!("  config_errors:");
-        for err in &validation_errors {
+        for err in validation_errors {
             println!("    - {}", err);
         }
     }
 
     let has_missing_deps = dep_results.iter().any(|d| !d.found);
     let has_unhealthy_mounts = mount_checks.iter().any(|m| !m.healthy);
-    let failed =
-        !validation_errors.is_empty() || !db_ok || has_missing_deps || has_unhealthy_mounts;
+    let snapshot_degraded =
+        snapshot_diag.snapshot_path.is_some() && snapshot_diag.freshness != "fresh";
+    let safety_trip = service_state.auto_paused_at.is_some()
+        || service_state.consecutive_pass_failures
+            >= config.safety.max_consecutive_pass_failures.max(1);
+    let failed = !validation_errors.is_empty()
+        || !db_ok
+        || has_missing_deps
+        || has_unhealthy_mounts
+        || snapshot_degraded
+        || safety_trip;
     println!("  status: {}", if failed { "failed" } else { "ok" });
 
     Ok(if failed { 1 } else { 0 })

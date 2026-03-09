@@ -6,6 +6,41 @@ fn bin_path() -> &'static str {
     env!("CARGO_BIN_EXE_watchdog")
 }
 
+fn parse_json_output(output: &std::process::Output) -> serde_json::Value {
+    fn try_parse(text: &str) -> Option<serde_json::Value> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return Some(v);
+        }
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        if end < start {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(v) = try_parse(&stdout) {
+        return v;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(v) = try_parse(&stderr) {
+        return v;
+    }
+
+    panic!(
+        "Failed to parse JSON output\nstatus={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+}
+
 struct TestConfigFile {
     _dir: tempfile::TempDir,
     path: PathBuf,
@@ -61,6 +96,98 @@ status_snapshot = ""
     }
 }
 
+fn write_invalid_config() -> TestConfigFile {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("watchdog.db");
+    let config_path = dir.path().join("watchdog.toml");
+    let mut file = std::fs::File::create(&config_path).unwrap();
+    writeln!(
+        file,
+        r#"[nfs]
+server = "127.0.0.1"
+
+[[shares]]
+name = "movies"
+remote_path = ""
+local_mount = "/tmp/nonexistent-mount"
+
+[paths]
+database = "{}"
+"#,
+        db_path.display()
+    )
+    .unwrap();
+    TestConfigFile {
+        _dir: dir,
+        path: config_path,
+    }
+}
+
+fn write_status_config(with_snapshot: bool) -> TestConfigFile {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("watchdog.db");
+    let snapshot_path = dir.path().join("status.json");
+    if with_snapshot {
+        std::fs::write(
+            &snapshot_path,
+            r#"{
+  "phase": "Idle",
+  "nfs_healthy": true,
+  "queue_position": 0,
+  "queue_total": 0,
+  "current_file": null,
+  "unhealthy_shares": [],
+  "reliability": {
+    "scan_timeouts": 0,
+    "last_failure_code": null
+  }
+}"#,
+        )
+        .unwrap();
+    }
+    let config_path = dir.path().join("watchdog.toml");
+    let mut file = std::fs::File::create(&config_path).unwrap();
+    writeln!(
+        file,
+        r#"[nfs]
+server = "127.0.0.1"
+
+[[shares]]
+name = "movies"
+remote_path = "/remote/movies"
+local_mount = "/tmp/nonexistent-mount"
+
+[scan]
+video_extensions = [".mkv"]
+interval_seconds = 300
+
+[safety]
+status_snapshot_stale_seconds = 30
+pause_file = "watchdog.pause"
+max_failures_before_cooldown = 3
+cooldown_base_seconds = 300
+cooldown_max_seconds = 86400
+max_consecutive_pass_failures = 3
+
+[paths]
+database = "{}"
+transcode_temp = "/tmp"
+status_snapshot = "{}"
+"#,
+        db_path.display(),
+        if with_snapshot {
+            snapshot_path.to_string_lossy().to_string()
+        } else {
+            String::new()
+        },
+    )
+    .unwrap();
+    TestConfigFile {
+        _dir: dir,
+        path: config_path,
+    }
+}
+
 #[test]
 fn healthcheck_healthy_simulate_returns_zero() {
     let output = Command::new(bin_path())
@@ -77,7 +204,7 @@ fn healthcheck_json_contains_exit_code_and_checks() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let json = parse_json_output(&output);
     assert_eq!(json["exit_code"], 0);
     assert_eq!(json["checks"]["config"], true);
     assert_eq!(json["checks"]["db"], true);
@@ -141,4 +268,45 @@ fn doctor_simulate_returns_zero() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("watchdog_doctor"));
+}
+
+#[test]
+fn doctor_with_invalid_config_still_runs_diagnostics() {
+    let cfg = write_invalid_config();
+    let output = Command::new(bin_path())
+        .args(["--doctor", "--config", cfg.path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("watchdog_doctor"));
+    assert!(text.contains("config_errors"));
+    assert!(text.contains("empty remote_path"));
+}
+
+#[test]
+fn status_json_fresh_snapshot_returns_zero() {
+    let cfg = write_status_config(true);
+    let output = Command::new(bin_path())
+        .args(["--status-json", "--config", cfg.path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let json = parse_json_output(&output);
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["status_freshness"], "fresh");
+}
+
+#[test]
+fn status_json_missing_snapshot_returns_degraded() {
+    let cfg = write_status_config(false);
+    let output = Command::new(bin_path())
+        .args(["--status-json", "--config", cfg.path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(30));
+    let json = parse_json_output(&output);
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["status_freshness"], "missing");
 }

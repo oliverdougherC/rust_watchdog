@@ -59,6 +59,7 @@ pub struct FileFailureState {
     pub file_path: String,
     pub consecutive_failures: u32,
     pub last_failure_reason: Option<String>,
+    pub last_failure_code: Option<String>,
     pub next_eligible_at: i64,
     pub updated_at: Option<String>,
 }
@@ -68,6 +69,7 @@ pub struct CooldownRecord {
     pub file_path: String,
     pub consecutive_failures: u32,
     pub last_failure_reason: Option<String>,
+    pub last_failure_code: Option<String>,
     pub next_eligible_at: i64,
 }
 
@@ -77,6 +79,23 @@ pub struct LatestFailureRecord {
     pub failure_reason: Option<String>,
     pub failure_code: Option<String>,
     pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceState {
+    pub consecutive_pass_failures: u32,
+    pub last_pass_failure_code: Option<String>,
+    pub auto_paused_at: Option<String>,
+    pub auto_pause_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuarantineRecord {
+    pub file_path: String,
+    pub quarantined_at: String,
+    pub last_failure_code: Option<String>,
+    pub reason: Option<String>,
+    pub manual_clear_required: bool,
 }
 
 /// Thread-safe SQLite database layer.
@@ -158,8 +177,25 @@ impl WatchdogDb {
                 file_path TEXT PRIMARY KEY,
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 last_failure_reason TEXT,
+                last_failure_code TEXT,
                 next_eligible_at INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS file_quarantine (
+                file_path TEXT PRIMARY KEY,
+                quarantined_at TEXT NOT NULL,
+                last_failure_code TEXT,
+                reason TEXT,
+                manual_clear_required INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS service_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                consecutive_pass_failures INTEGER NOT NULL DEFAULT 0,
+                last_pass_failure_code TEXT,
+                auto_paused_at TEXT,
+                auto_pause_reason TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_inspected_files_file_path
@@ -170,6 +206,9 @@ impl WatchdogDb {
 
             CREATE INDEX IF NOT EXISTS idx_file_failure_state_next_eligible_at
                 ON file_failure_state (next_eligible_at);
+
+            CREATE INDEX IF NOT EXISTS idx_file_quarantine_quarantined_at
+                ON file_quarantine (quarantined_at DESC);
         ",
         )?;
 
@@ -196,6 +235,25 @@ impl WatchdogDb {
             )?;
         }
 
+        let failure_state_code_col_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('file_failure_state') WHERE name = 'last_failure_code'",
+            [],
+            |row| row.get(0),
+        )?;
+        if failure_state_code_col_exists == 0 {
+            conn.execute(
+                "ALTER TABLE file_failure_state ADD COLUMN last_failure_code TEXT",
+                [],
+            )?;
+        }
+
+        conn.execute(
+            "INSERT INTO service_state (id, consecutive_pass_failures)
+             VALUES (1, 0)
+             ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+
         conn.execute(
             "UPDATE transcode_history
              SET outcome = CASE
@@ -213,18 +271,75 @@ impl WatchdogDb {
                  WHEN failure_reason IS NULL OR failure_reason = '' THEN NULL
                  WHEN failure_reason IN ('interrupted_by_shutdown') THEN 'interrupted_shutdown'
                  WHEN failure_reason IN ('interrupted_by_pause') THEN 'interrupted_pause'
-                 WHEN failure_reason IN ('timeout_exhausted') OR failure_reason LIKE 'timeout%' THEN 'timeout'
-                 WHEN failure_reason IN ('transcode_failed', 'transcode_error') THEN 'transcode_error'
-                 WHEN failure_reason IN ('verification_failed', 'verification_error') THEN 'verification_failed'
-                 WHEN failure_reason IN ('output_missing', 'output_zero_bytes', 'output_suspiciously_small') THEN 'output_invalid'
-                 WHEN failure_reason IN ('transfer_failed', 'transfer_error', 'rsync failed (requeued)', 'rsync error (requeued)') THEN 'transfer_error'
-                 WHEN failure_reason IN ('insufficient_temp_space', 'insufficient_nfs_space') THEN 'insufficient_space'
-                 WHEN failure_reason IN ('source_changed_during_transcode') THEN 'source_changed'
-                 WHEN failure_reason IN ('safe_replace_failed', 'safe_replace_error') THEN 'safe_replace_failed'
+                 WHEN failure_reason IN ('timeout (requeued)', 'timeout_requeued') THEN 'timeout_requeued'
+                 WHEN failure_reason IN ('timeout_exhausted') OR failure_reason LIKE 'timeout%' THEN 'timeout_exhausted'
+                 WHEN failure_reason IN ('transcode_failed') THEN 'transcode_failed'
+                 WHEN failure_reason IN ('transcode_error') THEN 'transcode_error'
+                 WHEN failure_reason IN ('verification_failed') THEN 'verification_failed'
+                 WHEN failure_reason IN ('verification_error') THEN 'verification_error'
+                 WHEN failure_reason IN ('output_missing') THEN 'output_missing'
+                 WHEN failure_reason IN ('output_zero_bytes') THEN 'output_zero_bytes'
+                 WHEN failure_reason IN ('output_suspiciously_small') THEN 'output_suspiciously_small'
+                 WHEN failure_reason IN ('transfer_failed') THEN 'transfer_failed'
+                 WHEN failure_reason IN ('transfer_error') THEN 'transfer_error'
+                 WHEN failure_reason IN ('rsync failed (requeued)', 'transfer_failed_requeued') THEN 'transfer_failed_requeued'
+                 WHEN failure_reason IN ('rsync error (requeued)', 'transfer_error_requeued') THEN 'transfer_error_requeued'
+                 WHEN failure_reason IN ('insufficient_temp_space') THEN 'insufficient_temp_space'
+                 WHEN failure_reason IN ('temp_space_probe_error') THEN 'temp_space_probe_error'
+                 WHEN failure_reason IN ('insufficient_nfs_space') THEN 'insufficient_nfs_space'
+                 WHEN failure_reason IN ('nfs_space_probe_error') THEN 'nfs_space_probe_error'
+                 WHEN failure_reason IN ('source_changed_during_transcode') THEN 'source_changed_during_transcode'
+                 WHEN failure_reason IN ('safe_replace_failed') THEN 'safe_replace_failed'
+                 WHEN failure_reason IN ('safe_replace_error') THEN 'safe_replace_error'
                  WHEN failure_reason IN ('file_in_use') THEN 'file_in_use'
+                 WHEN failure_reason IN ('scan_timeout') THEN 'scan_timeout'
+                 WHEN failure_reason IN ('auto_paused_safety_trip') THEN 'auto_paused_safety_trip'
+                 WHEN failure_reason IN ('quarantined_file') THEN 'quarantined_file'
+                 WHEN failure_reason IN ('nfs_mount_failed') THEN 'nfs_mount_failed'
+                 WHEN failure_reason IN ('no_media_directories') THEN 'no_media_directories'
+                 WHEN failure_reason IN ('pass_error') THEN 'pass_error'
                  ELSE 'other'
              END
              WHERE failure_code IS NULL AND failure_reason IS NOT NULL AND failure_reason <> ''",
+            [],
+        )?;
+
+        conn.execute(
+            "UPDATE file_failure_state
+             SET last_failure_code = CASE
+                 WHEN last_failure_reason IS NULL OR last_failure_reason = '' THEN NULL
+                 WHEN last_failure_reason IN ('interrupted_by_shutdown') THEN 'interrupted_shutdown'
+                 WHEN last_failure_reason IN ('interrupted_by_pause') THEN 'interrupted_pause'
+                 WHEN last_failure_reason IN ('timeout (requeued)', 'timeout_requeued') THEN 'timeout_requeued'
+                 WHEN last_failure_reason IN ('timeout_exhausted') OR last_failure_reason LIKE 'timeout%' THEN 'timeout_exhausted'
+                 WHEN last_failure_reason IN ('transcode_failed') THEN 'transcode_failed'
+                 WHEN last_failure_reason IN ('transcode_error') THEN 'transcode_error'
+                 WHEN last_failure_reason IN ('verification_failed') THEN 'verification_failed'
+                 WHEN last_failure_reason IN ('verification_error') THEN 'verification_error'
+                 WHEN last_failure_reason IN ('output_missing') THEN 'output_missing'
+                 WHEN last_failure_reason IN ('output_zero_bytes') THEN 'output_zero_bytes'
+                 WHEN last_failure_reason IN ('output_suspiciously_small') THEN 'output_suspiciously_small'
+                 WHEN last_failure_reason IN ('transfer_failed') THEN 'transfer_failed'
+                 WHEN last_failure_reason IN ('transfer_error') THEN 'transfer_error'
+                 WHEN last_failure_reason IN ('rsync failed (requeued)', 'transfer_failed_requeued') THEN 'transfer_failed_requeued'
+                 WHEN last_failure_reason IN ('rsync error (requeued)', 'transfer_error_requeued') THEN 'transfer_error_requeued'
+                 WHEN last_failure_reason IN ('insufficient_temp_space') THEN 'insufficient_temp_space'
+                 WHEN last_failure_reason IN ('temp_space_probe_error') THEN 'temp_space_probe_error'
+                 WHEN last_failure_reason IN ('insufficient_nfs_space') THEN 'insufficient_nfs_space'
+                 WHEN last_failure_reason IN ('nfs_space_probe_error') THEN 'nfs_space_probe_error'
+                 WHEN last_failure_reason IN ('source_changed_during_transcode') THEN 'source_changed_during_transcode'
+                 WHEN last_failure_reason IN ('safe_replace_failed') THEN 'safe_replace_failed'
+                 WHEN last_failure_reason IN ('safe_replace_error') THEN 'safe_replace_error'
+                 WHEN last_failure_reason IN ('file_in_use') THEN 'file_in_use'
+                 WHEN last_failure_reason IN ('scan_timeout') THEN 'scan_timeout'
+                 WHEN last_failure_reason IN ('auto_paused_safety_trip') THEN 'auto_paused_safety_trip'
+                 WHEN last_failure_reason IN ('quarantined_file') THEN 'quarantined_file'
+                 WHEN last_failure_reason IN ('nfs_mount_failed') THEN 'nfs_mount_failed'
+                 WHEN last_failure_reason IN ('no_media_directories') THEN 'no_media_directories'
+                 WHEN last_failure_reason IN ('pass_error') THEN 'pass_error'
+                 ELSE 'other'
+             END
+             WHERE last_failure_code IS NULL AND last_failure_reason IS NOT NULL AND last_failure_reason <> ''",
             [],
         )?;
         Ok(())
@@ -234,7 +349,7 @@ impl WatchdogDb {
     pub fn get_file_failure_state(&self, path: &str) -> Option<FileFailureState> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT file_path, consecutive_failures, last_failure_reason, next_eligible_at, updated_at
+            "SELECT file_path, consecutive_failures, last_failure_reason, last_failure_code, next_eligible_at, updated_at
              FROM file_failure_state WHERE file_path = ?1",
             params![path],
             |row| {
@@ -242,8 +357,9 @@ impl WatchdogDb {
                     file_path: row.get(0)?,
                     consecutive_failures: row.get::<_, i64>(1)?.max(0) as u32,
                     last_failure_reason: row.get(2)?,
-                    next_eligible_at: row.get::<_, i64>(3)?,
-                    updated_at: row.get(4)?,
+                    last_failure_code: row.get(3)?,
+                    next_eligible_at: row.get::<_, i64>(4)?,
+                    updated_at: row.get(5)?,
                 })
             },
         )
@@ -267,6 +383,7 @@ impl WatchdogDb {
         &self,
         path: &str,
         failure_reason: &str,
+        failure_code: &str,
         max_failures_before_cooldown: u32,
         cooldown_base_seconds: u64,
         cooldown_max_seconds: u64,
@@ -302,17 +419,19 @@ impl WatchdogDb {
 
         let updated_at = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         if let Err(e) = conn.execute(
-            "INSERT INTO file_failure_state (file_path, consecutive_failures, last_failure_reason, next_eligible_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO file_failure_state (file_path, consecutive_failures, last_failure_reason, last_failure_code, next_eligible_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(file_path) DO UPDATE SET
                  consecutive_failures=excluded.consecutive_failures,
                  last_failure_reason=excluded.last_failure_reason,
+                 last_failure_code=excluded.last_failure_code,
                  next_eligible_at=excluded.next_eligible_at,
                  updated_at=excluded.updated_at",
             params![
                 path,
                 consecutive as i64,
                 failure_reason,
+                failure_code,
                 next_eligible_at,
                 updated_at
             ],
@@ -325,6 +444,7 @@ impl WatchdogDb {
             file_path: path.to_string(),
             consecutive_failures: consecutive,
             last_failure_reason: Some(failure_reason.to_string()),
+            last_failure_code: Some(failure_code.to_string()),
             next_eligible_at,
             updated_at: Some(updated_at),
         })
@@ -378,7 +498,7 @@ impl WatchdogDb {
     pub fn get_cooldown_files(&self, now_ts: i64, limit: u32) -> Vec<CooldownRecord> {
         let conn = self.lock();
         let mut stmt = match conn.prepare(
-            "SELECT file_path, consecutive_failures, last_failure_reason, next_eligible_at
+            "SELECT file_path, consecutive_failures, last_failure_reason, last_failure_code, next_eligible_at
              FROM file_failure_state
              WHERE next_eligible_at > ?1
              ORDER BY next_eligible_at ASC
@@ -396,7 +516,8 @@ impl WatchdogDb {
                 file_path: row.get(0)?,
                 consecutive_failures: row.get::<_, i64>(1)?.max(0) as u32,
                 last_failure_reason: row.get(2)?,
-                next_eligible_at: row.get(3)?,
+                last_failure_code: row.get(3)?,
+                next_eligible_at: row.get(4)?,
             })
         }) {
             Ok(r) => r,
@@ -429,6 +550,205 @@ impl WatchdogDb {
         )
         .optional()
         .unwrap_or(None)
+    }
+
+    /// Current service-level safety state for tripwire enforcement.
+    pub fn get_service_state(&self) -> ServiceState {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT consecutive_pass_failures, last_pass_failure_code, auto_paused_at, auto_pause_reason
+             FROM service_state WHERE id = 1",
+            [],
+            |row| {
+                Ok(ServiceState {
+                    consecutive_pass_failures: row.get::<_, i64>(0)?.max(0) as u32,
+                    last_pass_failure_code: row.get(1)?,
+                    auto_paused_at: row.get(2)?,
+                    auto_pause_reason: row.get(3)?,
+                })
+            },
+        )
+        .unwrap_or(ServiceState {
+            consecutive_pass_failures: 0,
+            last_pass_failure_code: None,
+            auto_paused_at: None,
+            auto_pause_reason: None,
+        })
+    }
+
+    /// Increment pass-failure streak and capture failure code.
+    pub fn note_pass_failure(&self, failure_code: &str) -> ServiceState {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "INSERT INTO service_state (id, consecutive_pass_failures, last_pass_failure_code)
+             VALUES (1, 0, NULL)
+             ON CONFLICT(id) DO NOTHING",
+            [],
+        ) {
+            error!(
+                "DB error ensuring service_state in note_pass_failure: {}",
+                e
+            );
+            return self.get_service_state();
+        }
+        if let Err(e) = conn.execute(
+            "UPDATE service_state
+             SET consecutive_pass_failures = consecutive_pass_failures + 1,
+                 last_pass_failure_code = ?1
+             WHERE id = 1",
+            params![failure_code],
+        ) {
+            error!("DB error in note_pass_failure update: {}", e);
+        }
+        conn.query_row(
+            "SELECT consecutive_pass_failures, last_pass_failure_code, auto_paused_at, auto_pause_reason
+             FROM service_state WHERE id = 1",
+            [],
+            |row| {
+                Ok(ServiceState {
+                    consecutive_pass_failures: row.get::<_, i64>(0)?.max(0) as u32,
+                    last_pass_failure_code: row.get(1)?,
+                    auto_paused_at: row.get(2)?,
+                    auto_pause_reason: row.get(3)?,
+                })
+            },
+        )
+        .unwrap_or(ServiceState {
+            consecutive_pass_failures: 0,
+            last_pass_failure_code: None,
+            auto_paused_at: None,
+            auto_pause_reason: None,
+        })
+    }
+
+    /// Reset pass-failure streak after a successful pass.
+    pub fn note_pass_success(&self) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE service_state
+             SET consecutive_pass_failures = 0,
+                 last_pass_failure_code = NULL
+             WHERE id = 1",
+            [],
+        ) {
+            error!("DB error in note_pass_success: {}", e);
+        }
+    }
+
+    /// Persist auto-pause metadata for operator diagnostics.
+    pub fn mark_auto_paused(&self, reason: &str) {
+        let conn = self.lock();
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "UPDATE service_state
+             SET auto_paused_at = ?1,
+                 auto_pause_reason = ?2
+             WHERE id = 1",
+            params![now, reason],
+        ) {
+            error!("DB error in mark_auto_paused: {}", e);
+        }
+    }
+
+    /// Clear persisted auto-pause metadata when operator resumes.
+    pub fn clear_auto_paused(&self) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE service_state
+             SET auto_paused_at = NULL,
+                 auto_pause_reason = NULL
+             WHERE id = 1",
+            [],
+        ) {
+            error!("DB error in clear_auto_paused: {}", e);
+        }
+    }
+
+    /// Quarantine a file after repeated hard failures.
+    pub fn quarantine_file(&self, path: &str, last_failure_code: &str, reason: &str) {
+        let conn = self.lock();
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "INSERT INTO file_quarantine (file_path, quarantined_at, last_failure_code, reason, manual_clear_required)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(file_path) DO UPDATE SET
+                 quarantined_at=excluded.quarantined_at,
+                 last_failure_code=excluded.last_failure_code,
+                 reason=excluded.reason,
+                 manual_clear_required=1",
+            params![path, now, last_failure_code, reason],
+        ) {
+            error!("DB error in quarantine_file: {}", e);
+        }
+    }
+
+    /// Return true when the file is currently quarantined.
+    pub fn is_quarantined(&self, path: &str) -> bool {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM file_quarantine WHERE file_path = ?1",
+            params![path],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false)
+    }
+
+    /// Number of currently quarantined files.
+    pub fn quarantine_count(&self) -> i64 {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM file_quarantine", [], |row| row.get(0))
+            .unwrap_or(0)
+    }
+
+    /// List quarantined files by most recent quarantine time.
+    pub fn list_quarantined_files(&self, limit: u32) -> Vec<QuarantineRecord> {
+        let conn = self.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT file_path, quarantined_at, last_failure_code, reason, manual_clear_required
+             FROM file_quarantine
+             ORDER BY quarantined_at DESC
+             LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("DB error in list_quarantined_files: {}", e);
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![limit], |row| {
+            Ok(QuarantineRecord {
+                file_path: row.get(0)?,
+                quarantined_at: row.get(1)?,
+                last_failure_code: row.get(2)?,
+                reason: row.get(3)?,
+                manual_clear_required: row.get::<_, i64>(4)? != 0,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("DB error in list_quarantined_files query: {}", e);
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|row| row.ok()).collect()
+    }
+
+    /// Clear one quarantined file entry.
+    pub fn clear_quarantine_file(&self, path: &str) -> bool {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM file_quarantine WHERE file_path = ?1",
+            params![path],
+        )
+        .map(|rows| rows > 0)
+        .unwrap_or(false)
+    }
+
+    /// Clear all quarantined file entries.
+    pub fn clear_all_quarantine_files(&self) -> usize {
+        let conn = self.lock();
+        conn.execute("DELETE FROM file_quarantine", []).unwrap_or(0)
     }
 
     /// Check if a file was previously inspected with the same size and mtime.
@@ -585,6 +905,45 @@ impl WatchdogDb {
         }
     }
 
+    /// Record a non-file, pipeline-level failure event in transcode_history.
+    pub fn record_pipeline_failure(&self, failure_reason: &str, failure_code: &str) {
+        let conn = self.lock();
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "INSERT INTO transcode_history
+             (source_path, outcome, success, failure_reason, failure_code, started_at, completed_at)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?5)",
+            params![
+                "[pipeline]",
+                TranscodeOutcome::Failed.as_db_value(),
+                failure_reason,
+                failure_code,
+                now
+            ],
+        ) {
+            error!("DB error in record_pipeline_failure: {}", e);
+        }
+    }
+
+    /// Record a quarantined file skip event in history.
+    pub fn record_quarantine_skip(&self, source_path: &str, reason: &str) {
+        let conn = self.lock();
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "INSERT INTO transcode_history
+             (source_path, outcome, success, failure_reason, failure_code, started_at, completed_at)
+             VALUES (?1, ?2, 0, ?3, 'quarantined_file', ?4, ?4)",
+            params![
+                source_path,
+                TranscodeOutcome::Failed.as_db_value(),
+                reason,
+                now
+            ],
+        ) {
+            error!("DB error in record_quarantine_skip: {}", e);
+        }
+    }
+
     /// Mark any incomplete transcode rows as failed (interrupted).
     pub fn close_stale_transcodes(&self) -> usize {
         let conn = self.lock();
@@ -709,9 +1068,66 @@ impl WatchdogDb {
     /// Lightweight DB sanity check for health/doctor flows.
     pub fn healthcheck_query_ok(&self) -> bool {
         let conn = self.lock();
-        conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+        let basic_ok = conn
+            .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
             .map(|v| v == 1)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !basic_ok {
+            return false;
+        }
+
+        let required_tables = [
+            "transcode_history",
+            "inspected_files",
+            "space_saved_log",
+            "file_failure_state",
+            "file_quarantine",
+            "service_state",
+        ];
+        for table in required_tables {
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|v| v > 0)
+                .unwrap_or(false);
+            if !exists {
+                return false;
+            }
+        }
+
+        let required_columns = [
+            ("transcode_history", "source_path"),
+            ("transcode_history", "outcome"),
+            ("transcode_history", "failure_code"),
+            ("inspected_files", "file_path"),
+            ("inspected_files", "file_mtime"),
+            ("space_saved_log", "cumulative_bytes_saved"),
+            ("file_failure_state", "file_path"),
+            ("file_failure_state", "next_eligible_at"),
+            ("file_failure_state", "last_failure_code"),
+            ("file_quarantine", "file_path"),
+            ("file_quarantine", "manual_clear_required"),
+            ("service_state", "consecutive_pass_failures"),
+            ("service_state", "last_pass_failure_code"),
+        ];
+        for (table, column) in required_columns {
+            let sql = format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = ?1",
+                table
+            );
+            let exists = conn
+                .query_row(&sql, params![column], |row| row.get::<_, i64>(0))
+                .map(|v| v > 0)
+                .unwrap_or(false);
+            if !exists {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -743,14 +1159,15 @@ mod tests {
     fn test_transcode_lifecycle() {
         let db = WatchdogDb::open_in_memory().unwrap();
 
-        let row_id = db.record_transcode_start(
-            "/test/movie.mkv",
-            "movies",
-            Some("h264"),
-            30_000_000,
-            5_000_000_000,
-        )
-        .unwrap();
+        let row_id = db
+            .record_transcode_start(
+                "/test/movie.mkv",
+                "movies",
+                Some("h264"),
+                30_000_000,
+                5_000_000_000,
+            )
+            .unwrap();
         assert!(row_id > 0);
 
         db.record_transcode_end(
@@ -849,13 +1266,31 @@ mod tests {
     fn test_file_failure_state_cooldown_and_clear() {
         let db = WatchdogDb::open_in_memory().unwrap();
         let state = db
-            .record_file_failure("/test/a.mkv", "verification failed", 3, 300, 3600)
+            .record_file_failure(
+                "/test/a.mkv",
+                "verification_failed",
+                "verification_failed",
+                3,
+                300,
+                3600,
+            )
             .unwrap();
         assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(
+            state.last_failure_code.as_deref(),
+            Some("verification_failed")
+        );
         assert!(state.next_eligible_at <= chrono::Utc::now().timestamp());
 
         let state = db
-            .record_file_failure("/test/a.mkv", "verification failed", 2, 10, 60)
+            .record_file_failure(
+                "/test/a.mkv",
+                "verification_failed",
+                "verification_failed",
+                2,
+                10,
+                60,
+            )
             .unwrap();
         assert_eq!(state.consecutive_failures, 2);
         assert!(state.next_eligible_at > chrono::Utc::now().timestamp());
@@ -869,6 +1304,16 @@ mod tests {
     fn test_healthcheck_query_ok() {
         let db = WatchdogDb::open_in_memory().unwrap();
         assert!(db.healthcheck_query_ok());
+    }
+
+    #[test]
+    fn test_healthcheck_query_fails_when_required_table_missing() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        {
+            let conn = db.lock();
+            conn.execute("DROP TABLE space_saved_log", []).unwrap();
+        }
+        assert!(!db.healthcheck_query_ok());
     }
 
     #[test]
@@ -888,6 +1333,77 @@ mod tests {
         );
         let rec = db.get_recent_transcodes(1);
         assert_eq!(rec[0].failure_code.as_deref(), Some("verification_failed"));
+    }
+
+    #[test]
+    fn test_record_pipeline_failure() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        db.record_pipeline_failure("scan_timeout", "scan_timeout");
+        let rec = db.get_recent_transcodes(1);
+        assert_eq!(rec[0].source_path, "[pipeline]");
+        assert_eq!(rec[0].failure_reason.as_deref(), Some("scan_timeout"));
+        assert_eq!(rec[0].failure_code.as_deref(), Some("scan_timeout"));
+        assert_eq!(rec[0].outcome, TranscodeOutcome::Failed);
+    }
+
+    #[test]
+    fn test_service_state_pass_failure_and_reset() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        let initial = db.get_service_state();
+        assert_eq!(initial.consecutive_pass_failures, 0);
+
+        let after_failure = db.note_pass_failure("scan_timeout");
+        assert_eq!(after_failure.consecutive_pass_failures, 1);
+        assert_eq!(
+            after_failure.last_pass_failure_code.as_deref(),
+            Some("scan_timeout")
+        );
+
+        db.mark_auto_paused("tripwire");
+        let paused = db.get_service_state();
+        assert!(paused.auto_paused_at.is_some());
+        assert_eq!(paused.auto_pause_reason.as_deref(), Some("tripwire"));
+
+        db.clear_auto_paused();
+        db.note_pass_success();
+        let reset = db.get_service_state();
+        assert_eq!(reset.consecutive_pass_failures, 0);
+        assert!(reset.last_pass_failure_code.is_none());
+        assert!(reset.auto_paused_at.is_none());
+        assert!(reset.auto_pause_reason.is_none());
+    }
+
+    #[test]
+    fn test_file_quarantine_lifecycle() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        assert_eq!(db.quarantine_count(), 0);
+        assert!(!db.is_quarantined("/a.mkv"));
+
+        db.quarantine_file(
+            "/a.mkv",
+            "verification_failed",
+            "repeated verification failures",
+        );
+        assert!(db.is_quarantined("/a.mkv"));
+        assert_eq!(db.quarantine_count(), 1);
+
+        let list = db.list_quarantined_files(10);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].file_path, "/a.mkv");
+        assert_eq!(
+            list[0].last_failure_code.as_deref(),
+            Some("verification_failed")
+        );
+        assert!(list[0].manual_clear_required);
+
+        assert!(db.clear_quarantine_file("/a.mkv"));
+        assert_eq!(db.quarantine_count(), 0);
+        assert!(!db.clear_quarantine_file("/a.mkv"));
+
+        db.quarantine_file("/b.mkv", "safe_replace_failed", "replace failed");
+        db.quarantine_file("/c.mkv", "safe_replace_error", "replace error");
+        assert_eq!(db.clear_all_quarantine_files(), 2);
+        assert_eq!(db.quarantine_count(), 0);
     }
 
     #[test]

@@ -1,56 +1,278 @@
 use crate::error::{Result, WatchdogError};
-use crate::process::{run_command, RunOptions};
-use crate::traits::{FileSystem, FileTransfer, TransferResult};
+use crate::process::{
+    configure_subprocess_group, describe_exit_status, format_command_for_log, infer_failure_hint,
+    summarize_output_tail, terminate_subprocess,
+};
+use crate::traits::{FileSystem, FileTransfer, TransferProgress, TransferResult, TransferStage};
+use regex::Regex;
+use std::io::{self, Read};
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::process::Stdio;
+use std::sync::LazyLock;
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 pub const WATCHDOG_TMP_SUFFIX: &str = ".watchdog.tmp";
 pub const WATCHDOG_OLD_SUFFIX: &str = ".watchdog.old";
 
+static RSYNC_PROGRESS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*[0-9,]+\s+(\d{1,3})%\s+([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z/]+)\s+([0-9:]{4,8})")
+        .unwrap()
+});
+
+#[derive(Default)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    truncated: bool,
+}
+
+fn push_tail(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    buf.extend_from_slice(chunk);
+    if buf.len() > limit {
+        let drop_len = buf.len() - limit;
+        buf.drain(0..drop_len);
+        return true;
+    }
+    false
+}
+
+fn normalize_rate_to_mib(value: f64, unit: &str) -> Option<f64> {
+    let normalized = unit.trim().to_ascii_lowercase();
+    if !normalized.ends_with("/s") {
+        return None;
+    }
+    let unit = normalized.trim_end_matches("/s");
+    let mib = match unit {
+        "b" => value / (1024.0 * 1024.0),
+        "kb" | "kib" => value / 1024.0,
+        "mb" | "mib" => value,
+        "gb" | "gib" => value * 1024.0,
+        "tb" | "tib" => value * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some(mib.max(0.0))
+}
+
+fn parse_rsync_progress(line: &str) -> Option<(f64, f64, String)> {
+    let clean = line.replace(',', "");
+    let caps = RSYNC_PROGRESS_RE.captures(&clean)?;
+    let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
+    let rate: f64 = caps.get(2)?.as_str().parse().ok()?;
+    let unit = caps.get(3)?.as_str();
+    let eta = caps.get(4)?.as_str().to_string();
+    let rate_mib = normalize_rate_to_mib(rate, unit)?;
+    Some((percent.clamp(0.0, 100.0), rate_mib, eta))
+}
+
+fn spawn_capture_thread<R: Read + Send + 'static>(
+    mut reader: R,
+    limit: usize,
+) -> thread::JoinHandle<CapturedOutput> {
+    thread::spawn(move || {
+        let mut out = CapturedOutput::default();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.total_bytes = out.total_bytes.saturating_add(n);
+                    out.truncated |= push_tail(&mut out.bytes, &tmp[..n], limit);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        out
+    })
+}
+
+fn spawn_rsync_progress_thread<R: Read + Send + 'static>(
+    mut reader: R,
+    limit: usize,
+    stage: TransferStage,
+    progress_tx: Option<mpsc::Sender<TransferProgress>>,
+) -> thread::JoinHandle<CapturedOutput> {
+    thread::spawn(move || {
+        let mut out = CapturedOutput::default();
+        let mut tmp = [0u8; 4096];
+        let mut line_buf = Vec::new();
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let mut last_percent = -1.0f64;
+
+        let mut process_line = |buf: &[u8]| {
+            if buf.is_empty() {
+                return;
+            }
+            out.truncated |= push_tail(&mut out.bytes, buf, limit);
+            out.truncated |= push_tail(&mut out.bytes, b"\n", limit);
+            if let Some(ref tx) = progress_tx {
+                let line = String::from_utf8_lossy(buf);
+                if let Some((percent, rate_mib_per_sec, eta)) = parse_rsync_progress(&line) {
+                    let now = Instant::now();
+                    let should_emit = percent >= 100.0
+                        || (percent - last_percent).abs() >= 0.5
+                        || now.duration_since(last_emit) >= Duration::from_millis(250);
+                    if should_emit {
+                        let _ = tx.try_send(TransferProgress {
+                            stage,
+                            percent,
+                            rate_mib_per_sec,
+                            eta,
+                        });
+                        last_emit = now;
+                        last_percent = percent;
+                    }
+                }
+            }
+        };
+
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.total_bytes = out.total_bytes.saturating_add(n);
+                    for &byte in &tmp[..n] {
+                        if byte == b'\n' || byte == b'\r' {
+                            process_line(&line_buf);
+                            line_buf.clear();
+                        } else {
+                            line_buf.push(byte);
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if !line_buf.is_empty() {
+            process_line(&line_buf);
+        }
+        out
+    })
+}
+
 /// Real rsync-based file transfer.
 pub struct RsyncTransfer;
 
 impl FileTransfer for RsyncTransfer {
-    fn transfer(&self, source: &Path, dest: &Path, timeout_secs: u64) -> Result<TransferResult> {
-        let cmd_str = format!("rsync -avh {} {}", source.display(), dest.display());
-        info!("Running: {} (timeout: {}s)", cmd_str, timeout_secs);
+    fn transfer(
+        &self,
+        source: &Path,
+        dest: &Path,
+        timeout_secs: u64,
+        stage: TransferStage,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    ) -> Result<TransferResult> {
         let mut cmd = Command::new("rsync");
+        configure_subprocess_group(&mut cmd);
         cmd.args(["-avh", "--progress", "--checksum"])
             .arg(source)
-            .arg(dest);
-        let output = run_command(
-            cmd,
-            RunOptions {
-                timeout: if timeout_secs > 0 {
-                    Some(Duration::from_secs(timeout_secs))
-                } else {
-                    None
-                },
-                stdout_limit: 64 * 1024,
-                stderr_limit: 256 * 1024,
-                ..RunOptions::default()
-            },
-        )
-        .map_err(|e| WatchdogError::Transfer {
+            .arg(dest)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let command_repr = format_command_for_log(&cmd);
+        info!(
+            "Starting rsync transfer: stage={} source={} dest={} timeout={}s",
+            stage.as_str(),
+            source.display(),
+            dest.display(),
+            timeout_secs
+        );
+        let mut child = cmd.spawn().map_err(|e| WatchdogError::Transfer {
             path: source.to_path_buf(),
-            reason: format!("Failed to execute rsync: {}", e),
+            reason: format!("Failed to execute rsync command `{}`: {}", command_repr, e),
         })?;
 
-        if output.timed_out {
+        let stdout = child.stdout.take().ok_or_else(|| WatchdogError::Transfer {
+            path: source.to_path_buf(),
+            reason: "Failed to capture rsync stdout".to_string(),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| WatchdogError::Transfer {
+            path: source.to_path_buf(),
+            reason: "Failed to capture rsync stderr".to_string(),
+        })?;
+
+        let stdout_handle = spawn_rsync_progress_thread(stdout, 64 * 1024, stage, progress_tx);
+        let stderr_handle = spawn_capture_thread(stderr, 256 * 1024);
+
+        let start = Instant::now();
+        let mut timed_out = false;
+        let status = loop {
+            if timeout_secs > 0 && start.elapsed().as_secs() > timeout_secs {
+                timed_out = true;
+                terminate_subprocess(&mut child, Duration::from_secs(2));
+                break child.wait().map_err(|e| WatchdogError::Transfer {
+                    path: source.to_path_buf(),
+                    reason: format!("Failed to wait for timed out rsync process: {}", e),
+                })?;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(e) => {
+                    return Err(WatchdogError::Transfer {
+                        path: source.to_path_buf(),
+                        reason: format!("Failed while waiting for rsync process: {}", e),
+                    });
+                }
+            }
+        };
+
+        let stdout_capture = stdout_handle.join().unwrap_or_default();
+        let stderr_capture = stderr_handle.join().unwrap_or_default();
+        let elapsed = start.elapsed().as_secs_f64();
+
+        if timed_out {
             warn!(
-                "rsync timed out after {}s for {}",
+                "rsync transfer timed out: stage={} source={} dest={} timeout={}s elapsed={:.1}s command={}",
+                stage.as_str(),
+                source.display(),
+                dest.display(),
                 timeout_secs,
-                source.display()
+                elapsed,
+                command_repr
             );
             return Ok(TransferResult { success: false });
         }
-        if !output.status.success() {
+        if !status.success() {
+            let stderr_summary = summarize_output_tail(&stderr_capture.bytes, 400);
+            let stdout_summary = summarize_output_tail(&stdout_capture.bytes, 240);
+            let details = if stderr_summary == "(empty)" && stdout_summary != "(empty)" {
+                format!("stdout={}", stdout_summary)
+            } else {
+                format!("stderr={}", stderr_summary)
+            };
+            let hint_suffix = infer_failure_hint(&stderr_summary)
+                .map(|hint| format!(" likely_cause={}", hint))
+                .unwrap_or_default();
+            let trunc_suffix = if stderr_capture.truncated {
+                format!(
+                    " [stderr tail truncated; captured {} of {} bytes]",
+                    stderr_capture.bytes.len(),
+                    stderr_capture.total_bytes
+                )
+            } else {
+                String::new()
+            };
             warn!(
-                "rsync failed (rc={:?}): {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr_tail).trim()
+                "rsync transfer failed: stage={} source={} dest={} status={} elapsed={:.1}s {}{}{}",
+                stage.as_str(),
+                source.display(),
+                dest.display(),
+                describe_exit_status(&status),
+                elapsed,
+                details,
+                trunc_suffix,
+                hint_suffix
             );
             return Ok(TransferResult { success: false });
         }
@@ -66,6 +288,7 @@ pub fn safe_replace(
     transfer: &dyn FileTransfer,
     source_path: &Path,
     new_local_path: &Path,
+    progress_tx: Option<mpsc::Sender<TransferProgress>>,
 ) -> Result<bool> {
     let source_dir = source_path.parent().unwrap_or(Path::new("."));
     let source_filename = source_path
@@ -126,7 +349,13 @@ pub fn safe_replace(
         3600
     };
 
-    let result = transfer.transfer(new_local_path, &temp_remote, timeout)?;
+    let result = transfer.transfer(
+        new_local_path,
+        &temp_remote,
+        timeout,
+        TransferStage::Export,
+        progress_tx,
+    )?;
     if !result.success {
         error!("rsync to temp failed for {}", source_path.display());
         let _ = fs.remove(&temp_remote);
@@ -315,6 +544,8 @@ mod tests {
             source: &Path,
             dest: &Path,
             _timeout_secs: u64,
+            _stage: TransferStage,
+            _progress_tx: Option<mpsc::Sender<TransferProgress>>,
         ) -> Result<TransferResult> {
             if !self.succeed {
                 return Ok(TransferResult { success: false });
@@ -342,7 +573,7 @@ mod tests {
             force_dest_size: None,
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new).unwrap();
+        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
         assert!(ok);
         assert_eq!(fs.file_size(source).unwrap(), 50);
         assert!(!fs.exists(Path::new("/media/movie.mkv.watchdog.old")));
@@ -363,7 +594,7 @@ mod tests {
             force_dest_size: None,
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new).unwrap();
+        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
         assert!(!ok);
         assert_eq!(fs.file_size(source).unwrap(), 100);
     }
@@ -383,7 +614,7 @@ mod tests {
             force_dest_size: Some(999),
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new).unwrap();
+        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
         assert!(!ok);
         assert!(!fs.exists(tmp_remote));
     }
@@ -404,9 +635,24 @@ mod tests {
             force_dest_size: None,
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new).unwrap();
+        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
         assert!(!ok);
         assert!(!fs.exists(source));
         assert!(fs.exists(old_remote));
+    }
+
+    #[test]
+    fn test_parse_rsync_progress_openrsync() {
+        let line = "       14385152  98%  992.11KB/s   00:00:00";
+        let (percent, rate_mib, eta) = parse_rsync_progress(line).unwrap();
+        assert!((percent - 98.0).abs() < 0.01);
+        assert!(rate_mib > 0.0);
+        assert_eq!(eta, "00:00:00");
+    }
+
+    #[test]
+    fn test_parse_rsync_progress_ignores_non_progress_lines() {
+        assert!(parse_rsync_progress("Transfer starting: 1 files").is_none());
+        assert!(parse_rsync_progress("sent 13309k bytes  received 42 bytes").is_none());
     }
 }

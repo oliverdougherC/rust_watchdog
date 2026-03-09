@@ -21,3 +21,5 @@ logs/
 
 # Environment / secrets
 .env
+
+test_videos/*

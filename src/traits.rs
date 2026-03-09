@@ -37,6 +37,31 @@ pub struct TranscodeProgress {
     pub eta: String,
 }
 
+/// The pipeline stage a file transfer belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferStage {
+    Import,
+    Export,
+}
+
+impl TransferStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransferStage::Import => "import",
+            TransferStage::Export => "export",
+        }
+    }
+}
+
+/// Progress update from a running rsync transfer.
+#[derive(Debug, Clone)]
+pub struct TransferProgress {
+    pub stage: TransferStage,
+    pub percent: f64,
+    pub rate_mib_per_sec: f64,
+    pub eta: String,
+}
+
 /// Result of a transcode operation.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -130,7 +155,14 @@ pub trait Transcoder: Send + Sync {
 /// Abstracts rsync file transfer.
 pub trait FileTransfer: Send + Sync {
     /// Transfer a file from source to destination using rsync.
-    fn transfer(&self, source: &Path, dest: &Path, timeout_secs: u64) -> Result<TransferResult>;
+    fn transfer(
+        &self,
+        source: &Path,
+        dest: &Path,
+        timeout_secs: u64,
+        stage: TransferStage,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    ) -> Result<TransferResult>;
 }
 
 /// Abstracts NFS mount health checking and remounting.

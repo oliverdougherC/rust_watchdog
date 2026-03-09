@@ -1,10 +1,11 @@
 use crate::config::Config;
 use crate::db::{TranscodeOutcome, WatchdogDb};
 use crate::error::{Result, WatchdogError};
+use crate::event_journal::{append_event, resolve_event_journal_path};
 use crate::nfs::ensure_all_mounts;
 use crate::notify::{send_webhook, NotifyEvent};
 use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval};
-use crate::state::{PipelinePhase, StateManager};
+use crate::state::{PipelinePhase, ProgressStage, StateManager};
 use crate::stats::RunStats;
 use crate::traits::*;
 use crate::transfer::{safe_replace, WATCHDOG_OLD_SUFFIX, WATCHDOG_TMP_SUFFIX};
@@ -24,6 +25,8 @@ use tracing::{error, info, warn};
 const CANCEL_NONE: u8 = 0;
 const CANCEL_SHUTDOWN: u8 = 1;
 const CANCEL_PAUSE: u8 = 2;
+const FAILURE_CODE_QUARANTINED_FILE: &str = "quarantined_file";
+const FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP: &str = "auto_paused_safety_trip";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
@@ -32,6 +35,7 @@ enum SkipReason {
     Cooldown,
     Filtered,
     InUse,
+    Quarantined,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,8 +45,10 @@ enum FailureCode {
     TransferFailed,
     TransferError,
     InsufficientTempSpace,
+    TempSpaceProbeError,
     TimeoutRequeued,
     TimeoutExhausted,
+    ScanTimeout,
     InterruptedShutdown,
     InterruptedPause,
     Interrupted,
@@ -54,10 +60,12 @@ enum FailureCode {
     VerificationError,
     OutputSuspiciouslySmall,
     InsufficientNfsSpace,
+    NfsSpaceProbeError,
     SourceChangedDuringTranscode,
     FileInUse,
     SafeReplaceFailed,
     SafeReplaceError,
+    QuarantinedFile,
 }
 
 impl FailureCode {
@@ -68,8 +76,10 @@ impl FailureCode {
             Self::TransferFailed => "transfer_failed",
             Self::TransferError => "transfer_error",
             Self::InsufficientTempSpace => "insufficient_temp_space",
+            Self::TempSpaceProbeError => "temp_space_probe_error",
             Self::TimeoutRequeued => "timeout_requeued",
             Self::TimeoutExhausted => "timeout_exhausted",
+            Self::ScanTimeout => "scan_timeout",
             Self::InterruptedShutdown => "interrupted_shutdown",
             Self::InterruptedPause => "interrupted_pause",
             Self::Interrupted => "interrupted",
@@ -81,10 +91,12 @@ impl FailureCode {
             Self::VerificationError => "verification_error",
             Self::OutputSuspiciouslySmall => "output_suspiciously_small",
             Self::InsufficientNfsSpace => "insufficient_nfs_space",
+            Self::NfsSpaceProbeError => "nfs_space_probe_error",
             Self::SourceChangedDuringTranscode => "source_changed_during_transcode",
             Self::FileInUse => "file_in_use",
             Self::SafeReplaceFailed => "safe_replace_failed",
             Self::SafeReplaceError => "safe_replace_error",
+            Self::QuarantinedFile => FAILURE_CODE_QUARANTINED_FILE,
         }
     }
 }
@@ -122,6 +134,45 @@ impl Ord for QueueCandidate {
     }
 }
 
+fn stable_path_hash(path: &Path) -> u64 {
+    // Deterministic FNV-1a hash for stable temp naming across runs.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0001_0000_01b3);
+    }
+    hash
+}
+
+fn build_local_temp_paths(
+    temp_dir: &Path,
+    share_name: &str,
+    source_path: &Path,
+) -> (PathBuf, PathBuf) {
+    let hash = format!("{:016x}", stable_path_hash(source_path));
+    let source_name = source_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let name_no_ext = source_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let original_ext = source_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mkv");
+
+    let local_source = temp_dir.join(format!("{}_{}__{}", share_name, hash, source_name));
+    let local_output = temp_dir.join(format!(
+        "{}_{}__{}.av1.{}",
+        share_name, hash, name_no_ext, original_ext
+    ));
+    (local_source, local_output)
+}
+
 /// Log a formatted message to both tracing and the TUI state log.
 fn tui_log(state: &StateManager, level: &str, msg: &str) {
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -130,7 +181,7 @@ fn tui_log(state: &StateManager, level: &str, msg: &str) {
 
 /// All injectable dependencies for the pipeline.
 pub struct PipelineDeps {
-    pub fs: Box<dyn FileSystem>,
+    pub fs: Arc<dyn FileSystem>,
     pub prober: Box<dyn Prober>,
     pub transcoder: Box<dyn Transcoder>,
     pub transfer: Box<dyn FileTransfer>,
@@ -161,7 +212,7 @@ pub async fn run_watchdog_pass(
 
     state.set_phase(PipelinePhase::Scanning);
     state.set_current_file(None);
-    state.set_transcode_progress(0.0, 0.0, 0.0, String::new());
+    state.reset_file_progress();
     state.update(|s| {
         s.run_inspected = 0;
         s.run_transcoded = 0;
@@ -172,8 +223,19 @@ pub async fn run_watchdog_pass(
         s.run_skipped_cooldown = 0;
         s.run_skipped_filtered = 0;
         s.run_skipped_in_use = 0;
+        s.run_skipped_quarantined = 0;
+        s.quarantined_files = db.quarantine_count().max(0) as u64;
     });
     tui_log(state, "INFO", "Starting watchdog scan pass");
+    emit_event(
+        config,
+        base_dir,
+        "pass_start",
+        json!({
+            "dry_run": dry_run,
+            "share_count": config.shares.len(),
+        }),
+    );
 
     if is_pause_requested(config, base_dir) {
         state.set_phase(PipelinePhase::Paused);
@@ -293,9 +355,11 @@ pub async fn run_watchdog_pass(
 
     const PROBE_BATCH_SIZE: usize = 512;
     let scanned_shares = scan_shares_parallel(
-        deps.fs.as_ref(),
+        deps.fs.clone(),
         &share_scan_jobs,
         &config.scan.video_extensions,
+        Duration::from_secs(config.safety.share_scan_timeout_seconds.max(1)),
+        &mut shutdown_rx,
     )?;
     for (_share_name, entries) in scanned_shares {
         for entry in entries {
@@ -316,7 +380,7 @@ pub async fn run_watchdog_pass(
                 last_scan_log = Instant::now();
             }
 
-            if shutdown_rx.try_recv().is_ok() {
+            if shutdown_requested(&mut shutdown_rx) {
                 return Err(WatchdogError::Shutdown);
             }
             if is_pause_requested(config, base_dir) {
@@ -342,6 +406,16 @@ pub async fn run_watchdog_pass(
             }
 
             let path_string = entry.path.to_string_lossy().to_string();
+            if db.is_quarantined(&path_string) {
+                increment_skip_counter(state, SkipReason::Quarantined);
+                db.record_quarantine_skip(&path_string, "quarantined_file");
+                let quarantined_count = db.quarantine_count().max(0) as u64;
+                state.update(|s| {
+                    s.last_failure_code = Some(FailureCode::QuarantinedFile.as_str().to_string());
+                    s.quarantined_files = quarantined_count;
+                });
+                continue;
+            }
             if let Some(failure_state) = db.get_file_failure_state(&path_string) {
                 if failure_state.next_eligible_at > now_ts {
                     increment_skip_counter(state, SkipReason::Cooldown);
@@ -410,7 +484,21 @@ pub async fn run_watchdog_pass(
         state.set_phase(PipelinePhase::Idle);
         state.set_last_pass_time();
         state.set_current_file(None);
-        state.set_transcode_progress(0.0, 0.0, 0.0, String::new());
+        state.reset_file_progress();
+        emit_event(
+            config,
+            base_dir,
+            "pass_end",
+            json!({
+                "result": "ok",
+                "discovered_files": discovered_count,
+                "inspected_files": stats.files_inspected,
+                "queued_files": stats.files_queued,
+                "transcoded_files": stats.files_transcoded,
+                "failed_files": stats.transcode_failures,
+                "space_saved_bytes": stats.space_saved_bytes,
+            }),
+        );
         return Ok(stats);
     }
 
@@ -496,7 +584,7 @@ pub async fn run_watchdog_pass(
 
     while idx < transcode_queue.len() {
         // Check shutdown
-        if shutdown_rx.try_recv().is_ok() {
+        if shutdown_requested(&mut shutdown_rx) {
             info!("Shutdown requested, stopping pipeline");
             return Err(WatchdogError::Shutdown);
         }
@@ -542,7 +630,7 @@ pub async fn run_watchdog_pass(
         );
         state.set_current_file(Some(path_str.clone()));
         state.set_queue_info(processed, progress_total as u32);
-        state.set_transcode_progress(0.0, 0.0, 0.0, String::new());
+        state.reset_file_progress();
 
         let transcode_start = Instant::now();
         let original_size = deps.fs.file_size(path).unwrap_or(entry.size) as i64;
@@ -572,6 +660,7 @@ pub async fn run_watchdog_pass(
 
         if check_file_in_use_best_effort(
             config,
+            base_dir,
             deps,
             state,
             path,
@@ -587,8 +676,8 @@ pub async fn run_watchdog_pass(
 
         // Check disk space
         let required = (original_size as f64 * config.transcode.min_free_space_multiplier) as u64;
-        if let Ok(free) = deps.fs.free_space(&temp_dir) {
-            if free < required {
+        match deps.fs.free_space(&temp_dir) {
+            Ok(free) if free < required => {
                 warn!(
                     "[{}] Skipping {}: insufficient temp space (need {}, have {})",
                     share_name,
@@ -605,8 +694,10 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -616,28 +707,46 @@ pub async fn run_watchdog_pass(
                 );
                 continue;
             }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "[{}] Skipping {}: failed to determine temp free space ({}), failing closed",
+                    share_name, path_str, e
+                );
+                stats.transcode_failures += 1;
+                state.update(|s| s.run_failures += 1);
+                tui_log(
+                    state,
+                    "WARN",
+                    &format!("Skipped {}: temp-space probe failed", display_filename),
+                );
+                let dur = transcode_start.elapsed().as_secs_f64();
+                record_failure(
+                    state,
+                    db.as_ref(),
+                    config,
+                    base_dir,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::TempSpaceProbeError,
+                    "temp_space_probe_error",
+                    true,
+                );
+                continue;
+            }
         }
 
-        // Build temp file paths (prefix with share name to avoid collisions
-        // when different shares contain files with identical names)
-        let source_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let local_source = temp_dir.join(format!("{}_{}", share_name, source_name));
-        let name_no_ext = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let original_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("mkv");
-        let local_output = temp_dir.join(format!(
-            "{}_{}.av1.{}",
-            share_name, name_no_ext, original_ext
-        ));
+        // Build collision-resistant temp paths using a deterministic hash of full source path.
+        let (local_source, local_output) = build_local_temp_paths(&temp_dir, share_name, path);
 
         // Step 1: rsync source to temp
+        tui_log(
+            state,
+            "INFO",
+            &format!("Rsync source -> temp: {}", display_filename),
+        );
+        state.set_progress_stage(ProgressStage::Import);
         let rsync_timeout = if original_size > 0 {
             (original_size as u64 / (1024 * 1024)).max(300)
         } else {
@@ -645,11 +754,35 @@ pub async fn run_watchdog_pass(
         };
 
         let transfer_result = tokio::task::block_in_place(|| {
-            deps.transfer.transfer(path, &local_source, rsync_timeout)
+            let mut result: Option<Result<TransferResult>> = None;
+            let (transfer_tx, mut transfer_rx) = mpsc::channel::<TransferProgress>(32);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while let Some(p) = transfer_rx.blocking_recv() {
+                        state.set_import_progress(p.percent, p.rate_mib_per_sec, p.eta);
+                    }
+                });
+
+                result = Some(deps.transfer.transfer(
+                    path,
+                    &local_source,
+                    rsync_timeout,
+                    TransferStage::Import,
+                    Some(transfer_tx),
+                ));
+            });
+            result.unwrap()
         });
 
         match transfer_result {
-            Ok(r) if r.success => {}
+            Ok(r) if r.success => {
+                state.set_import_progress(100.0, 0.0, String::new());
+                tui_log(
+                    state,
+                    "INFO",
+                    &format!("Rsync complete: {}", display_filename),
+                );
+            }
             Ok(_) => {
                 error!("[{}] Failed to rsync source: {}", share_name, path_str);
                 let dur = transcode_start.elapsed().as_secs_f64();
@@ -678,8 +811,10 @@ pub async fn run_watchdog_pass(
                         &format!("Transfer failed (retries exhausted): {}", display_filename),
                     );
                     record_failure(
+                        state,
                         db.as_ref(),
                         config,
+                        base_dir,
                         &path_str,
                         db_row_id,
                         dur,
@@ -719,8 +854,10 @@ pub async fn run_watchdog_pass(
                         &format!("Transfer error (retries exhausted): {}", display_filename),
                     );
                     record_failure(
+                        state,
                         db.as_ref(),
                         config,
+                        base_dir,
                         &path_str,
                         db_row_id,
                         dur,
@@ -735,6 +872,12 @@ pub async fn run_watchdog_pass(
         }
 
         // Step 2: Transcode
+        tui_log(
+            state,
+            "INFO",
+            &format!("Starting HandBrake encode: {}", display_filename),
+        );
+        state.set_progress_stage(ProgressStage::Transcode);
         let (progress_tx, mut progress_rx) = mpsc::channel::<TranscodeProgress>(32);
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_reason = Arc::new(AtomicU8::new(CANCEL_NONE));
@@ -855,8 +998,10 @@ pub async fn run_watchdog_pass(
                     );
                     let dur = transcode_start.elapsed().as_secs_f64();
                     record_failure(
+                        state,
                         db.as_ref(),
                         config,
+                        base_dir,
                         &path_str,
                         db_row_id,
                         dur,
@@ -878,8 +1023,10 @@ pub async fn run_watchdog_pass(
                 // Operator-driven interruptions are recorded in history but should not
                 // increment per-file cooldown counters.
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -909,8 +1056,10 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -932,8 +1081,10 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -944,7 +1095,12 @@ pub async fn run_watchdog_pass(
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
-            Ok(_) => {} // Success, continue to verification
+            Ok(_) => {
+                state.update(|s| {
+                    s.progress_stage = ProgressStage::Transcode;
+                    s.transcode_percent = s.transcode_percent.max(100.0);
+                });
+            } // Success, continue to verification
         }
 
         // Step 3: Pre-verify output file exists and is non-zero
@@ -963,8 +1119,10 @@ pub async fn run_watchdog_pass(
             );
             let dur = transcode_start.elapsed().as_secs_f64();
             record_failure(
+                state,
                 db.as_ref(),
                 config,
+                base_dir,
                 &path_str,
                 db_row_id,
                 dur,
@@ -991,8 +1149,10 @@ pub async fn run_watchdog_pass(
             );
             let dur = transcode_start.elapsed().as_secs_f64();
             record_failure(
+                state,
                 db.as_ref(),
                 config,
+                base_dir,
                 &path_str,
                 db_row_id,
                 dur,
@@ -1028,8 +1188,10 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -1051,8 +1213,10 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -1088,8 +1252,10 @@ pub async fn run_watchdog_pass(
             );
             let dur = transcode_start.elapsed().as_secs_f64();
             record_failure(
+                state,
                 db.as_ref(),
                 config,
+                base_dir,
                 &path_str,
                 db_row_id,
                 dur,
@@ -1130,8 +1296,8 @@ pub async fn run_watchdog_pass(
         // Step 5: Verify NFS share has enough free space for the replacement file.
         // We need at least the output file size free on the target share.
         let share_path = path.parent().unwrap_or(path);
-        if let Ok(share_free) = deps.fs.free_space(share_path) {
-            if share_free < new_size as u64 {
+        match deps.fs.free_space(share_path) {
+            Ok(share_free) if share_free < new_size as u64 => {
                 warn!(
                     "[{}] Insufficient space on NFS share for replacement (need {}, have {}): {}",
                     share_name,
@@ -1146,13 +1312,44 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
                     FailureCode::InsufficientNfsSpace,
                     "insufficient_nfs_space",
+                    true,
+                );
+                cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "[{}] Skipping {}: failed to determine NFS free space ({}), failing closed",
+                    share_name, path_str, e
+                );
+                stats.transcode_failures += 1;
+                state.update(|s| s.run_failures += 1);
+                tui_log(
+                    state,
+                    "WARN",
+                    &format!("Skipped {}: NFS-space probe failed", display_filename),
+                );
+                let dur = transcode_start.elapsed().as_secs_f64();
+                record_failure(
+                    state,
+                    db.as_ref(),
+                    config,
+                    base_dir,
+                    &path_str,
+                    db_row_id,
+                    dur,
+                    FailureCode::NfsSpaceProbeError,
+                    "nfs_space_probe_error",
                     true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
@@ -1184,8 +1381,10 @@ pub async fn run_watchdog_pass(
             );
             let dur = transcode_start.elapsed().as_secs_f64();
             record_failure(
+                state,
                 db.as_ref(),
                 config,
+                base_dir,
                 &path_str,
                 db_row_id,
                 dur,
@@ -1200,6 +1399,7 @@ pub async fn run_watchdog_pass(
         // Step 7: Safe replace
         if check_file_in_use_best_effort(
             config,
+            base_dir,
             deps,
             state,
             path,
@@ -1214,17 +1414,30 @@ pub async fn run_watchdog_pass(
             continue;
         }
 
+        state.set_progress_stage(ProgressStage::Export);
         let replaced = tokio::task::block_in_place(|| {
-            safe_replace(
-                deps.fs.as_ref(),
-                deps.transfer.as_ref(),
-                path,
-                &local_output,
-            )
+            let mut result: Option<Result<bool>> = None;
+            let (transfer_tx, mut transfer_rx) = mpsc::channel::<TransferProgress>(32);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while let Some(p) = transfer_rx.blocking_recv() {
+                        state.set_export_progress(p.percent, p.rate_mib_per_sec, p.eta);
+                    }
+                });
+                result = Some(safe_replace(
+                    deps.fs.as_ref(),
+                    deps.transfer.as_ref(),
+                    path,
+                    &local_output,
+                    Some(transfer_tx),
+                ));
+            });
+            result.unwrap()
         });
 
         match replaced {
             Ok(true) => {
+                state.set_export_progress(100.0, 0.0, String::new());
                 let space_saved = original_size - new_size;
                 stats.files_transcoded += 1;
                 stats.space_saved_bytes += space_saved;
@@ -1296,8 +1509,10 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -1317,8 +1532,10 @@ pub async fn run_watchdog_pass(
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
+                    state,
                     db.as_ref(),
                     config,
+                    base_dir,
                     &path_str,
                     db_row_id,
                     dur,
@@ -1342,7 +1559,7 @@ pub async fn run_watchdog_pass(
     });
     state.set_last_pass_time();
     state.set_current_file(None);
-    state.set_transcode_progress(0.0, 0.0, 0.0, String::new());
+    state.reset_file_progress();
     tui_log(
         state,
         "INFO",
@@ -1352,6 +1569,20 @@ pub async fn run_watchdog_pass(
             stats.transcode_failures,
             format_bytes_signed(stats.space_saved_bytes)
         ),
+    );
+    emit_event(
+        config,
+        base_dir,
+        "pass_end",
+        json!({
+            "result": "ok",
+            "discovered_files": discovered_count,
+            "inspected_files": stats.files_inspected,
+            "queued_files": stats.files_queued,
+            "transcoded_files": stats.files_transcoded,
+            "failed_files": stats.transcode_failures,
+            "space_saved_bytes": stats.space_saved_bytes,
+        }),
     );
 
     Ok(stats)
@@ -1449,9 +1680,11 @@ fn process_probe_batch(
 
 /// Walk healthy shares concurrently and return per-share entries.
 fn scan_shares_parallel(
-    fs: &dyn FileSystem,
+    fs: Arc<dyn FileSystem>,
     jobs: &[(String, PathBuf)],
     extensions: &[String],
+    timeout: Duration,
+    shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> Result<Vec<(String, Vec<FileEntry>)>> {
     if jobs.is_empty() {
         return Ok(Vec::new());
@@ -1459,24 +1692,67 @@ fn scan_shares_parallel(
 
     let extensions = extensions.to_vec();
     let mut per_share: Vec<(String, Result<Vec<FileEntry>>)> = Vec::new();
+    let pending = Arc::new(std::sync::Mutex::new(
+        jobs.iter()
+            .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>(),
+    ));
+    let (tx, rx) = std::sync::mpsc::channel::<(String, Result<Vec<FileEntry>>)>();
+    for (share_name, mount_path) in jobs {
+        let tx = tx.clone();
+        let share_name = share_name.clone();
+        let mount_path = mount_path.clone();
+        let extensions = extensions.clone();
+        let fs = Arc::clone(&fs);
+        let pending = Arc::clone(&pending);
+        std::thread::spawn(move || {
+            let result = fs.walk_share(&share_name, &mount_path, &extensions);
+            if let Ok(mut pending) = pending.lock() {
+                pending.remove(&share_name);
+            }
+            let _ = tx.send((share_name, result));
+        });
+    }
+    drop(tx);
 
-    std::thread::scope(|scope| {
-        let (tx, rx) = std::sync::mpsc::channel::<(String, Result<Vec<FileEntry>>)>();
-        for (share_name, mount_path) in jobs {
-            let tx = tx.clone();
-            let share_name = share_name.clone();
-            let mount_path = mount_path.clone();
-            let extensions = extensions.clone();
-            scope.spawn(move || {
-                let result = fs.walk_share(&share_name, &mount_path, &extensions);
-                let _ = tx.send((share_name, result));
+    let deadline = Instant::now() + timeout;
+    while per_share.len() < jobs.len() {
+        if shutdown_requested(shutdown_rx) {
+            return Err(WatchdogError::Shutdown);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let (pending_count, pending_list) = pending
+                .lock()
+                .map(|s| (s.len(), s.iter().cloned().collect::<Vec<_>>()))
+                .unwrap_or_default();
+            error!(
+                "Share scan timed out after {}s; pending shares: {}",
+                timeout.as_secs().max(1),
+                if pending_list.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    pending_list.join(", ")
+                }
+            );
+            return Err(WatchdogError::ScanTimeout {
+                timeout_secs: timeout.as_secs().max(1),
+                pending_shares: pending_count.max(1),
             });
         }
-        drop(tx);
-        for received in rx {
-            per_share.push(received);
+
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(200));
+        match rx.recv_timeout(wait) {
+            Ok(received) => per_share.push(received),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
         }
-    });
+    }
 
     let mut out = Vec::with_capacity(per_share.len());
     for (share_name, result) in per_share {
@@ -1534,7 +1810,7 @@ fn probe_candidates_parallel(
             drop(tx);
 
             while completed < candidates.len() {
-                if shutdown_rx.try_recv().is_ok() {
+                if shutdown_requested(shutdown_rx) {
                     cancelled.store(true, Ordering::Relaxed);
                     aborted = true;
                 }
@@ -1598,6 +1874,7 @@ fn shutdown_requested(shutdown_rx: &mut broadcast::Receiver<()>) -> bool {
 fn recover_orphaned_files(
     fs: &dyn FileSystem,
     config: &Config,
+    base_dir: &Path,
     state: &StateManager,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> bool {
@@ -1640,6 +1917,16 @@ fn recover_orphaned_files(
                     path.display()
                 );
                 let _ = fs.remove(&path);
+                emit_event(
+                    config,
+                    base_dir,
+                    "orphan_recovery",
+                    json!({
+                        "share": share.name,
+                        "action": "remove_stale_backup",
+                        "path": path,
+                    }),
+                );
             } else {
                 error!(
                     "[{}] RECOVERING orphaned file: {} -> {}",
@@ -1658,6 +1945,17 @@ fn recover_orphaned_files(
                             state,
                             "WARN",
                             &format!("Recovered orphaned file: {}", original_name),
+                        );
+                        emit_event(
+                            config,
+                            base_dir,
+                            "orphan_recovery",
+                            json!({
+                                "share": share.name,
+                                "action": "restore_orphaned_original",
+                                "from": path,
+                                "to": original_path,
+                            }),
                         );
                     }
                     Err(e) => {
@@ -1689,6 +1987,16 @@ fn recover_orphaned_files(
                     tmp_path.display()
                 );
                 let _ = fs.remove(&tmp_path);
+                emit_event(
+                    config,
+                    base_dir,
+                    "orphan_recovery",
+                    json!({
+                        "share": share.name,
+                        "action": "remove_stale_temp",
+                        "path": tmp_path,
+                    }),
+                );
             }
         }
 
@@ -1729,8 +2037,10 @@ fn cleanup_temp_files(fs: &dyn FileSystem, paths: &[&Path]) {
 
 #[allow(clippy::too_many_arguments)]
 fn record_failure(
+    state: &StateManager,
     db: &WatchdogDb,
     config: &Config,
+    base_dir: &Path,
     path: &str,
     row_id: i64,
     duration_seconds: f64,
@@ -1738,6 +2048,24 @@ fn record_failure(
     reason: &str,
     apply_cooldown: bool,
 ) {
+    let failure_code = code.as_str();
+    let now_ts = chrono::Utc::now().timestamp();
+    let summary = format!(
+        "Recording file failure: code={} path={} reason={} duration={:.1}s cooldown_tracking={}",
+        failure_code, path, reason, duration_seconds, apply_cooldown
+    );
+    match code {
+        FailureCode::InterruptedShutdown
+        | FailureCode::InterruptedPause
+        | FailureCode::Interrupted => {
+            info!("{}", summary);
+        }
+        _ => warn!("{}", summary),
+    }
+
+    state.update(|s| {
+        s.last_failure_code = Some(failure_code.to_string());
+    });
     db.record_transcode_end_with_code(
         row_id,
         TranscodeOutcome::Failed,
@@ -1745,16 +2073,58 @@ fn record_failure(
         0,
         duration_seconds,
         Some(reason),
-        Some(code.as_str()),
+        Some(failure_code),
     );
     if apply_cooldown {
         if let Some(cooldown) = db.record_file_failure(
             path,
             reason,
+            failure_code,
             config.safety.max_failures_before_cooldown,
             config.safety.cooldown_base_seconds,
             config.safety.cooldown_max_seconds,
         ) {
+            let should_quarantine = config
+                .safety
+                .quarantine_failure_codes
+                .iter()
+                .any(|c| c == failure_code)
+                && cooldown.consecutive_failures >= config.safety.quarantine_after_failures.max(1);
+            let retry_in_seconds = cooldown.next_eligible_at.saturating_sub(now_ts).max(0);
+            warn!(
+                "Failure cooldown state: code={} path={} consecutive_failures={} retry_in={}s quarantine_candidate={}",
+                failure_code,
+                path,
+                cooldown.consecutive_failures,
+                retry_in_seconds,
+                should_quarantine
+            );
+            if should_quarantine {
+                let was_quarantined = db.is_quarantined(path);
+                db.quarantine_file(path, failure_code, reason);
+                if !was_quarantined {
+                    tui_log(
+                        state,
+                        "ERROR",
+                        &format!("File quarantined after repeated failures: {}", path),
+                    );
+                    emit_event(
+                        config,
+                        base_dir,
+                        "quarantine_add",
+                        json!({
+                            "path": path,
+                            "failure_code": failure_code,
+                            "failure_reason": reason,
+                            "consecutive_failures": cooldown.consecutive_failures,
+                        }),
+                    );
+                }
+                let quarantined_count = db.quarantine_count().max(0) as u64;
+                state.update(|s| {
+                    s.quarantined_files = quarantined_count;
+                });
+            }
             if cooldown.next_eligible_at > chrono::Utc::now().timestamp() {
                 send_webhook(
                     &config.notify,
@@ -1762,12 +2132,17 @@ fn record_failure(
                     &json!({
                         "path": path,
                         "failure_reason": reason,
-                        "failure_code": code.as_str(),
+                        "failure_code": failure_code,
                         "consecutive_failures": cooldown.consecutive_failures,
                         "next_eligible_at": cooldown.next_eligible_at,
                     }),
                 );
             }
+        } else {
+            warn!(
+                "Failed to persist cooldown state for {} (code={} reason={}); DB error should be logged separately",
+                path, failure_code, reason
+            );
         }
     }
 }
@@ -1775,6 +2150,7 @@ fn record_failure(
 #[allow(clippy::too_many_arguments)]
 fn check_file_in_use_best_effort(
     config: &Config,
+    base_dir: &Path,
     deps: &PipelineDeps,
     state: &StateManager,
     path: &Path,
@@ -1803,8 +2179,10 @@ fn check_file_in_use_best_effort(
                 &format!("Skipped (in use): {} [{}]", display_filename, stage),
             );
             record_failure(
+                state,
                 db,
                 config,
+                base_dir,
                 path_str,
                 row_id,
                 duration_seconds,
@@ -1839,6 +2217,7 @@ fn increment_skip_counter(state: &StateManager, reason: SkipReason) {
         SkipReason::Cooldown => s.run_skipped_cooldown += 1,
         SkipReason::Filtered => s.run_skipped_filtered += 1,
         SkipReason::InUse => s.run_skipped_in_use += 1,
+        SkipReason::Quarantined => s.run_skipped_quarantined += 1,
     });
 }
 
@@ -1926,6 +2305,67 @@ fn is_pause_requested(config: &Config, base_dir: &Path) -> bool {
     pause_path.exists()
 }
 
+fn sync_service_state(state: &StateManager, db: &WatchdogDb) {
+    let service = db.get_service_state();
+    let quarantined = db.quarantine_count().max(0) as u64;
+    state.update(|s| {
+        s.consecutive_pass_failures = service.consecutive_pass_failures;
+        s.auto_paused = service.auto_paused_at.is_some();
+        s.auto_pause_reason = service.auto_pause_reason.clone();
+        s.auto_paused_at = service.auto_paused_at.clone();
+        s.quarantined_files = quarantined;
+    });
+}
+
+fn emit_event(config: &Config, base_dir: &Path, event: &str, payload: serde_json::Value) {
+    let path = resolve_event_journal_path(&config.paths.event_journal, base_dir);
+    append_event(path.as_deref(), event, payload);
+}
+
+fn write_pause_marker(config: &Config, base_dir: &Path, reason: &str) -> std::io::Result<PathBuf> {
+    let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
+    if let Some(parent) = pause_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let marker = format!(
+        "paused_at={}\nreason={}\nsource=auto_safety_trip\n",
+        chrono::Utc::now().to_rfc3339(),
+        reason
+    );
+    std::fs::write(&pause_path, marker.as_bytes())?;
+    Ok(pause_path)
+}
+
+async fn wait_while_paused(
+    config: &Config,
+    base_dir: &Path,
+    state: &StateManager,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> bool {
+    loop {
+        if !is_pause_requested(config, base_dir) {
+            tui_log(state, "INFO", "Pause lifted, resuming pipeline");
+            return true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
+            _ = shutdown_rx.recv() => {
+                info!("Pipeline shutting down while paused");
+                return false;
+            }
+        }
+    }
+}
+
+fn classify_pass_failure_code(err: &WatchdogError) -> &'static str {
+    match err {
+        WatchdogError::ScanTimeout { .. } => FailureCode::ScanTimeout.as_str(),
+        WatchdogError::NfsMount { .. } => "nfs_mount_failed",
+        WatchdogError::NoMediaDirectories => "no_media_directories",
+        _ => "pass_error",
+    }
+}
+
 /// Run the pipeline in a loop with configurable interval.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline_loop(
@@ -1942,10 +2382,17 @@ pub async fn run_pipeline_loop(
     let recovery_interval =
         Duration::from_secs(config.safety.recovery_scan_interval_seconds.max(1));
     let mut last_recovery_run: Option<Instant> = None;
+    sync_service_state(&state, db.as_ref());
 
     loop {
         if shutdown_requested(&mut shutdown_rx) {
             info!("Pipeline shutting down");
+            emit_event(
+                &config,
+                &base_dir,
+                "shutdown",
+                json!({"phase": "loop_top_shutdown"}),
+            );
             return Ok(());
         }
 
@@ -1953,8 +2400,20 @@ pub async fn run_pipeline_loop(
             .as_ref()
             .is_none_or(|last| last.elapsed() >= recovery_interval)
         {
-            if !recover_orphaned_files(deps.fs.as_ref(), &config, &state, &mut shutdown_rx) {
+            if !recover_orphaned_files(
+                deps.fs.as_ref(),
+                &config,
+                &base_dir,
+                &state,
+                &mut shutdown_rx,
+            ) {
                 info!("Pipeline shutting down during recovery scan");
+                emit_event(
+                    &config,
+                    &base_dir,
+                    "shutdown",
+                    json!({"phase": "recovery_scan"}),
+                );
                 return Ok(());
             }
             last_recovery_run = Some(Instant::now());
@@ -1980,6 +2439,8 @@ pub async fn run_pipeline_loop(
                     stats.transcode_failures,
                     format_bytes_signed(stats.space_saved_bytes)
                 );
+                db.note_pass_success();
+                sync_service_state(&state, db.as_ref());
                 retry_delay = 30;
                 if once {
                     return Ok(());
@@ -1987,6 +2448,12 @@ pub async fn run_pipeline_loop(
             }
             Err(WatchdogError::Shutdown) => {
                 info!("Pipeline shutting down");
+                emit_event(
+                    &config,
+                    &base_dir,
+                    "shutdown",
+                    json!({"phase": "pass_shutdown"}),
+                );
                 return Ok(());
             }
             Err(WatchdogError::Paused) => {
@@ -1995,33 +2462,139 @@ pub async fn run_pipeline_loop(
                 }
                 state.set_phase(PipelinePhase::Paused);
                 tui_log(&state, "WARN", "Pipeline paused");
-                loop {
-                    if !is_pause_requested(&config, &base_dir) {
-                        tui_log(&state, "INFO", "Pause lifted, resuming pipeline");
-                        break;
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
-                        _ = shutdown_rx.recv() => {
-                            info!("Pipeline shutting down while paused");
-                            return Ok(());
-                        }
-                    }
+                if !wait_while_paused(&config, &base_dir, &state, &mut shutdown_rx).await {
+                    emit_event(
+                        &config,
+                        &base_dir,
+                        "shutdown",
+                        json!({"phase": "paused_wait"}),
+                    );
+                    return Ok(());
+                }
+                if db.get_service_state().auto_paused_at.is_some() {
+                    db.clear_auto_paused();
+                    db.note_pass_success();
+                    sync_service_state(&state, db.as_ref());
+                    emit_event(
+                        &config,
+                        &base_dir,
+                        "auto_pause_cleared",
+                        json!({"source": "manual_resume"}),
+                    );
                 }
                 continue;
             }
-            Err(e) => {
+            Err(WatchdogError::ScanTimeout {
+                timeout_secs,
+                pending_shares,
+            }) => {
                 if dry_run || once {
-                    return Err(e);
+                    return Err(WatchdogError::ScanTimeout {
+                        timeout_secs,
+                        pending_shares,
+                    });
                 }
-                error!("Watchdog pass failed: {}", e);
+                error!(
+                    "Share scan timed out after {}s ({} share(s) pending)",
+                    timeout_secs, pending_shares
+                );
                 state.set_nfs_healthy(false);
-                tui_log(&state, "ERROR", &format!("Pass failed: {}", e));
+                state.update(|s| {
+                    s.scan_timeout_count += 1;
+                    s.last_failure_code = Some(FailureCode::ScanTimeout.as_str().to_string());
+                });
+                db.record_pipeline_failure("scan_timeout", FailureCode::ScanTimeout.as_str());
+                let service_state = db.note_pass_failure(FailureCode::ScanTimeout.as_str());
+                state.update(|s| {
+                    s.consecutive_pass_failures = service_state.consecutive_pass_failures;
+                });
+                emit_event(
+                    &config,
+                    &base_dir,
+                    "scan_timeout",
+                    json!({
+                        "timeout_seconds": timeout_secs,
+                        "pending_shares": pending_shares,
+                        "consecutive_pass_failures": service_state.consecutive_pass_failures,
+                    }),
+                );
+                if config.safety.auto_pause_on_pass_failures
+                    && service_state.consecutive_pass_failures
+                        >= config.safety.max_consecutive_pass_failures.max(1)
+                {
+                    let reason = format!(
+                        "tripwire: {} consecutive pass failures (latest: {})",
+                        service_state.consecutive_pass_failures,
+                        FailureCode::ScanTimeout.as_str()
+                    );
+                    match write_pause_marker(&config, &base_dir, &reason) {
+                        Ok(path) => info!("Auto-pause marker created at {}", path.display()),
+                        Err(e) => warn!("Failed to write auto-pause marker: {}", e),
+                    }
+                    db.mark_auto_paused(&reason);
+                    db.record_pipeline_failure(
+                        FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP,
+                        FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP,
+                    );
+                    sync_service_state(&state, db.as_ref());
+                    state.update(|s| {
+                        s.last_failure_code =
+                            Some(FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP.to_string());
+                    });
+                    emit_event(
+                        &config,
+                        &base_dir,
+                        "auto_pause",
+                        json!({
+                            "reason": reason,
+                            "trigger_failure_code": FailureCode::ScanTimeout.as_str(),
+                            "consecutive_pass_failures": service_state.consecutive_pass_failures,
+                        }),
+                    );
+                    state.set_phase(PipelinePhase::Paused);
+                    tui_log(
+                        &state,
+                        "ERROR",
+                        "Safety tripwire triggered; pipeline auto-paused until --resume",
+                    );
+                    if !wait_while_paused(&config, &base_dir, &state, &mut shutdown_rx).await {
+                        emit_event(
+                            &config,
+                            &base_dir,
+                            "shutdown",
+                            json!({"phase": "auto_pause_wait"}),
+                        );
+                        return Ok(());
+                    }
+                    db.clear_auto_paused();
+                    db.note_pass_success();
+                    sync_service_state(&state, db.as_ref());
+                    emit_event(
+                        &config,
+                        &base_dir,
+                        "auto_pause_cleared",
+                        json!({"source": "manual_resume"}),
+                    );
+                    retry_delay = 30;
+                    continue;
+                }
+                tui_log(
+                    &state,
+                    "ERROR",
+                    &format!(
+                        "Pass failed: scan timeout after {}s ({} pending share(s))",
+                        timeout_secs, pending_shares
+                    ),
+                );
                 send_webhook(
                     &config.notify,
                     NotifyEvent::PassFailureSummary,
                     &json!({
-                        "error": e.to_string(),
+                        "error": format!(
+                            "share scan timed out after {}s ({} share(s) pending)",
+                            timeout_secs, pending_shares
+                        ),
+                        "failure_code": FailureCode::ScanTimeout.as_str(),
                         "retry_delay_seconds": retry_delay,
                     }),
                 );
@@ -2029,6 +2602,123 @@ pub async fn run_pipeline_loop(
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay)) => {}
                     _ = shutdown_rx.recv() => {
                         info!("Pipeline shutting down during retry backoff");
+                        emit_event(
+                            &config,
+                            &base_dir,
+                            "shutdown",
+                            json!({"phase": "retry_backoff_scan_timeout"}),
+                        );
+                        return Ok(());
+                    }
+                }
+                retry_delay = (retry_delay * 2).min(300);
+                continue;
+            }
+            Err(e) => {
+                if dry_run || once {
+                    return Err(e);
+                }
+                let pass_failure_code = classify_pass_failure_code(&e).to_string();
+                error!("Watchdog pass failed: {}", e);
+                state.set_nfs_healthy(false);
+                state.update(|s| {
+                    s.last_failure_code = Some(pass_failure_code.clone());
+                });
+                db.record_pipeline_failure(&pass_failure_code, &pass_failure_code);
+                let service_state = db.note_pass_failure(&pass_failure_code);
+                state.update(|s| {
+                    s.consecutive_pass_failures = service_state.consecutive_pass_failures;
+                });
+                tui_log(&state, "ERROR", &format!("Pass failed: {}", e));
+                emit_event(
+                    &config,
+                    &base_dir,
+                    "pass_end",
+                    json!({
+                        "result": "failed",
+                        "failure_code": pass_failure_code,
+                        "error": e.to_string(),
+                        "consecutive_pass_failures": service_state.consecutive_pass_failures,
+                    }),
+                );
+                if config.safety.auto_pause_on_pass_failures
+                    && service_state.consecutive_pass_failures
+                        >= config.safety.max_consecutive_pass_failures.max(1)
+                {
+                    let reason = format!(
+                        "tripwire: {} consecutive pass failures (latest: {})",
+                        service_state.consecutive_pass_failures, pass_failure_code
+                    );
+                    match write_pause_marker(&config, &base_dir, &reason) {
+                        Ok(path) => info!("Auto-pause marker created at {}", path.display()),
+                        Err(err) => warn!("Failed to write auto-pause marker: {}", err),
+                    }
+                    db.mark_auto_paused(&reason);
+                    db.record_pipeline_failure(
+                        FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP,
+                        FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP,
+                    );
+                    sync_service_state(&state, db.as_ref());
+                    state.update(|s| {
+                        s.last_failure_code =
+                            Some(FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP.to_string());
+                    });
+                    emit_event(
+                        &config,
+                        &base_dir,
+                        "auto_pause",
+                        json!({
+                            "reason": reason,
+                            "trigger_failure_code": pass_failure_code,
+                            "consecutive_pass_failures": service_state.consecutive_pass_failures,
+                        }),
+                    );
+                    state.set_phase(PipelinePhase::Paused);
+                    tui_log(
+                        &state,
+                        "ERROR",
+                        "Safety tripwire triggered; pipeline auto-paused until --resume",
+                    );
+                    if !wait_while_paused(&config, &base_dir, &state, &mut shutdown_rx).await {
+                        emit_event(
+                            &config,
+                            &base_dir,
+                            "shutdown",
+                            json!({"phase": "auto_pause_wait"}),
+                        );
+                        return Ok(());
+                    }
+                    db.clear_auto_paused();
+                    db.note_pass_success();
+                    sync_service_state(&state, db.as_ref());
+                    emit_event(
+                        &config,
+                        &base_dir,
+                        "auto_pause_cleared",
+                        json!({"source": "manual_resume"}),
+                    );
+                    retry_delay = 30;
+                    continue;
+                }
+                send_webhook(
+                    &config.notify,
+                    NotifyEvent::PassFailureSummary,
+                    &json!({
+                        "error": e.to_string(),
+                        "failure_code": pass_failure_code,
+                        "retry_delay_seconds": retry_delay,
+                    }),
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay)) => {}
+                    _ = shutdown_rx.recv() => {
+                        info!("Pipeline shutting down during retry backoff");
+                        emit_event(
+                            &config,
+                            &base_dir,
+                            "shutdown",
+                            json!({"phase": "retry_backoff_pass_error"}),
+                        );
                         return Ok(());
                     }
                 }
@@ -2044,13 +2734,33 @@ pub async fn run_pipeline_loop(
         if is_pause_requested(&config, &base_dir) {
             state.set_phase(PipelinePhase::Paused);
             tui_log(&state, "WARN", "Pipeline paused");
+            if !wait_while_paused(&config, &base_dir, &state, &mut shutdown_rx).await {
+                emit_event(
+                    &config,
+                    &base_dir,
+                    "shutdown",
+                    json!({"phase": "manual_pause_wait"}),
+                );
+                return Ok(());
+            }
+            if db.get_service_state().auto_paused_at.is_some() {
+                db.clear_auto_paused();
+                db.note_pass_success();
+                sync_service_state(&state, db.as_ref());
+                emit_event(
+                    &config,
+                    &base_dir,
+                    "auto_pause_cleared",
+                    json!({"source": "manual_resume"}),
+                );
+            }
             continue;
         }
 
         // Wait for next scan interval or shutdown
         state.set_phase(PipelinePhase::Waiting);
         state.set_current_file(None);
-        state.set_transcode_progress(0.0, 0.0, 0.0, String::new());
+        state.reset_file_progress();
         tui_log(
             &state,
             "INFO",
@@ -2061,8 +2771,63 @@ pub async fn run_pipeline_loop(
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(config.scan.interval_seconds)) => {}
             _ = shutdown_rx.recv() => {
                 info!("Pipeline shutting down during wait");
+                emit_event(
+                    &config,
+                    &base_dir,
+                    "shutdown",
+                    json!({"phase": "interval_wait"}),
+                );
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_local_temp_paths_hashes_full_path_to_avoid_collisions() {
+        let temp_dir = Path::new("/tmp/watchdog");
+        let a = Path::new("/mnt/movies/A/Movie.mkv");
+        let b = Path::new("/mnt/movies/B/Movie.mkv");
+        let (a_source, a_output) = build_local_temp_paths(temp_dir, "movies", a);
+        let (b_source, b_output) = build_local_temp_paths(temp_dir, "movies", b);
+
+        assert_ne!(a_source, b_source);
+        assert_ne!(a_output, b_output);
+        assert!(a_source
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("movies_")));
+    }
+
+    #[test]
+    fn shutdown_requested_false_when_no_signal() {
+        let (_tx, mut rx) = broadcast::channel::<()>(1);
+        assert!(!shutdown_requested(&mut rx));
+    }
+
+    #[test]
+    fn shutdown_requested_true_when_signal_arrives() {
+        let (tx, mut rx) = broadcast::channel::<()>(1);
+        let _ = tx.send(());
+        assert!(shutdown_requested(&mut rx));
+    }
+
+    #[test]
+    fn shutdown_requested_true_when_channel_lagged() {
+        let (tx, mut rx) = broadcast::channel::<()>(1);
+        let _ = tx.send(());
+        let _ = tx.send(());
+        assert!(shutdown_requested(&mut rx));
+    }
+
+    #[test]
+    fn shutdown_requested_true_when_channel_closed() {
+        let (tx, mut rx) = broadcast::channel::<()>(1);
+        drop(tx);
+        assert!(shutdown_requested(&mut rx));
     }
 }

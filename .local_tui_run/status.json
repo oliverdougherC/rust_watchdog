@@ -1,0 +1,61 @@
+{
+  "timestamp": "2026-03-09T02:09:47.491463+00:00",
+  "phase": "Transcoding",
+  "paused": false,
+  "nfs_healthy": true,
+  "simulate_mode": false,
+  "queue_position": 2,
+  "queue_total": 6,
+  "current_file": "/Users/ofhd/Developer/rust_watchdog/.local_tui_run/media_share/Reference_1080p_h264_8bit.mp4",
+  "progress_stage": "Transcode",
+  "import_percent": 100.0,
+  "transcode_percent": 14.673157036304474,
+  "export_percent": 0.0,
+  "composite_percent": 28.803894221782684,
+  "transfer_rate_mib_per_sec": 0.0,
+  "transfer_eta": "",
+  "transcode_fps": 0.0,
+  "transcode_avg_fps": 0.0,
+  "transcode_eta": "",
+  "totals": {
+    "transcoded": 1,
+    "inspected": 6,
+    "space_saved_bytes": 5290
+  },
+  "run": {
+    "inspected": 6,
+    "transcoded": 1,
+    "failures": 0,
+    "space_saved_bytes": 5290,
+    "skipped_inspected": 0,
+    "skipped_young": 0,
+    "skipped_cooldown": 0,
+    "skipped_filtered": 0,
+    "skipped_in_use": 0,
+    "skipped_quarantined": 0
+  },
+  "reliability": {
+    "scan_timeouts": 0,
+    "last_failure_code": null,
+    "consecutive_pass_failures": 0,
+    "auto_paused": false,
+    "auto_pause_reason": null,
+    "auto_paused_at": null,
+    "quarantined_files": 0
+  },
+  "cooldown_files": 0,
+  "top_failure_reasons": [],
+  "share_health": [
+    {
+      "name": "local_test_videos",
+      "healthy": true
+    }
+  ],
+  "unhealthy_shares": [],
+  "latest_failure": {
+    "source_path": "/Users/ofhd/Developer/rust_watchdog/.local_tui_run/media_share/Reference_1080p_h264_8bit.mp4",
+    "failure_reason": null,
+    "failure_code": null,
+    "completed_at": null
+  }
+}
