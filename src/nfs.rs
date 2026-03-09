@@ -27,15 +27,31 @@ fn allow_local_mounts_for_testing() -> bool {
 pub struct SystemMountManager;
 
 impl SystemMountManager {
+    fn parse_mount_fs_type(mount_output: &str, mount_point: &Path) -> Option<String> {
+        let needle = format!(" on {} (", mount_point.display());
+        for line in mount_output.lines() {
+            let start = match line.find(&needle) {
+                Some(idx) => idx + needle.len(),
+                None => continue,
+            };
+            let rest = &line[start..];
+            let end = rest.find([',', ')']).unwrap_or(rest.len());
+            let fs_type = rest[..end].trim().to_lowercase();
+            if !fs_type.is_empty() {
+                return Some(fs_type);
+            }
+        }
+        None
+    }
+
     fn filesystem_type(&self, mount_point: &Path) -> Option<String> {
-        let mut cmd = Command::new("stat");
-        cmd.args(["-f", "%T"]).arg(mount_point);
+        let cmd = Command::new("mount");
         let command_repr = format_command_for_log(&cmd);
         let output = match run_command(
             cmd,
             RunOptions {
                 timeout: Some(Duration::from_secs(3)),
-                stdout_limit: 1024,
+                stdout_limit: 256 * 1024,
                 stderr_limit: 1024,
                 ..RunOptions::default()
             },
@@ -71,17 +87,16 @@ impl SystemMountManager {
             return None;
         }
 
-        let fs_type = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_lowercase();
-        if fs_type.is_empty() {
-            None
-        } else {
-            Some(fs_type)
+        let mount_output = String::from_utf8_lossy(&output.stdout);
+        let fs_type = Self::parse_mount_fs_type(&mount_output, mount_point);
+        if fs_type.is_none() {
+            warn!(
+                "Filesystem-type probe could not find mount entry for {} in mount output (command={})",
+                mount_point.display(),
+                command_repr
+            );
         }
+        fs_type
     }
 }
 
@@ -262,5 +277,22 @@ mod tests {
         let manager = SystemMountManager;
         let temp = tempfile::tempdir().unwrap();
         assert!(!manager.is_healthy(temp.path()));
+    }
+
+    #[test]
+    fn parse_mount_fs_type_extracts_nfs() {
+        let output =
+            "192.168.1.244:/data on /Volumes/JellyfinMovies (nfs, nodev, nosuid, mounted by root)";
+        let mount_point = Path::new("/Volumes/JellyfinMovies");
+        let fs_type = SystemMountManager::parse_mount_fs_type(output, mount_point);
+        assert_eq!(fs_type.as_deref(), Some("nfs"));
+    }
+
+    #[test]
+    fn parse_mount_fs_type_returns_none_when_mount_point_missing() {
+        let output = "//user@host/share on /Volumes/share (smbfs, nodev, nosuid, mounted by user)";
+        let mount_point = Path::new("/Volumes/JellyfinTV");
+        let fs_type = SystemMountManager::parse_mount_fs_type(output, mount_point);
+        assert!(fs_type.is_none());
     }
 }
