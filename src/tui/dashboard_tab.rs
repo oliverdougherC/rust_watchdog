@@ -584,7 +584,9 @@ fn render_recent_activity(f: &mut Frame, area: Rect, state: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{composite_percent, compute_segment_widths, transfer_detail_text, truncate_to_width};
+    use super::{
+        composite_percent, compute_segment_widths, transfer_detail_text, truncate_to_width,
+    };
     use crate::state::{AppState, ProgressStage};
 
     #[test]
@@ -612,10 +614,12 @@ mod tests {
 
     #[test]
     fn transfer_detail_shows_preparing_message_at_zero_percent() {
-        let mut state = AppState::default();
-        state.progress_stage = ProgressStage::Import;
-        state.import_percent = 0.0;
-        state.transfer_eta = "preparing".to_string();
+        let state = AppState {
+            progress_stage: ProgressStage::Import,
+            import_percent: 0.0,
+            transfer_eta: "preparing".to_string(),
+            ..AppState::default()
+        };
         assert_eq!(transfer_detail_text(&state), "Rsync preparing/checking...");
     }
 }

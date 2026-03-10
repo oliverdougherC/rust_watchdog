@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -5,15 +6,18 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use watchdog::config::Config;
 use watchdog::db::WatchdogDb;
+use watchdog::diagnostics::{log_anyhow_error, print_anyhow_error_report};
 use watchdog::event_journal::{append_event, resolve_event_journal_path};
 use watchdog::in_use::CommandInUseDetector;
 use watchdog::nfs::SystemMountManager;
 use watchdog::pipeline::{run_pipeline_loop, PipelineDeps};
 use watchdog::probe::FfprobeProber;
-use watchdog::process::{run_command, RunOptions};
+use watchdog::process::{
+    describe_exit_status, format_command_for_log, run_command, summarize_output_tail, RunOptions,
+};
 use watchdog::scanner::RealFileSystem;
 use watchdog::simulate::create_simulated_deps;
 use watchdog::state::StateManager;
@@ -151,6 +155,10 @@ struct Cli {
     #[arg(long, default_value = "watchdog.toml")]
     config: PathBuf,
 
+    /// Override log verbosity (error|warn|info|debug|trace)
+    #[arg(long, value_parser = ["error", "warn", "info", "debug", "trace"])]
+    log_level: Option<String>,
+
     /// Run read-only health checks and exit
     #[arg(long)]
     healthcheck: bool,
@@ -197,7 +205,15 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(err) = run().await {
+        log_anyhow_error("Fatal watchdog error", &err);
+        print_anyhow_error_report("watchdog failed", &err);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.pause && cli.resume {
         anyhow::bail!("Use only one of --pause or --resume");
@@ -261,7 +277,10 @@ async fn main() -> anyhow::Result<()> {
         && !run_healthcheck_mode
         && !cli.pause
         && !cli.resume;
-    let default_level = if tui_mode { "warn" } else { "info" };
+    let default_level = cli
+        .log_level
+        .as_deref()
+        .unwrap_or(if tui_mode { "warn" } else { "info" });
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -270,9 +289,22 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    info!("Starting Jellyfin AV1 Transcoding Watchdog");
     info!(
-        "Runtime flags: simulate={} headless={} dry_run={} once={} doctor={} status_mode={} healthcheck_mode={} clear_scan_cache={}",
+        "Starting Jellyfin AV1 Transcoding Watchdog v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    info!(
+        "Runtime platform: os={} arch={} pid={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::process::id()
+    );
+    if let Ok(cwd) = std::env::current_dir() {
+        info!("Current working directory: {}", cwd.display());
+    }
+    debug!("Raw argv: {:?}", std::env::args().collect::<Vec<_>>());
+    info!(
+        "Runtime flags: simulate={} headless={} dry_run={} once={} doctor={} status_mode={} healthcheck_mode={} clear_scan_cache={} tui_mode={} log_level={}",
         cli.simulate,
         cli.headless,
         cli.dry_run,
@@ -280,7 +312,9 @@ async fn main() -> anyhow::Result<()> {
         cli.doctor,
         run_status_mode,
         run_healthcheck_mode,
-        cli.clear_scan_cache
+        cli.clear_scan_cache,
+        tui_mode,
+        default_level
     );
 
     // Load or generate config
@@ -291,14 +325,24 @@ async fn main() -> anyhow::Result<()> {
         match Config::load(&cli.config) {
             Ok(c) => c,
             Err(e) => {
-                error!("Failed to load config from {}: {}", cli.config.display(), e);
+                error!(
+                    "Failed to load config from {}: {} (code={} category={})",
+                    cli.config.display(),
+                    e,
+                    e.code(),
+                    e.category()
+                );
+                if let Some(hint) = e.operator_hint() {
+                    warn!("Config remediation hint: {}", hint);
+                }
                 if run_healthcheck_mode {
                     std::process::exit(HC_CONFIG_FAIL);
                 }
                 if run_status_mode {
                     std::process::exit(STATUS_INTERNAL_FAIL);
                 }
-                anyhow::bail!("Config load failed: {}", e);
+                return Err(anyhow::Error::new(e)
+                    .context(format!("Config load failed from {}", cli.config.display())));
             }
         }
     };
@@ -310,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Determine base directory (config file's parent, or cwd)
     let base_dir = if cli.simulate {
-        std::env::current_dir()?
+        std::env::current_dir().context("Failed to determine current working directory")?
     } else {
         cli.config
             .canonicalize()
@@ -324,19 +368,29 @@ async fn main() -> anyhow::Result<()> {
     let mut resume_requested = false;
     if cli.pause || cli.resume {
         let pause_path = config.resolve_path(&base_dir, &config.safety.pause_file);
+        info!("Pause marker path: {}", pause_path.display());
         if cli.pause {
             if let Some(parent) = pause_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "Failed to create pause marker parent directory {}",
+                        parent.display()
+                    )
+                })?;
             }
             let marker = format!(
                 "paused_at={}\nreason=manual_cli\nsource=operator\n",
                 chrono::Utc::now().to_rfc3339()
             );
-            std::fs::write(&pause_path, marker.as_bytes())?;
+            std::fs::write(&pause_path, marker.as_bytes()).with_context(|| {
+                format!("Failed to write pause marker file {}", pause_path.display())
+            })?;
             println!("pause file created: {}", pause_path.display());
         } else {
             if pause_path.exists() {
-                std::fs::remove_file(&pause_path)?;
+                std::fs::remove_file(&pause_path).with_context(|| {
+                    format!("Failed to remove pause marker {}", pause_path.display())
+                })?;
                 println!("pause file removed: {}", pause_path.display());
             } else {
                 println!("pause file already absent: {}", pause_path.display());
@@ -385,7 +439,10 @@ async fn main() -> anyhow::Result<()> {
                             db_path.display(),
                             e
                         );
-                        return Err(e.into());
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "Failed to open read-only database at {}",
+                            db_path.display()
+                        )));
                     }
                 }
             } else {
@@ -397,7 +454,12 @@ async fn main() -> anyhow::Result<()> {
             }
         } else {
             if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "Failed to create database parent directory {}",
+                        parent.display()
+                    )
+                })?;
             }
             match WatchdogDb::open(&db_path) {
                 Ok(db) => Arc::new(db),
@@ -409,7 +471,8 @@ async fn main() -> anyhow::Result<()> {
                     if run_status_mode {
                         std::process::exit(STATUS_INTERNAL_FAIL);
                     }
-                    return Err(e.into());
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Failed to open database at {}", db_path.display())));
                 }
             }
         }
@@ -503,7 +566,7 @@ async fn main() -> anyhow::Result<()> {
         let exit_code = match run_status(&config, &base_dir, &db, cli.simulate, cli.status_json) {
             Ok(code) => code,
             Err(e) => {
-                error!("Status internal error: {}", e);
+                log_anyhow_error("Status internal error", &e);
                 STATUS_INTERNAL_FAIL
             }
         };
@@ -515,7 +578,7 @@ async fn main() -> anyhow::Result<()> {
             match run_healthcheck(&config, &base_dir, &db, cli.simulate, cli.healthcheck_json) {
                 Ok(code) => code,
                 Err(e) => {
-                    error!("Healthcheck internal error: {}", e);
+                    log_anyhow_error("Healthcheck internal error", &e);
                     HC_INTERNAL_FAIL
                 }
             };
@@ -532,6 +595,10 @@ async fn main() -> anyhow::Result<()> {
         for err in &validation_errors {
             error!("Config validation error: {}", err);
         }
+        warn!(
+            "Configuration validation failed; run `watchdog --doctor --config {}` for a full diagnostic report",
+            cli.config.display()
+        );
         anyhow::bail!(
             "Configuration validation failed with {} error(s)",
             validation_errors.len()
@@ -550,7 +617,11 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 error!("{}", e);
-                anyhow::bail!("{}", e);
+                anyhow::bail!(
+                    "Failed to acquire instance lock at {}: {}",
+                    lock_path.display(),
+                    e
+                );
             }
         }
     } else {
@@ -561,9 +632,23 @@ async fn main() -> anyhow::Result<()> {
     if !cli.simulate {
         if let Err(missing) = util::verify_dependencies() {
             error!("Missing required tools: {}", missing.join(", "));
-            anyhow::bail!("Dependency check failed. Install: {}", missing.join(", "));
+            debug!(
+                "Dependency check PATH snapshot: {}",
+                std::env::var("PATH").unwrap_or_else(|_| "<unavailable>".to_string())
+            );
+            anyhow::bail!(
+                "Dependency check failed. Install: {}. Run `watchdog --doctor --config {}` for detailed diagnostics.",
+                missing.join(", "),
+                cli.config.display()
+            );
         }
-        info!("All required CLI tools found: ffprobe, HandBrakeCLI, rsync");
+        let ffprobe_ver = tool_version("ffprobe").unwrap_or_else(|| "unknown".to_string());
+        let handbrake_ver = tool_version("HandBrakeCLI").unwrap_or_else(|| "unknown".to_string());
+        let rsync_ver = tool_version("rsync").unwrap_or_else(|| "unknown".to_string());
+        info!(
+            "All required CLI tools found: ffprobe='{}' HandBrakeCLI='{}' rsync='{}'",
+            ffprobe_ver, handbrake_ver, rsync_ver
+        );
     }
 
     // Create state manager and seed cumulative stats from DB
@@ -674,7 +759,12 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
         let _ = shutdown_tx.send(());
-        pipeline_result?;
+        pipeline_result.with_context(|| {
+            format!(
+                "Pipeline loop failed (headless={}, dry_run={}, once={})",
+                cli.headless, cli.dry_run, cli.once
+            )
+        })?;
     } else {
         // TUI mode: run pipeline in background, TUI in foreground
         let pipeline_config = config.clone();
@@ -711,12 +801,26 @@ async fn main() -> anyhow::Result<()> {
         // Wait for pipeline to finish
         match pipeline_handle.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => error!("Pipeline error: {}", e),
+            Ok(Err(e)) => {
+                error!(
+                    "Pipeline error: {} (code={} category={})",
+                    e,
+                    e.code(),
+                    e.category()
+                );
+                for (key, value) in e.diagnostic_fields() {
+                    error!("pipeline_error_context {}={}", key, value);
+                }
+                if let Some(hint) = e.operator_hint() {
+                    warn!("Pipeline remediation hint: {}", hint);
+                }
+            }
             Err(e) => error!("Pipeline task join error: {}", e),
         }
 
         if let Err(e) = tui_result {
-            error!("TUI error: {}", e);
+            log_anyhow_error("TUI error", &e);
+            print_anyhow_error_report("tui failed", &e);
         }
     }
 
@@ -936,7 +1040,12 @@ fn collect_snapshot_diagnostics(config: &Config, base_dir: &Path) -> SnapshotDia
     };
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(_) => {
+        Err(e) => {
+            debug!(
+                "Status snapshot metadata unavailable at {}: {}",
+                path.display(),
+                e
+            );
             return SnapshotDiagnostics {
                 freshness: "missing".to_string(),
                 age_seconds: None,
@@ -958,8 +1067,25 @@ fn collect_snapshot_diagnostics(config: &Config, base_dir: &Path) -> SnapshotDia
     .to_string();
 
     let snapshot = match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str::<Value>(&content).ok(),
-        Err(_) => None,
+        Ok(content) => match serde_json::from_str::<Value>(&content) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                warn!(
+                    "Status snapshot at {} is invalid JSON: {}",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                "Failed to read status snapshot at {}: {}",
+                path.display(),
+                e
+            );
+            None
+        }
     };
     SnapshotDiagnostics {
         freshness,
@@ -982,7 +1108,8 @@ fn read_list_env(key: &str) -> Option<Vec<String>> {
 fn tool_version(tool: &str) -> Option<String> {
     let mut cmd = Command::new(tool);
     cmd.arg("--version");
-    let out = run_command(
+    let command_repr = format_command_for_log(&cmd);
+    let out = match run_command(
         cmd,
         RunOptions {
             timeout: Some(Duration::from_secs(3)),
@@ -990,9 +1117,25 @@ fn tool_version(tool: &str) -> Option<String> {
             stderr_limit: 4096,
             ..RunOptions::default()
         },
-    )
-    .ok()?;
-    if !out.status.success() || out.timed_out {
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            debug!(
+                "Tool version probe failed to execute: tool={} command={} error={}",
+                tool, command_repr, e
+            );
+            return None;
+        }
+    };
+    if out.timed_out || !out.status.success() {
+        debug!(
+            "Tool version probe failed: tool={} command={} status={} timed_out={} stderr={}",
+            tool,
+            command_repr,
+            describe_exit_status(&out.status),
+            out.timed_out,
+            summarize_output_tail(&out.stderr_tail, 200)
+        );
         return None;
     }
     let text = if !out.stdout.is_empty() {
@@ -1011,6 +1154,7 @@ fn run_status(
     json_output: bool,
 ) -> anyhow::Result<i32> {
     if !db.healthcheck_query_ok() {
+        warn!("Status request degraded: database healthcheck query failed");
         let result = StatusResult {
             status: "error".to_string(),
             exit_code: STATUS_INTERNAL_FAIL,
@@ -1044,6 +1188,7 @@ fn run_status(
             println!("  status: error");
             println!("  exit_code: {}", STATUS_INTERNAL_FAIL);
             println!("  db_query_ok: false");
+            println!("  hint: run watchdog --doctor for database diagnostics");
         }
         return Ok(STATUS_INTERNAL_FAIL);
     }

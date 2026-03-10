@@ -18,9 +18,21 @@
 
 # Logs
 logs/
+*.log
+*.log.*
 
 # Environment / secrets
 .env
+.env.local
+.env.*.local
+
+# Local runtime/config artifacts
+watchdog.toml
+watchdog.pause
+status.json
+status_snapshot*.json
+events.ndjson
+*.lock
 
 test_videos/*
 .local_tui_run/

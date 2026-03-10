@@ -23,6 +23,7 @@ Automated media transcoding pipeline for Jellyfin libraries. Scans NFS-mounted m
 - **Active-file guard (optional)** — best-effort in-use checks to avoid files currently opened by other processes
 - **Status snapshot (optional)** — atomic JSON state file for service monitoring integrations
 - **Event journal (optional)** — NDJSON operational event stream for audits and diagnostics
+- **Structured fatal diagnostics** — error chain, machine code/category, context fields, and remediation hints
 
 ## Requirements
 
@@ -118,6 +119,34 @@ WATCHDOG_LOCAL_TUI_HEADLESS_LOG_LEVEL=debug ./local_tui.sh --headless-once
 ./local_tui.sh --prepare-only
 ```
 
+## Debugging and Logging
+
+When troubleshooting, run with explicit verbosity and backtraces:
+
+```bash
+RUST_LOG=watchdog=debug RUST_BACKTRACE=1 ./target/release/watchdog --headless --log-level debug
+```
+
+What you now get on fatal failures:
+
+- Full error chain (`[0]` root through nested causes)
+- Structured classification (`error_code`, `error_category`)
+- Variant-specific context fields (for example `path`, `share`, timeout values)
+- Actionable remediation hints for common failure classes
+
+Useful operator commands:
+
+```bash
+# Fast environment + dependency + mount diagnostics
+./target/release/watchdog --doctor --config watchdog.toml
+
+# Snapshot-driven service status for remote debugging
+./target/release/watchdog --status-json --config watchdog.toml
+
+# Health-oriented checks suitable for supervisors
+./target/release/watchdog --healthcheck-json --config watchdog.toml
+```
+
 ## CLI Flags
 
 | Flag | Description |
@@ -126,6 +155,7 @@ WATCHDOG_LOCAL_TUI_HEADLESS_LOG_LEVEL=debug ./local_tui.sh --headless-once
 | `--dry-run` | Scan and report the transcode queue, then exit |
 | `--once` | Run one live pass, then exit |
 | `--headless` | No TUI, log to stdout (for services) |
+| `--log-level <level>` | Override default log level (`error`, `warn`, `info`, `debug`, `trace`) |
 | `--healthcheck` | Read-only dependency/NFS/paused/cooldown status summary |
 | `--healthcheck-json` | JSON healthcheck output (implies healthcheck behavior) |
 | `--status` | SSH-friendly operational status summary |

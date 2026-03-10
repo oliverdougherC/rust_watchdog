@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod diagnostics;
 pub mod error;
 pub mod event_journal;
 pub mod in_use;
