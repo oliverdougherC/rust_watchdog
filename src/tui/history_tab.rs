@@ -77,6 +77,7 @@ pub fn render_history(f: &mut Frame, area: Rect, tab_state: &mut HistoryTabState
             let status_str = match record.outcome {
                 crate::db::TranscodeOutcome::Replaced => "OK",
                 crate::db::TranscodeOutcome::SkippedNoSavings => "SKIP",
+                crate::db::TranscodeOutcome::RetryScheduled => "RETRY",
                 crate::db::TranscodeOutcome::Failed => "FAIL",
             };
             let color = status_color_for_outcome(record.outcome);
@@ -194,6 +195,7 @@ fn render_details(record: &TranscodeRecord) -> String {
     let outcome = match record.outcome {
         crate::db::TranscodeOutcome::Replaced => "replaced",
         crate::db::TranscodeOutcome::SkippedNoSavings => "skipped_no_savings",
+        crate::db::TranscodeOutcome::RetryScheduled => "retry_scheduled",
         crate::db::TranscodeOutcome::Failed => "failed",
     };
     format!(
@@ -205,4 +207,33 @@ fn render_details(record: &TranscodeRecord) -> String {
         record.started_at.as_deref().unwrap_or("-"),
         record.completed_at.as_deref().unwrap_or("-")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::TranscodeOutcome;
+
+    #[test]
+    fn render_details_shows_retry_outcome() {
+        let record = TranscodeRecord {
+            id: 1,
+            source_path: "/media/movie.mkv".to_string(),
+            share_name: Some("movies".to_string()),
+            original_codec: Some("h264".to_string()),
+            original_bitrate_bps: Some(1_000_000),
+            original_size: Some(1_000),
+            output_size: Some(0),
+            space_saved: Some(0),
+            duration_seconds: Some(12.0),
+            outcome: TranscodeOutcome::RetryScheduled,
+            success: false,
+            failure_reason: Some("timeout_exhausted".to_string()),
+            failure_code: Some("timeout_exhausted".to_string()),
+            started_at: Some("2026-01-01T00:00:00".to_string()),
+            completed_at: Some("2026-01-01T00:00:12".to_string()),
+        };
+        let details = render_details(&record);
+        assert!(details.contains("retry_scheduled"));
+    }
 }

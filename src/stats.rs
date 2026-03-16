@@ -7,6 +7,7 @@ pub struct RunStats {
     pub files_queued: u64,
     pub files_transcoded: u64,
     pub transcode_failures: u64,
+    pub retries_scheduled: u64,
     pub space_saved_bytes: i64,
 }
 
@@ -23,6 +24,7 @@ pub struct CumulativeStats {
     pub files_inspected: u64,
     pub files_transcoded: u64,
     pub transcode_failures: u64,
+    pub retries_scheduled: u64,
     pub space_saved_bytes: i64,
 }
 
@@ -33,6 +35,7 @@ impl CumulativeStats {
         self.files_inspected += run.files_inspected;
         self.files_transcoded += run.files_transcoded;
         self.transcode_failures += run.transcode_failures;
+        self.retries_scheduled += run.retries_scheduled;
         self.space_saved_bytes += run.space_saved_bytes;
     }
 }

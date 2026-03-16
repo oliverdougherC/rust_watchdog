@@ -95,6 +95,7 @@ pub fn status_color_for_outcome(outcome: TranscodeOutcome) -> Color {
     match outcome {
         TranscodeOutcome::Replaced => Color::Green,
         TranscodeOutcome::SkippedNoSavings => Color::Yellow,
+        TranscodeOutcome::RetryScheduled => Color::Cyan,
         TranscodeOutcome::Failed => Color::Red,
     }
 }

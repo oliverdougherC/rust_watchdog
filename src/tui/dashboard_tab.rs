@@ -534,6 +534,12 @@ fn render_recent_activity(f: &mut Frame, area: Rect, state: &AppState) {
                 state.scan_timeout_count
             ));
         }
+        if state.run_retries_scheduled > 0 {
+            header_lines.push(format!(
+                "Retries scheduled this pass: {} (lifetime: {})",
+                state.run_retries_scheduled, state.total_retries_scheduled
+            ));
+        }
         if let Some(code) = state.last_failure_code.as_deref() {
             header_lines.push(format!("Last failure code: {}", code));
         }

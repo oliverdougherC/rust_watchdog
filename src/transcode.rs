@@ -66,6 +66,7 @@ struct CapturedOutput {
 struct ProgressActivity {
     last_percent: f64,
     last_forward_progress_at: Option<Instant>,
+    last_stream_activity_at: Option<Instant>,
 }
 
 impl Default for ProgressActivity {
@@ -73,8 +74,17 @@ impl Default for ProgressActivity {
         Self {
             last_percent: -1.0,
             last_forward_progress_at: None,
+            last_stream_activity_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LivenessSnapshot {
+    last_percent: f64,
+    progress_idle_secs: f64,
+    output_idle_secs: f64,
+    stream_idle_secs: f64,
 }
 
 fn push_tail(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) -> bool {
@@ -198,6 +208,27 @@ fn brace_delta(text: &str) -> i32 {
     opens - closes
 }
 
+fn idle_secs_since(start: Instant, last_activity: Option<Instant>, now: Instant) -> f64 {
+    let anchor = last_activity.unwrap_or(start);
+    now.duration_since(anchor).as_secs_f64()
+}
+
+fn capture_liveness_snapshot(
+    start: Instant,
+    now: Instant,
+    last_forward_progress_at: Option<Instant>,
+    last_output_growth_at: Instant,
+    last_stream_activity_at: Option<Instant>,
+    last_percent: f64,
+) -> LivenessSnapshot {
+    LivenessSnapshot {
+        last_percent,
+        progress_idle_secs: idle_secs_since(start, last_forward_progress_at, now),
+        output_idle_secs: now.duration_since(last_output_growth_at).as_secs_f64(),
+        stream_idle_secs: idle_secs_since(start, last_stream_activity_at, now),
+    }
+}
+
 fn spawn_progress_thread<R: Read + Send + 'static>(
     mut reader: R,
     limit: usize,
@@ -284,6 +315,9 @@ fn spawn_progress_thread<R: Read + Send + 'static>(
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Ok(mut shared) = activity.lock() {
+                        shared.last_stream_activity_at = Some(Instant::now());
+                    }
                     out.total_bytes = out.total_bytes.saturating_add(n);
                     for &byte in &tmp[..n] {
                         if byte == b'\r' || byte == b'\n' {
@@ -404,23 +438,27 @@ impl Transcoder for HandBrakeTranscoder {
         let mut timed_out = false;
         let mut stalled = false;
         let mut cancelled = false;
+        let mut timeout_liveness: Option<LivenessSnapshot> = None;
+        let mut stalled_liveness: Option<LivenessSnapshot> = None;
 
         let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(WatchdogError::Transcode {
+                        path: input.to_path_buf(),
+                        reason: format!("Failed while waiting for HandBrakeCLI: {}", e),
+                    });
+                }
+            }
+
             if cancel.load(Ordering::Relaxed) {
                 cancelled = true;
                 terminate_subprocess(&mut child, Duration::from_secs(2));
                 break child.wait().map_err(|e| WatchdogError::Transcode {
                     path: input.to_path_buf(),
                     reason: format!("Failed to wait for cancelled HandBrakeCLI process: {}", e),
-                })?;
-            }
-
-            if timeout_secs > 0 && start.elapsed().as_secs() > timeout_secs {
-                timed_out = true;
-                terminate_subprocess(&mut child, Duration::from_secs(2));
-                break child.wait().map_err(|e| WatchdogError::Transcode {
-                    path: input.to_path_buf(),
-                    reason: format!("Failed to wait for timed out HandBrakeCLI process: {}", e),
                 })?;
             }
 
@@ -431,18 +469,46 @@ impl Transcoder for HandBrakeTranscoder {
                 last_output_growth_at = now;
             }
 
-            let last_forward_progress_at = progress_activity
-                .lock()
-                .ok()
-                .and_then(|shared| shared.last_forward_progress_at);
+            let (last_forward_progress_at, last_stream_activity_at, last_percent) =
+                progress_activity
+                    .lock()
+                    .ok()
+                    .map(|shared| {
+                        (
+                            shared.last_forward_progress_at,
+                            shared.last_stream_activity_at,
+                            shared.last_percent,
+                        )
+                    })
+                    .unwrap_or((None, None, -1.0));
+            let liveness = capture_liveness_snapshot(
+                start,
+                now,
+                last_forward_progress_at,
+                last_output_growth_at,
+                last_stream_activity_at,
+                last_percent,
+            );
+            if timeout_secs > 0 && start.elapsed() >= Duration::from_secs(timeout_secs) {
+                timed_out = true;
+                timeout_liveness = Some(liveness);
+                terminate_subprocess(&mut child, Duration::from_secs(2));
+                break child.wait().map_err(|e| WatchdogError::Transcode {
+                    path: input.to_path_buf(),
+                    reason: format!("Failed to wait for timed out HandBrakeCLI process: {}", e),
+                })?;
+            }
+
             if should_mark_transcode_stalled(
                 start,
                 last_forward_progress_at,
                 last_output_growth_at,
+                last_stream_activity_at,
                 now,
                 stall_timeout,
             ) {
                 stalled = true;
+                stalled_liveness = Some(liveness);
                 terminate_subprocess(&mut child, Duration::from_secs(2));
                 break child.wait().map_err(|e| WatchdogError::Transcode {
                     path: input.to_path_buf(),
@@ -450,16 +516,7 @@ impl Transcoder for HandBrakeTranscoder {
                 })?;
             }
 
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(e) => {
-                    return Err(WatchdogError::Transcode {
-                        path: input.to_path_buf(),
-                        reason: format!("Failed while waiting for HandBrakeCLI: {}", e),
-                    });
-                }
-            }
+            thread::sleep(Duration::from_millis(100));
         };
 
         let stdout_capture = stdout_handle.join().unwrap_or_default();
@@ -489,12 +546,42 @@ impl Transcoder for HandBrakeTranscoder {
             let hint_suffix = infer_failure_hint(&stderr_summary)
                 .map(|hint| format!(" likely_cause={}", hint))
                 .unwrap_or_default();
+            let liveness = timeout_liveness.unwrap_or_else(|| {
+                let now = Instant::now();
+                let (last_forward_progress_at, last_stream_activity_at, last_percent) =
+                    progress_activity
+                        .lock()
+                        .ok()
+                        .map(|shared| {
+                            (
+                                shared.last_forward_progress_at,
+                                shared.last_stream_activity_at,
+                                shared.last_percent,
+                            )
+                        })
+                        .unwrap_or((None, None, -1.0));
+                capture_liveness_snapshot(
+                    start,
+                    now,
+                    last_forward_progress_at,
+                    last_output_growth_at,
+                    last_stream_activity_at,
+                    last_percent,
+                )
+            });
             warn!(
-                "HandBrake timed out: input={} timeout={}s elapsed={:.1}s progress={} stderr={}{}{} command={}",
+                "HandBrake timed out: input={} timeout={}s elapsed={:.1}s progress={} last_percent={:.2}% progress_idle={:.1}s output_idle={:.1}s stream_idle={:.1}s stdout_bytes={} stderr_bytes={} json_progress={} stderr={}{}{} command={}",
                 input.display(),
                 timeout_secs,
                 elapsed,
                 summarize_progress(last_progress),
+                liveness.last_percent,
+                liveness.progress_idle_secs,
+                liveness.output_idle_secs,
+                liveness.stream_idle_secs,
+                stdout_capture.total_bytes,
+                stderr_capture.total_bytes,
+                use_json,
                 stderr_summary,
                 if stderr_capture.truncated {
                     " [stderr tail truncated]"
@@ -515,13 +602,43 @@ impl Transcoder for HandBrakeTranscoder {
             let hint_suffix = infer_failure_hint(&stderr_summary)
                 .map(|hint| format!(" likely_cause={}", hint))
                 .unwrap_or_default();
+            let liveness = stalled_liveness.unwrap_or_else(|| {
+                let now = Instant::now();
+                let (last_forward_progress_at, last_stream_activity_at, last_percent) =
+                    progress_activity
+                        .lock()
+                        .ok()
+                        .map(|shared| {
+                            (
+                                shared.last_forward_progress_at,
+                                shared.last_stream_activity_at,
+                                shared.last_percent,
+                            )
+                        })
+                        .unwrap_or((None, None, -1.0));
+                capture_liveness_snapshot(
+                    start,
+                    now,
+                    last_forward_progress_at,
+                    last_output_growth_at,
+                    last_stream_activity_at,
+                    last_percent,
+                )
+            });
             warn!(
-                "HandBrake stalled: input={} stall_timeout={}s elapsed={:.1}s output_bytes={} progress={} stderr={}{}{} command={}",
+                "HandBrake stalled: input={} stall_timeout={}s elapsed={:.1}s output_bytes={} progress={} last_percent={:.2}% progress_idle={:.1}s output_idle={:.1}s stream_idle={:.1}s stdout_bytes={} stderr_bytes={} json_progress={} stderr={}{}{} command={}",
                 input.display(),
                 stall_timeout_secs.max(1),
                 elapsed,
                 last_output_size,
                 summarize_progress(last_progress),
+                liveness.last_percent,
+                liveness.progress_idle_secs,
+                liveness.output_idle_secs,
+                liveness.stream_idle_secs,
+                stdout_capture.total_bytes,
+                stderr_capture.total_bytes,
+                use_json,
                 stderr_summary,
                 if stderr_capture.truncated {
                     " [stderr tail truncated]"
@@ -590,6 +707,7 @@ fn should_mark_transcode_stalled(
     start: Instant,
     last_forward_progress_at: Option<Instant>,
     last_output_growth_at: Instant,
+    last_stream_activity_at: Option<Instant>,
     now: Instant,
     stall_timeout: Duration,
 ) -> bool {
@@ -598,6 +716,9 @@ fn should_mark_transcode_stalled(
         last_activity = last_activity.max(progress_at);
     }
     last_activity = last_activity.max(last_output_growth_at);
+    if let Some(stream_at) = last_stream_activity_at {
+        last_activity = last_activity.max(stream_at);
+    }
     now.duration_since(last_activity) > stall_timeout
 }
 
@@ -670,6 +791,7 @@ mod tests {
             start,
             progress_at,
             output_growth_at,
+            None,
             now,
             Duration::from_secs(10)
         ));
@@ -685,6 +807,23 @@ mod tests {
             start,
             progress_at,
             output_growth_at,
+            None,
+            now,
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn stall_detection_uses_stream_activity_when_progress_parser_misses() {
+        let now = Instant::now();
+        let start = now - Duration::from_secs(120);
+        let output_growth_at = now - Duration::from_secs(40);
+        let stream_activity_at = Some(now - Duration::from_secs(4));
+        assert!(!should_mark_transcode_stalled(
+            start,
+            None,
+            output_growth_at,
+            stream_activity_at,
             now,
             Duration::from_secs(10)
         ));

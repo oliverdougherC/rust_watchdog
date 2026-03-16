@@ -50,6 +50,7 @@ struct SnapshotRun {
     inspected: u64,
     transcoded: u64,
     failures: u64,
+    retries_scheduled: u64,
     space_saved_bytes: i64,
     skipped_inspected: u64,
     skipped_young: u64,
@@ -62,6 +63,7 @@ struct SnapshotRun {
 #[derive(Debug, Serialize)]
 struct SnapshotReliability<'a> {
     scan_timeouts: u64,
+    retries_scheduled_total: u64,
     last_failure_code: Option<&'a str>,
     consecutive_pass_failures: u32,
     auto_paused: bool,
@@ -132,6 +134,7 @@ pub fn write_snapshot(
             inspected: state.run_inspected,
             transcoded: state.run_transcoded,
             failures: state.run_failures,
+            retries_scheduled: state.run_retries_scheduled,
             space_saved_bytes: state.run_space_saved,
             skipped_inspected: state.run_skipped_inspected,
             skipped_young: state.run_skipped_young,
@@ -142,6 +145,7 @@ pub fn write_snapshot(
         },
         reliability: SnapshotReliability {
             scan_timeouts: state.scan_timeout_count,
+            retries_scheduled_total: state.total_retries_scheduled,
             last_failure_code: state.last_failure_code.as_deref(),
             consecutive_pass_failures: state.consecutive_pass_failures,
             auto_paused: state.auto_paused,
@@ -257,6 +261,8 @@ mod tests {
         assert_eq!(json["run"]["skipped_in_use"], 2);
         assert_eq!(json["totals"]["transcoded"], 3);
         assert_eq!(json["reliability"]["scan_timeouts"], 0);
+        assert_eq!(json["run"]["retries_scheduled"], 0);
+        assert_eq!(json["reliability"]["retries_scheduled_total"], 0);
         assert!(json["reliability"]["last_failure_code"].is_null());
         assert_eq!(json["share_health"][0]["name"], "movies");
         assert_eq!(json["share_health"][1]["healthy"], false);

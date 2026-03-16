@@ -105,6 +105,12 @@ impl FailureCode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryScheduleDisposition {
+    Scheduled,
+    Quarantined,
+}
+
 struct GlobMatcher {
     path_set: Option<GlobSet>,
     basename_set: Option<GlobSet>,
@@ -177,6 +183,39 @@ fn build_local_temp_paths(
     (local_source, local_output)
 }
 
+fn scaled_timeout_for_attempt(
+    base_secs: u64,
+    attempt_num: u32,
+    multiplier: f64,
+    cap_secs: u64,
+) -> u64 {
+    if attempt_num <= 1 {
+        return base_secs.min(cap_secs).max(1);
+    }
+    let exponent = (attempt_num - 1) as i32;
+    let factor = multiplier.powi(exponent);
+    let scaled = (base_secs as f64) * factor;
+    let capped = scaled.ceil() as u64;
+    capped.min(cap_secs).max(1)
+}
+
+fn transcode_timeouts_for_attempt(config: &Config, attempt_num: u32) -> (u64, u64) {
+    (
+        scaled_timeout_for_attempt(
+            config.transcode.timeout_seconds,
+            attempt_num,
+            config.transcode.retry_timeout_multiplier,
+            config.transcode.retry_timeout_cap_seconds,
+        ),
+        scaled_timeout_for_attempt(
+            config.transcode.stall_timeout_seconds,
+            attempt_num,
+            config.transcode.retry_timeout_multiplier,
+            config.transcode.retry_stall_timeout_cap_seconds,
+        ),
+    )
+}
+
 /// Log a formatted message to both tracing and the TUI state log.
 fn tui_log(state: &StateManager, level: &str, msg: &str) {
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -223,6 +262,7 @@ pub async fn run_watchdog_pass(
         s.run_inspected = 0;
         s.run_transcoded = 0;
         s.run_failures = 0;
+        s.run_retries_scheduled = 0;
         s.run_space_saved = 0;
         s.run_skipped_inspected = 0;
         s.run_skipped_young = 0;
@@ -533,6 +573,7 @@ pub async fn run_watchdog_pass(
                 "queued_files": stats.files_queued,
                 "transcoded_files": stats.files_transcoded,
                 "failed_files": stats.transcode_failures,
+                "retries_scheduled": stats.retries_scheduled,
                 "space_saved_bytes": stats.space_saved_bytes,
             }),
         );
@@ -911,11 +952,16 @@ pub async fn run_watchdog_pass(
         }
 
         // Step 2: Transcode
+        let (effective_timeout_secs, effective_stall_timeout_secs) =
+            transcode_timeouts_for_attempt(config, attempt_num);
         state.set_phase(PipelinePhase::Transcoding);
         tui_log(
             state,
             "INFO",
-            &format!("Starting HandBrake encode: {}", display_filename),
+            &format!(
+                "Starting HandBrake encode: {} (timeout={}s stall={}s)",
+                display_filename, effective_timeout_secs, effective_stall_timeout_secs
+            ),
         );
         state.set_progress_stage(ProgressStage::Transcode);
         let (progress_tx, mut progress_rx) = mpsc::channel::<TranscodeProgress>(32);
@@ -971,8 +1017,8 @@ pub async fn run_watchdog_pass(
                     &local_output,
                     &preset_path,
                     &config.transcode.preset_name,
-                    config.transcode.timeout_seconds,
-                    config.transcode.stall_timeout_seconds,
+                    effective_timeout_secs,
+                    effective_stall_timeout_secs,
                     progress_tx,
                     Arc::clone(&cancel_flag),
                 ));
@@ -983,10 +1029,10 @@ pub async fn run_watchdog_pass(
         let _ = monitor_task.await;
 
         match transcode_result {
-            Err(WatchdogError::TranscodeTimeout { .. }) => {
+            Err(WatchdogError::TranscodeTimeout { timeout_secs, .. }) => {
                 warn!(
                     "[{}] Transcode timed out after {}s: {}",
-                    share_name, config.transcode.timeout_seconds, path_str
+                    share_name, timeout_secs, path_str
                 );
 
                 if attempt_num <= config.transcode.max_retries {
@@ -1018,27 +1064,25 @@ pub async fn run_watchdog_pass(
                     let dur = transcode_start.elapsed().as_secs_f64();
                     db.record_transcode_end_with_code(
                         db_row_id,
-                        TranscodeOutcome::Failed,
+                        TranscodeOutcome::RetryScheduled,
                         0,
                         0,
                         dur,
-                        Some("timeout (requeued)"),
+                        Some("timeout (retrying in-pass)"),
                         Some(FailureCode::TimeoutRequeued.as_str()),
                     );
+                    stats.retries_scheduled += 1;
+                    state.update(|s| {
+                        s.run_retries_scheduled += 1;
+                        s.total_retries_scheduled += 1;
+                    });
                 } else {
-                    error!(
-                        "[{}] Timeout retries exhausted for {}",
+                    warn!(
+                        "[{}] Timeout retries exhausted; scheduling delayed retry for {}",
                         share_name, path_str
                     );
-                    stats.transcode_failures += 1;
-                    state.update(|s| s.run_failures += 1);
-                    tui_log(
-                        state,
-                        "ERROR",
-                        &format!("Timeout retries exhausted: {}", display_filename),
-                    );
                     let dur = transcode_start.elapsed().as_secs_f64();
-                    record_failure(
+                    match record_retry_scheduled(
                         state,
                         db.as_ref(),
                         config,
@@ -1049,7 +1093,32 @@ pub async fn run_watchdog_pass(
                         FailureCode::TimeoutExhausted,
                         "timeout_exhausted",
                         true,
-                    );
+                    ) {
+                        RetryScheduleDisposition::Scheduled => {
+                            stats.retries_scheduled += 1;
+                            state.update(|s| {
+                                s.run_retries_scheduled += 1;
+                                s.total_retries_scheduled += 1;
+                            });
+                            tui_log(
+                                state,
+                                "WARN",
+                                &format!(
+                                    "Timeout retries exhausted, delayed retry scheduled: {}",
+                                    display_filename
+                                ),
+                            );
+                        }
+                        RetryScheduleDisposition::Quarantined => {
+                            stats.transcode_failures += 1;
+                            state.update(|s| s.run_failures += 1);
+                            tui_log(
+                                state,
+                                "ERROR",
+                                &format!("Timed out repeatedly; quarantined: {}", display_filename),
+                            );
+                        }
+                    }
                 }
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
@@ -1091,24 +1160,25 @@ pub async fn run_watchdog_pass(
                     let dur = transcode_start.elapsed().as_secs_f64();
                     db.record_transcode_end_with_code(
                         db_row_id,
-                        TranscodeOutcome::Failed,
+                        TranscodeOutcome::RetryScheduled,
                         0,
                         0,
                         dur,
-                        Some("stalled (requeued)"),
+                        Some("stalled (retrying in-pass)"),
                         Some(FailureCode::StalledRequeued.as_str()),
                     );
+                    stats.retries_scheduled += 1;
+                    state.update(|s| {
+                        s.run_retries_scheduled += 1;
+                        s.total_retries_scheduled += 1;
+                    });
                 } else {
-                    error!("[{}] Stall retries exhausted for {}", share_name, path_str);
-                    stats.transcode_failures += 1;
-                    state.update(|s| s.run_failures += 1);
-                    tui_log(
-                        state,
-                        "ERROR",
-                        &format!("Stall retries exhausted: {}", display_filename),
+                    warn!(
+                        "[{}] Stall retries exhausted; scheduling delayed retry for {}",
+                        share_name, path_str
                     );
                     let dur = transcode_start.elapsed().as_secs_f64();
-                    record_failure(
+                    match record_retry_scheduled(
                         state,
                         db.as_ref(),
                         config,
@@ -1119,7 +1189,32 @@ pub async fn run_watchdog_pass(
                         FailureCode::StalledExhausted,
                         "stalled_exhausted",
                         true,
-                    );
+                    ) {
+                        RetryScheduleDisposition::Scheduled => {
+                            stats.retries_scheduled += 1;
+                            state.update(|s| {
+                                s.run_retries_scheduled += 1;
+                                s.total_retries_scheduled += 1;
+                            });
+                            tui_log(
+                                state,
+                                "WARN",
+                                &format!(
+                                    "Stall retries exhausted, delayed retry scheduled: {}",
+                                    display_filename
+                                ),
+                            );
+                        }
+                        RetryScheduleDisposition::Quarantined => {
+                            stats.transcode_failures += 1;
+                            state.update(|s| s.run_failures += 1);
+                            tui_log(
+                                state,
+                                "ERROR",
+                                &format!("Stalled repeatedly; quarantined: {}", display_filename),
+                            );
+                        }
+                    }
                 }
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
@@ -1680,9 +1775,10 @@ pub async fn run_watchdog_pass(
         state,
         "INFO",
         &format!(
-            "Pass complete: {} transcoded, {} failures, {} saved",
+            "Pass complete: {} transcoded, {} failures, {} retries scheduled, {} saved",
             stats.files_transcoded,
             stats.transcode_failures,
+            stats.retries_scheduled,
             format_bytes_signed(stats.space_saved_bytes)
         ),
     );
@@ -1697,6 +1793,7 @@ pub async fn run_watchdog_pass(
             "queued_files": stats.files_queued,
             "transcoded_files": stats.files_transcoded,
             "failed_files": stats.transcode_failures,
+            "retries_scheduled": stats.retries_scheduled,
             "space_saved_bytes": stats.space_saved_bytes,
         }),
     );
@@ -2198,6 +2295,93 @@ fn cleanup_temp_files(fs: &dyn FileSystem, paths: &[&Path]) {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn apply_failure_cooldown(
+    state: &StateManager,
+    db: &WatchdogDb,
+    config: &Config,
+    base_dir: &Path,
+    path: &str,
+    failure_code: &str,
+    reason: &str,
+    now_ts: i64,
+    cooldown_threshold_override: Option<u32>,
+) -> bool {
+    let cooldown_threshold = cooldown_threshold_override
+        .unwrap_or(config.safety.max_failures_before_cooldown)
+        .max(1);
+    if let Some(cooldown) = db.record_file_failure(
+        path,
+        reason,
+        failure_code,
+        cooldown_threshold,
+        config.safety.cooldown_base_seconds,
+        config.safety.cooldown_max_seconds,
+    ) {
+        let should_quarantine = config
+            .safety
+            .quarantine_failure_codes
+            .iter()
+            .any(|c| c == failure_code)
+            && cooldown.consecutive_failures >= config.safety.quarantine_after_failures.max(1);
+        let retry_in_seconds = cooldown.next_eligible_at.saturating_sub(now_ts).max(0);
+        warn!(
+            "Failure cooldown state: code={} path={} consecutive_failures={} retry_in={}s quarantine_candidate={}",
+            failure_code,
+            path,
+            cooldown.consecutive_failures,
+            retry_in_seconds,
+            should_quarantine
+        );
+        if should_quarantine {
+            let was_quarantined = db.is_quarantined(path);
+            db.quarantine_file(path, failure_code, reason);
+            if !was_quarantined {
+                tui_log(
+                    state,
+                    "ERROR",
+                    &format!("File quarantined after repeated failures: {}", path),
+                );
+                emit_event(
+                    config,
+                    base_dir,
+                    "quarantine_add",
+                    json!({
+                        "path": path,
+                        "failure_code": failure_code,
+                        "failure_reason": reason,
+                        "consecutive_failures": cooldown.consecutive_failures,
+                    }),
+                );
+            }
+            let quarantined_count = db.quarantine_count().max(0) as u64;
+            state.update(|s| {
+                s.quarantined_files = quarantined_count;
+            });
+        }
+        if cooldown.next_eligible_at > chrono::Utc::now().timestamp() {
+            send_webhook(
+                &config.notify,
+                NotifyEvent::CooldownAlert,
+                &json!({
+                    "path": path,
+                    "failure_reason": reason,
+                    "failure_code": failure_code,
+                    "consecutive_failures": cooldown.consecutive_failures,
+                    "next_eligible_at": cooldown.next_eligible_at,
+                }),
+            );
+        }
+        should_quarantine
+    } else {
+        warn!(
+            "Failed to persist cooldown state for {} (code={} reason={}); DB error should be logged separately",
+            path, failure_code, reason
+        );
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_failure(
     state: &StateManager,
     db: &WatchdogDb,
@@ -2238,75 +2422,84 @@ fn record_failure(
         Some(failure_code),
     );
     if apply_cooldown {
-        if let Some(cooldown) = db.record_file_failure(
+        let _ = apply_failure_cooldown(
+            state,
+            db,
+            config,
+            base_dir,
             path,
-            reason,
             failure_code,
-            config.safety.max_failures_before_cooldown,
-            config.safety.cooldown_base_seconds,
-            config.safety.cooldown_max_seconds,
-        ) {
-            let should_quarantine = config
-                .safety
-                .quarantine_failure_codes
-                .iter()
-                .any(|c| c == failure_code)
-                && cooldown.consecutive_failures >= config.safety.quarantine_after_failures.max(1);
-            let retry_in_seconds = cooldown.next_eligible_at.saturating_sub(now_ts).max(0);
-            warn!(
-                "Failure cooldown state: code={} path={} consecutive_failures={} retry_in={}s quarantine_candidate={}",
-                failure_code,
-                path,
-                cooldown.consecutive_failures,
-                retry_in_seconds,
-                should_quarantine
-            );
-            if should_quarantine {
-                let was_quarantined = db.is_quarantined(path);
-                db.quarantine_file(path, failure_code, reason);
-                if !was_quarantined {
-                    tui_log(
-                        state,
-                        "ERROR",
-                        &format!("File quarantined after repeated failures: {}", path),
-                    );
-                    emit_event(
-                        config,
-                        base_dir,
-                        "quarantine_add",
-                        json!({
-                            "path": path,
-                            "failure_code": failure_code,
-                            "failure_reason": reason,
-                            "consecutive_failures": cooldown.consecutive_failures,
-                        }),
-                    );
-                }
-                let quarantined_count = db.quarantine_count().max(0) as u64;
-                state.update(|s| {
-                    s.quarantined_files = quarantined_count;
-                });
-            }
-            if cooldown.next_eligible_at > chrono::Utc::now().timestamp() {
-                send_webhook(
-                    &config.notify,
-                    NotifyEvent::CooldownAlert,
-                    &json!({
-                        "path": path,
-                        "failure_reason": reason,
-                        "failure_code": failure_code,
-                        "consecutive_failures": cooldown.consecutive_failures,
-                        "next_eligible_at": cooldown.next_eligible_at,
-                    }),
-                );
-            }
-        } else {
-            warn!(
-                "Failed to persist cooldown state for {} (code={} reason={}); DB error should be logged separately",
-                path, failure_code, reason
-            );
-        }
+            reason,
+            now_ts,
+            None,
+        );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_retry_scheduled(
+    state: &StateManager,
+    db: &WatchdogDb,
+    config: &Config,
+    base_dir: &Path,
+    path: &str,
+    row_id: i64,
+    duration_seconds: f64,
+    code: FailureCode,
+    reason: &str,
+    apply_cooldown: bool,
+) -> RetryScheduleDisposition {
+    let failure_code = code.as_str();
+    warn!(
+        "Recording retry schedule: code={} path={} reason={} duration={:.1}s cooldown_tracking={}",
+        failure_code, path, reason, duration_seconds, apply_cooldown
+    );
+    state.update(|s| {
+        s.last_failure_code = Some(failure_code.to_string());
+    });
+    db.record_transcode_end_with_code(
+        row_id,
+        TranscodeOutcome::RetryScheduled,
+        0,
+        0,
+        duration_seconds,
+        Some(reason),
+        Some(failure_code),
+    );
+
+    if apply_cooldown
+        && apply_failure_cooldown(
+            state,
+            db,
+            config,
+            base_dir,
+            path,
+            failure_code,
+            reason,
+            chrono::Utc::now().timestamp(),
+            Some(1),
+        )
+    {
+        let quarantine_code = FailureCode::QuarantinedFile.as_str();
+        warn!(
+            "Retry scheduling escalated to quarantine for {} (code={})",
+            path, failure_code
+        );
+        db.record_transcode_end_with_code(
+            row_id,
+            TranscodeOutcome::Failed,
+            0,
+            0,
+            duration_seconds,
+            Some(quarantine_code),
+            Some(quarantine_code),
+        );
+        state.update(|s| {
+            s.last_failure_code = Some(quarantine_code.to_string());
+        });
+        return RetryScheduleDisposition::Quarantined;
+    }
+    RetryScheduleDisposition::Scheduled
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2595,11 +2788,12 @@ pub async fn run_pipeline_loop(
         {
             Ok(stats) => {
                 info!(
-                    "Pass complete: inspected={} queued={} transcoded={} failures={} saved={}",
+                    "Pass complete: inspected={} queued={} transcoded={} failures={} retries_scheduled={} saved={}",
                     stats.files_inspected,
                     stats.files_queued,
                     stats.files_transcoded,
                     stats.transcode_failures,
+                    stats.retries_scheduled,
                     format_bytes_signed(stats.space_saved_bytes)
                 );
                 if !dry_run {
@@ -2966,6 +3160,30 @@ mod tests {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("movies_")));
+    }
+
+    #[test]
+    fn scaled_timeout_for_attempt_applies_multiplier_and_cap() {
+        assert_eq!(scaled_timeout_for_attempt(100, 1, 2.0, 10_000), 100);
+        assert_eq!(scaled_timeout_for_attempt(100, 2, 2.0, 10_000), 200);
+        assert_eq!(scaled_timeout_for_attempt(100, 3, 2.0, 10_000), 400);
+        assert_eq!(scaled_timeout_for_attempt(100, 6, 2.0, 900), 900);
+    }
+
+    #[test]
+    fn transcode_timeouts_for_attempt_uses_config_retry_scaling() {
+        let mut cfg = Config::default_config();
+        cfg.transcode.timeout_seconds = 300;
+        cfg.transcode.stall_timeout_seconds = 120;
+        cfg.transcode.retry_timeout_multiplier = 2.0;
+        cfg.transcode.retry_timeout_cap_seconds = 1_000;
+        cfg.transcode.retry_stall_timeout_cap_seconds = 500;
+        let (timeout_a1, stall_a1) = transcode_timeouts_for_attempt(&cfg, 1);
+        let (timeout_a3, stall_a3) = transcode_timeouts_for_attempt(&cfg, 3);
+        let (timeout_a5, stall_a5) = transcode_timeouts_for_attempt(&cfg, 5);
+        assert_eq!((timeout_a1, stall_a1), (300, 120));
+        assert_eq!((timeout_a3, stall_a3), (1000, 480));
+        assert_eq!((timeout_a5, stall_a5), (1000, 500));
     }
 
     #[test]

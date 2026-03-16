@@ -74,6 +74,15 @@ pub struct TranscodeConfig {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
 
+    #[serde(default = "default_retry_timeout_multiplier")]
+    pub retry_timeout_multiplier: f64,
+
+    #[serde(default = "default_retry_timeout_cap_seconds")]
+    pub retry_timeout_cap_seconds: u64,
+
+    #[serde(default = "default_retry_stall_timeout_cap_seconds")]
+    pub retry_stall_timeout_cap_seconds: u64,
+
     #[serde(default = "default_min_free_space_multiplier")]
     pub min_free_space_multiplier: f64,
 }
@@ -88,6 +97,9 @@ impl Default for TranscodeConfig {
             timeout_seconds: default_timeout(),
             stall_timeout_seconds: default_stall_timeout(),
             max_retries: default_max_retries(),
+            retry_timeout_multiplier: default_retry_timeout_multiplier(),
+            retry_timeout_cap_seconds: default_retry_timeout_cap_seconds(),
+            retry_stall_timeout_cap_seconds: default_retry_stall_timeout_cap_seconds(),
             min_free_space_multiplier: default_min_free_space_multiplier(),
         }
     }
@@ -113,6 +125,15 @@ fn default_stall_timeout() -> u64 {
 }
 fn default_max_retries() -> u32 {
     1
+}
+fn default_retry_timeout_multiplier() -> f64 {
+    2.0
+}
+fn default_retry_timeout_cap_seconds() -> u64 {
+    86_400
+}
+fn default_retry_stall_timeout_cap_seconds() -> u64 {
+    7_200
 }
 fn default_min_free_space_multiplier() -> f64 {
     2.0
@@ -272,6 +293,8 @@ fn default_quarantine_after_failures() -> u32 {
 
 fn default_quarantine_failure_codes() -> Vec<String> {
     vec![
+        "timeout_exhausted".to_string(),
+        "stalled_exhausted".to_string(),
         "transcode_failed".to_string(),
         "transcode_error".to_string(),
         "verification_failed".to_string(),
@@ -521,6 +544,29 @@ impl Config {
         if self.transcode.stall_timeout_seconds == 0 {
             errors.push("transcode.stall_timeout_seconds must be >= 1".to_string());
         }
+        if !self.transcode.retry_timeout_multiplier.is_finite()
+            || self.transcode.retry_timeout_multiplier < 1.0
+        {
+            errors.push("transcode.retry_timeout_multiplier must be >= 1.0".to_string());
+        }
+        if self.transcode.retry_timeout_cap_seconds == 0 {
+            errors.push("transcode.retry_timeout_cap_seconds must be >= 1".to_string());
+        }
+        if self.transcode.retry_timeout_cap_seconds < self.transcode.timeout_seconds {
+            errors.push(
+                "transcode.retry_timeout_cap_seconds must be >= transcode.timeout_seconds"
+                    .to_string(),
+            );
+        }
+        if self.transcode.retry_stall_timeout_cap_seconds == 0 {
+            errors.push("transcode.retry_stall_timeout_cap_seconds must be >= 1".to_string());
+        }
+        if self.transcode.retry_stall_timeout_cap_seconds < self.transcode.stall_timeout_seconds {
+            errors.push(
+                "transcode.retry_stall_timeout_cap_seconds must be >= transcode.stall_timeout_seconds"
+                    .to_string(),
+            );
+        }
         if self.scan.video_extensions.iter().any(|e| e.trim() == ".") {
             errors.push("video_extensions must not contain empty extension entries".to_string());
         }
@@ -738,5 +784,20 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| e.contains("local_mount must be an absolute path")));
+    }
+
+    #[test]
+    fn test_validate_retry_timeout_scaling_constraints() {
+        let mut cfg = Config::default_config();
+        cfg.transcode.retry_timeout_multiplier = 0.5;
+        cfg.transcode.retry_timeout_cap_seconds = cfg.transcode.timeout_seconds - 1;
+        cfg.transcode.retry_stall_timeout_cap_seconds = cfg.transcode.stall_timeout_seconds - 1;
+
+        let errs = cfg.validate();
+        assert!(errs.iter().any(|e| e.contains("retry_timeout_multiplier")));
+        assert!(errs.iter().any(|e| e.contains("retry_timeout_cap_seconds")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("retry_stall_timeout_cap_seconds")));
     }
 }

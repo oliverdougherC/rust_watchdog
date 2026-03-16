@@ -696,8 +696,13 @@ async fn timeout_retries_up_to_max_retries() {
     .unwrap();
 
     let recent = db.get_recent_transcodes(10);
-    assert_eq!(stats.transcode_failures, 1);
+    assert_eq!(stats.transcode_failures, 0);
+    assert_eq!(stats.retries_scheduled, 3);
+    assert_eq!(state.snapshot().run_failures, 0);
+    assert_eq!(state.snapshot().run_retries_scheduled, 3);
     assert_eq!(recent.len(), 3);
+    assert_eq!(recent[0].outcome, TranscodeOutcome::RetryScheduled);
+    assert_eq!(recent[0].failure_code.as_deref(), Some("timeout_exhausted"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -734,8 +739,12 @@ async fn stalled_retries_up_to_max_retries() {
     .unwrap();
 
     let recent = db.get_recent_transcodes(10);
-    assert_eq!(stats.transcode_failures, 1);
+    assert_eq!(stats.transcode_failures, 0);
+    assert_eq!(stats.retries_scheduled, 3);
+    assert_eq!(state.snapshot().run_failures, 0);
+    assert_eq!(state.snapshot().run_retries_scheduled, 3);
     assert_eq!(recent.len(), 3);
+    assert_eq!(recent[0].outcome, TranscodeOutcome::RetryScheduled);
     assert_eq!(recent[0].failure_code.as_deref(), Some("stalled_exhausted"));
 }
 
@@ -1718,6 +1727,8 @@ async fn repeated_scan_timeouts_trigger_auto_pause_tripwire() {
 async fn quarantined_file_is_skipped_until_cleared() {
     let mut cfg = base_config();
     cfg.transcode.max_retries = 0;
+    cfg.safety.cooldown_base_seconds = 1;
+    cfg.safety.cooldown_max_seconds = 1;
     cfg.safety.quarantine_after_failures = 2;
     cfg.safety.quarantine_failure_codes = vec!["timeout_exhausted".to_string()];
 
@@ -1755,6 +1766,16 @@ async fn quarantined_file_is_skipped_until_cleared() {
     .await
     .unwrap();
     assert!(!db.is_quarantined(&source.to_string_lossy()));
+    let first_pass_latest = db.get_recent_transcodes(1);
+    assert_eq!(
+        first_pass_latest[0].outcome,
+        TranscodeOutcome::RetryScheduled
+    );
+    assert_eq!(
+        first_pass_latest[0].failure_code.as_deref(),
+        Some("timeout_exhausted")
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let (state_b, _rx_b) = StateManager::new();
     let deps_b = PipelineDeps {
@@ -1783,6 +1804,12 @@ async fn quarantined_file_is_skipped_until_cleared() {
     .await
     .unwrap();
     assert!(db.is_quarantined(&source.to_string_lossy()));
+    let second_pass_latest = db.get_recent_transcodes(1);
+    assert_eq!(second_pass_latest[0].outcome, TranscodeOutcome::Failed);
+    assert_eq!(
+        second_pass_latest[0].failure_code.as_deref(),
+        Some("quarantined_file")
+    );
 
     let (state_c, _rx_c) = StateManager::new();
     let deps_c = PipelineDeps {

@@ -8,6 +8,7 @@ use tracing::error;
 pub enum TranscodeOutcome {
     Replaced,
     SkippedNoSavings,
+    RetryScheduled,
     Failed,
 }
 
@@ -16,6 +17,7 @@ impl TranscodeOutcome {
         match self {
             Self::Replaced => "replaced",
             Self::SkippedNoSavings => "skipped_no_savings",
+            Self::RetryScheduled => "retry_scheduled",
             Self::Failed => "failed",
         }
     }
@@ -24,12 +26,13 @@ impl TranscodeOutcome {
         match value {
             "replaced" => Self::Replaced,
             "skipped_no_savings" => Self::SkippedNoSavings,
+            "retry_scheduled" => Self::RetryScheduled,
             _ => Self::Failed,
         }
     }
 
     pub fn is_successful(self) -> bool {
-        !matches!(self, Self::Failed)
+        matches!(self, Self::Replaced | Self::SkippedNoSavings)
     }
 }
 
@@ -1253,6 +1256,28 @@ mod tests {
 
         assert_eq!(db.get_outcome_count(TranscodeOutcome::SkippedNoSavings), 1);
         assert_eq!(db.get_transcode_count(), 0);
+    }
+
+    #[test]
+    fn test_retry_scheduled_round_trip_marks_unsuccessful() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        let row_id = db
+            .record_transcode_start("/test/retry.mkv", "movies", Some("h264"), 0, 1000)
+            .unwrap();
+        db.record_transcode_end_with_code(
+            row_id,
+            TranscodeOutcome::RetryScheduled,
+            0,
+            0,
+            2.5,
+            Some("timeout_exhausted"),
+            Some("timeout_exhausted"),
+        );
+
+        let records = db.get_recent_transcodes(1);
+        assert_eq!(records[0].outcome, TranscodeOutcome::RetryScheduled);
+        assert!(!records[0].success);
+        assert_eq!(db.get_outcome_count(TranscodeOutcome::RetryScheduled), 1);
     }
 
     #[test]
