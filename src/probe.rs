@@ -5,6 +5,7 @@ use crate::process::{
     summarize_output_tail, RunOptions,
 };
 use crate::traits::{ProbeResult, Prober};
+use crate::transcode::PresetContract;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -280,16 +281,142 @@ pub fn evaluate_transcode_need(probe: &ProbeResult, config: &TranscodeConfig) ->
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationFailure {
+    HealthCheckFailed,
+    OriginalProbeFailed,
+    OutputProbeFailed,
+    OriginalDurationMissing,
+    OutputDurationMissing,
+    DurationMismatch {
+        original_ms: u64,
+        output_ms: u64,
+        delta_ms: u64,
+        tolerance_ms: u64,
+    },
+    CodecMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
+    ContainerMismatch {
+        expected_extension: String,
+        actual_formats: Vec<String>,
+    },
+    VideoMissing,
+    AudioMissing {
+        original_count: u32,
+        output_count: u32,
+    },
+}
+
+impl VerificationFailure {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::HealthCheckFailed => "verification_health_check_failed",
+            Self::OriginalProbeFailed => "verification_original_probe_failed",
+            Self::OutputProbeFailed => "verification_output_probe_failed",
+            Self::OriginalDurationMissing => "verification_original_zero_duration",
+            Self::OutputDurationMissing => "verification_output_zero_duration",
+            Self::DurationMismatch { .. } => "verification_duration_mismatch",
+            Self::CodecMismatch { .. } => "verification_codec_mismatch",
+            Self::ContainerMismatch { .. } => "verification_container_mismatch",
+            Self::VideoMissing => "verification_video_missing",
+            Self::AudioMissing { .. } => "verification_audio_missing",
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            Self::HealthCheckFailed => "ffprobe health check failed".to_string(),
+            Self::OriginalProbeFailed => "failed to read source metadata".to_string(),
+            Self::OutputProbeFailed => "failed to read transcoded metadata".to_string(),
+            Self::OriginalDurationMissing => "source duration is 0 seconds".to_string(),
+            Self::OutputDurationMissing => "transcoded duration is 0 seconds".to_string(),
+            Self::DurationMismatch {
+                original_ms,
+                output_ms,
+                delta_ms,
+                tolerance_ms,
+            } => format!(
+                "duration mismatch: source={:.3}s output={:.3}s delta={:.3}s tolerance={:.3}s",
+                (*original_ms as f64) / 1000.0,
+                (*output_ms as f64) / 1000.0,
+                (*delta_ms as f64) / 1000.0,
+                (*tolerance_ms as f64) / 1000.0
+            ),
+            Self::CodecMismatch { expected, actual } => format!(
+                "codec mismatch: expected {} got {}",
+                expected,
+                actual.as_deref().unwrap_or("unknown")
+            ),
+            Self::ContainerMismatch {
+                expected_extension,
+                actual_formats,
+            } => format!(
+                "container mismatch: expected {} got {}",
+                expected_extension,
+                if actual_formats.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    actual_formats.join(",")
+                }
+            ),
+            Self::VideoMissing => "transcoded output has no video stream".to_string(),
+            Self::AudioMissing {
+                original_count,
+                output_count,
+            } => format!(
+                "audio streams missing: source had {} output has {}",
+                original_count, output_count
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationOutcome {
+    Passed,
+    Failed(VerificationFailure),
+}
+
+fn probe_format_names(probe: &ProbeResult) -> Vec<String> {
+    probe
+        .raw_json
+        .get("format")
+        .and_then(|format| format.get("format_name"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| segment.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn verification_duration_tolerance(duration_seconds: f64) -> f64 {
+    (duration_seconds * 0.001).clamp(2.0, 5.0)
+}
+
 /// Verify a transcode by comparing original and transcoded file metadata.
 /// Rejects the transcode if any safety check fails — we never replace on doubt.
 ///
 /// IMPORTANT: Callers should verify the output file exists and has non-zero size
 /// via the FileSystem trait BEFORE calling this (to support simulation mode).
-pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path) -> Result<bool> {
+pub fn verify_transcode(
+    prober: &dyn Prober,
+    original: &Path,
+    transcoded: &Path,
+    contract: &PresetContract,
+) -> Result<VerificationOutcome> {
     // Health check on the transcoded file (ffprobe -v error)
     if !prober.health_check(transcoded)? {
         warn!("Health check failed for {}", transcoded.display());
-        return Ok(false);
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::HealthCheckFailed,
+        ));
     }
 
     let orig = match prober.probe(original)? {
@@ -299,7 +426,9 @@ pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path)
                 "Failed to read metadata for verification of {}",
                 original.display()
             );
-            return Ok(false);
+            return Ok(VerificationOutcome::Failed(
+                VerificationFailure::OriginalProbeFailed,
+            ));
         }
     };
 
@@ -310,7 +439,9 @@ pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path)
                 "Failed to read metadata for verification of {}",
                 transcoded.display()
             );
-            return Ok(false);
+            return Ok(VerificationOutcome::Failed(
+                VerificationFailure::OutputProbeFailed,
+            ));
         }
     };
 
@@ -320,7 +451,9 @@ pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path)
             "MANUAL ENCODING REQUIRED: original duration is 0.0s for {} — rejecting automatic transcode",
             original.display()
         );
-        return Ok(false);
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::OriginalDurationMissing,
+        ));
     }
 
     // Duration: transcoded must have a valid duration
@@ -329,32 +462,64 @@ pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path)
             "Transcoded file has 0.0s duration — rejecting: {}",
             transcoded.display()
         );
-        return Ok(false);
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::OutputDurationMissing,
+        ));
     }
 
-    // Duration: must match within 1 second
-    if (orig.duration_seconds - new.duration_seconds).abs() > 1.0 {
-        warn!(
-            "Duration mismatch: original={:.3}s new={:.3}s (delta={:.3}s)",
-            orig.duration_seconds,
-            new.duration_seconds,
-            (orig.duration_seconds - new.duration_seconds).abs()
-        );
-        return Ok(false);
-    }
-
-    // Stream count check: video + audio must match exactly (subtitles can differ)
-    if orig.video_stream_count != new.video_stream_count
-        || orig.audio_stream_count != new.audio_stream_count
+    let output_codec = new
+        .video_codec
+        .as_deref()
+        .map(|codec| codec.to_ascii_lowercase());
+    if output_codec
+        .as_deref()
+        .is_none_or(|codec| codec != contract.target_codec)
     {
         warn!(
-            "Stream count mismatch: orig(v{},a{}) vs new(v{},a{})",
-            orig.video_stream_count,
-            orig.audio_stream_count,
-            new.video_stream_count,
-            new.audio_stream_count
+            "Codec mismatch for {}: expected {} got {}",
+            transcoded.display(),
+            contract.target_codec,
+            output_codec.as_deref().unwrap_or("unknown")
         );
-        return Ok(false);
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::CodecMismatch {
+                expected: contract.target_codec.clone(),
+                actual: output_codec,
+            },
+        ));
+    }
+
+    let output_format_names = probe_format_names(&new);
+    if !contract.container_matches(&output_format_names) {
+        warn!(
+            "Container mismatch for {}: expected {} got {:?}",
+            transcoded.display(),
+            contract.container_extension,
+            output_format_names
+        );
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::ContainerMismatch {
+                expected_extension: contract.container_extension.clone(),
+                actual_formats: output_format_names,
+            },
+        ));
+    }
+
+    let duration_delta = (orig.duration_seconds - new.duration_seconds).abs();
+    let duration_tolerance = verification_duration_tolerance(orig.duration_seconds);
+    if duration_delta > duration_tolerance {
+        warn!(
+            "Duration mismatch: original={:.3}s new={:.3}s (delta={:.3}s tolerance={:.3}s)",
+            orig.duration_seconds, new.duration_seconds, duration_delta, duration_tolerance
+        );
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::DurationMismatch {
+                original_ms: (orig.duration_seconds * 1000.0).round() as u64,
+                output_ms: (new.duration_seconds * 1000.0).round() as u64,
+                delta_ms: (duration_delta * 1000.0).round() as u64,
+                tolerance_ms: (duration_tolerance * 1000.0).round() as u64,
+            },
+        ));
     }
 
     // Must have at least 1 video stream
@@ -363,7 +528,34 @@ pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path)
             "Transcoded file has no video streams — rejecting: {}",
             transcoded.display()
         );
-        return Ok(false);
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::VideoMissing,
+        ));
+    }
+
+    if orig.audio_stream_count > 0 && new.audio_stream_count == 0 {
+        warn!(
+            "Audio stream missing after transcode: orig={} new={}",
+            orig.audio_stream_count, new.audio_stream_count
+        );
+        return Ok(VerificationOutcome::Failed(
+            VerificationFailure::AudioMissing {
+                original_count: orig.audio_stream_count,
+                output_count: new.audio_stream_count,
+            },
+        ));
+    }
+
+    if orig.video_stream_count != new.video_stream_count
+        || orig.audio_stream_count != new.audio_stream_count
+    {
+        info!(
+            "Primary stream counts changed but required tracks remain: orig(v{},a{}) -> new(v{},a{})",
+            orig.video_stream_count,
+            orig.audio_stream_count,
+            new.video_stream_count,
+            new.audio_stream_count
+        );
     }
 
     if orig.subtitle_stream_count != new.subtitle_stream_count {
@@ -374,19 +566,22 @@ pub fn verify_transcode(prober: &dyn Prober, original: &Path, transcoded: &Path)
     }
 
     info!(
-        "Verification passed: duration {:.1}s, v{}/a{}/s{}",
+        "Verification passed: duration {:.1}s codec={} container={} v{}/a{}/s{}",
         new.duration_seconds,
+        contract.target_codec,
+        contract.container_extension,
         new.video_stream_count,
         new.audio_stream_count,
         new.subtitle_stream_count,
     );
 
-    Ok(true)
+    Ok(VerificationOutcome::Passed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn base_probe() -> ProbeResult {
         ProbeResult {
@@ -398,7 +593,61 @@ mod tests {
             video_stream_count: 1,
             audio_stream_count: 1,
             subtitle_stream_count: 0,
-            raw_json: serde_json::json!({}),
+            raw_json: serde_json::json!({
+                "format": {
+                    "format_name": "matroska,webm"
+                }
+            }),
+        }
+    }
+
+    fn contract() -> PresetContract {
+        PresetContract::resolve(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("AV1_MKV.json"),
+            "AV1_MKV",
+            "av1",
+        )
+        .unwrap()
+    }
+
+    fn probe_with(
+        codec: &str,
+        duration_seconds: f64,
+        video_stream_count: u32,
+        audio_stream_count: u32,
+        format_name: &str,
+    ) -> ProbeResult {
+        ProbeResult {
+            video_codec: Some(codec.to_string()),
+            duration_seconds,
+            video_stream_count,
+            audio_stream_count,
+            raw_json: serde_json::json!({
+                "format": {
+                    "format_name": format_name
+                }
+            }),
+            ..base_probe()
+        }
+    }
+
+    struct MockProber {
+        original: Option<ProbeResult>,
+        output: Option<ProbeResult>,
+        health_ok: bool,
+    }
+
+    impl Prober for MockProber {
+        fn probe(&self, path: &Path) -> Result<Option<ProbeResult>> {
+            if path.to_string_lossy().contains("source") {
+                Ok(self.original.clone())
+            } else {
+                Ok(self.output.clone())
+            }
+        }
+
+        fn health_check(&self, _path: &Path) -> Result<bool> {
+            Ok(self.health_ok)
         }
     }
 
@@ -430,5 +679,92 @@ mod tests {
 
         let eval = evaluate_transcode_need(&probe, &cfg);
         assert!(!eval.needs_transcode);
+    }
+
+    #[test]
+    fn verify_transcode_rejects_wrong_codec() {
+        let prober = MockProber {
+            original: Some(probe_with("h264", 120.0, 1, 1, "matroska,webm")),
+            output: Some(probe_with("h264", 120.0, 1, 1, "matroska,webm")),
+            health_ok: true,
+        };
+
+        let result = verify_transcode(
+            &prober,
+            Path::new("/tmp/source.mkv"),
+            Path::new("/tmp/output.mkv"),
+            &contract(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            VerificationOutcome::Failed(VerificationFailure::CodecMismatch {
+                expected: "av1".to_string(),
+                actual: Some("h264".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn verify_transcode_rejects_wrong_container() {
+        let prober = MockProber {
+            original: Some(probe_with("h264", 120.0, 1, 1, "matroska,webm")),
+            output: Some(probe_with("av1", 120.0, 1, 1, "mov,mp4,m4a,3gp,3g2,mj2")),
+            health_ok: true,
+        };
+
+        let result = verify_transcode(
+            &prober,
+            Path::new("/tmp/source.mkv"),
+            Path::new("/tmp/output.mp4"),
+            &contract(),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            VerificationOutcome::Failed(VerificationFailure::ContainerMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_transcode_allows_small_duration_drift_and_track_normalization() {
+        let prober = MockProber {
+            original: Some(probe_with("h264", 7200.0, 1, 1, "matroska,webm")),
+            output: Some(probe_with("av1", 7204.0, 1, 2, "matroska,webm")),
+            health_ok: true,
+        };
+
+        let result = verify_transcode(
+            &prober,
+            Path::new("/tmp/source.mkv"),
+            Path::new("/tmp/output.mkv"),
+            &contract(),
+        )
+        .unwrap();
+        assert_eq!(result, VerificationOutcome::Passed);
+    }
+
+    #[test]
+    fn verify_transcode_rejects_missing_required_audio() {
+        let prober = MockProber {
+            original: Some(probe_with("h264", 120.0, 1, 2, "matroska,webm")),
+            output: Some(probe_with("av1", 120.0, 1, 0, "matroska,webm")),
+            health_ok: true,
+        };
+
+        let result = verify_transcode(
+            &prober,
+            Path::new("/tmp/source.mkv"),
+            Path::new("/tmp/output.mkv"),
+            &contract(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            VerificationOutcome::Failed(VerificationFailure::AudioMissing {
+                original_count: 2,
+                output_count: 0,
+            })
+        );
     }
 }

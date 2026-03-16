@@ -7,7 +7,7 @@ use crate::traits::{TranscodeProgress, TranscodeResult, Transcoder};
 use regex::Regex;
 use serde_json::Value;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
@@ -52,6 +52,163 @@ static HB_JSON_SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
     };
     text.contains("--json")
 });
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresetContract {
+    pub target_codec: String,
+    pub container_extension: String,
+    accepted_format_names: Vec<String>,
+}
+
+impl PresetContract {
+    pub fn resolve(
+        preset_file: &Path,
+        preset_name: &str,
+        configured_target_codec: &str,
+    ) -> Result<Self> {
+        let payload_text = std::fs::read_to_string(preset_file).map_err(|e| {
+            WatchdogError::Config(format!(
+                "failed to read preset file {}: {}",
+                preset_file.display(),
+                e
+            ))
+        })?;
+        let payload: Value = serde_json::from_str(&payload_text).map_err(|e| {
+            WatchdogError::Config(format!(
+                "failed to parse preset file {} as JSON: {}",
+                preset_file.display(),
+                e
+            ))
+        })?;
+
+        let preset = payload
+            .get("PresetList")
+            .and_then(Value::as_array)
+            .and_then(|presets| {
+                presets.iter().find(|preset| {
+                    preset.get("PresetName").and_then(Value::as_str) == Some(preset_name)
+                })
+            })
+            .ok_or_else(|| {
+                WatchdogError::Config(format!(
+                    "preset '{}' was not found in {}",
+                    preset_name,
+                    preset_file.display()
+                ))
+            })?;
+
+        let video_encoder = preset
+            .get("VideoEncoder")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WatchdogError::Config(format!(
+                    "preset '{}' in {} is missing VideoEncoder",
+                    preset_name,
+                    preset_file.display()
+                ))
+            })?;
+        let file_format = preset
+            .get("FileFormat")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WatchdogError::Config(format!(
+                    "preset '{}' in {} is missing FileFormat",
+                    preset_name,
+                    preset_file.display()
+                ))
+            })?;
+
+        let resolved_codec = map_video_encoder_to_codec(video_encoder).ok_or_else(|| {
+            WatchdogError::Config(format!(
+                "preset '{}' in {} uses unsupported VideoEncoder '{}'",
+                preset_name,
+                preset_file.display(),
+                video_encoder
+            ))
+        })?;
+        let configured_codec = configured_target_codec.trim().to_ascii_lowercase();
+        if resolved_codec != configured_codec {
+            return Err(WatchdogError::Config(format!(
+                "preset '{}' outputs codec '{}' but transcode.target_codec is '{}'",
+                preset_name, resolved_codec, configured_codec
+            )));
+        }
+
+        let (container_extension, accepted_format_names) =
+            map_file_format_to_container(file_format).ok_or_else(|| {
+                WatchdogError::Config(format!(
+                    "preset '{}' in {} uses unsupported FileFormat '{}'",
+                    preset_name,
+                    preset_file.display(),
+                    file_format
+                ))
+            })?;
+
+        Ok(Self {
+            target_codec: resolved_codec.to_string(),
+            container_extension: container_extension.to_string(),
+            accepted_format_names: accepted_format_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        })
+    }
+
+    pub fn output_path_for(&self, source_path: &Path) -> PathBuf {
+        if source_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(&self.container_extension))
+        {
+            return source_path.to_path_buf();
+        }
+
+        let parent = source_path.parent().unwrap_or(Path::new("."));
+        let stem = source_path
+            .file_stem()
+            .or_else(|| source_path.file_name())
+            .unwrap_or_default()
+            .to_string_lossy();
+        parent.join(format!("{}.{}", stem, self.container_extension))
+    }
+
+    pub fn container_matches(&self, format_names: &[String]) -> bool {
+        format_names.iter().any(|name| {
+            self.accepted_format_names
+                .iter()
+                .any(|expected| name.eq_ignore_ascii_case(expected))
+        })
+    }
+}
+
+fn map_video_encoder_to_codec(encoder: &str) -> Option<&'static str> {
+    let normalized = encoder.trim().to_ascii_lowercase();
+    if normalized.contains("av1") {
+        Some("av1")
+    } else if normalized.contains("265") || normalized.contains("hevc") {
+        Some("hevc")
+    } else if normalized.contains("264") || normalized.contains("avc") {
+        Some("h264")
+    } else if normalized.contains("mpeg2") {
+        Some("mpeg2video")
+    } else if normalized.contains("vp9") {
+        Some("vp9")
+    } else {
+        None
+    }
+}
+
+fn map_file_format_to_container(
+    file_format: &str,
+) -> Option<(&'static str, &'static [&'static str])> {
+    match file_format.trim().to_ascii_lowercase().as_str() {
+        "av_mkv" => Some(("mkv", &["matroska", "webm"])),
+        "av_mp4" | "av_mov" => Some(("mp4", &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"])),
+        "av_webm" => Some(("webm", &["matroska", "webm"])),
+        "av_avi" => Some(("avi", &["avi"])),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Default)]
 struct CapturedOutput {
@@ -726,8 +883,9 @@ fn should_mark_transcode_stalled(
 mod tests {
     use super::{
         parse_handbrake_progress_json_block, parse_handbrake_progress_text,
-        should_mark_transcode_stalled,
+        should_mark_transcode_stalled, PresetContract,
     };
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -779,6 +937,35 @@ mod tests {
 }"#;
         let p = parse_handbrake_progress_json_block(block).unwrap();
         assert!((p.percent - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn resolve_bundled_preset_contract() {
+        let preset_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("AV1_MKV.json");
+        let contract = PresetContract::resolve(&preset_file, "AV1_MKV", "av1").unwrap();
+        assert_eq!(contract.target_codec, "av1");
+        assert_eq!(contract.container_extension, "mkv");
+        assert!(contract.container_matches(&["matroska".to_string()]));
+    }
+
+    #[test]
+    fn output_path_uses_resolved_container_extension() {
+        let contract = PresetContract {
+            target_codec: "av1".to_string(),
+            container_extension: "mkv".to_string(),
+            accepted_format_names: vec!["matroska".to_string(), "webm".to_string()],
+        };
+
+        for input in [
+            "/mnt/movies/Example.mkv",
+            "/mnt/movies/Example.mp4",
+            "/mnt/movies/Example.avi",
+            "/mnt/movies/Example.mov",
+            "/mnt/movies/Example.webm",
+        ] {
+            let output = contract.output_path_for(Path::new(input));
+            assert_eq!(output, PathBuf::from("/mnt/movies/Example.mkv"));
+        }
     }
 
     #[test]

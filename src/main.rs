@@ -23,7 +23,7 @@ use watchdog::simulate::create_simulated_deps;
 use watchdog::state::StateManager;
 use watchdog::status_snapshot::{resolve_status_snapshot_path, run_status_snapshot_task};
 use watchdog::traits::MountManager;
-use watchdog::transcode::HandBrakeTranscoder;
+use watchdog::transcode::{HandBrakeTranscoder, PresetContract};
 use watchdog::transfer::RsyncTransfer;
 use watchdog::{tui, util};
 
@@ -364,6 +364,30 @@ async fn run() -> anyhow::Result<()> {
             .to_path_buf()
     };
     info!("Resolved base directory: {}", base_dir.display());
+
+    let needs_preset_contract = !run_status_mode
+        && !run_healthcheck_mode
+        && !cli.pause
+        && !cli.resume
+        && !cli.quarantine_list
+        && cli.quarantine_clear.is_none()
+        && !cli.quarantine_clear_all
+        && !cli.doctor;
+    if needs_preset_contract {
+        let preset_path = config.resolve_path(&base_dir, &config.transcode.preset_file);
+        let preset_contract = PresetContract::resolve(
+            &preset_path,
+            &config.transcode.preset_name,
+            &config.transcode.target_codec,
+        )?;
+        info!(
+            "Resolved preset contract: codec={} container=.{} preset={} file={}",
+            preset_contract.target_codec,
+            preset_contract.container_extension,
+            config.transcode.preset_name,
+            preset_path.display()
+        );
+    }
 
     let mut resume_requested = false;
     if cli.pause || cli.resume {

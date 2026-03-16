@@ -11,12 +11,58 @@ use watchdog::pipeline::{run_pipeline_loop, run_watchdog_pass, PipelineDeps};
 use watchdog::state::StateManager;
 use watchdog::traits::*;
 
+#[derive(Clone)]
+struct TestMediaFile {
+    size: u64,
+    mtime: f64,
+    codec: String,
+    format_name: String,
+    duration_seconds: f64,
+    video_stream_count: u32,
+    audio_stream_count: u32,
+    subtitle_stream_count: u32,
+}
+
+fn format_name_for_path(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mkv" | "webm" => "matroska,webm".to_string(),
+        "mp4" | "mov" => "mov,mp4,m4a,3gp,3g2,mj2".to_string(),
+        "avi" => "avi".to_string(),
+        _ => "matroska,webm".to_string(),
+    }
+}
+
+fn default_media_file(path: &Path, size: u64, mtime: f64) -> TestMediaFile {
+    let codec = if path.to_string_lossy().contains(".av1.") {
+        "av1"
+    } else {
+        "h264"
+    };
+    TestMediaFile {
+        size,
+        mtime,
+        codec: codec.to_string(),
+        format_name: format_name_for_path(path),
+        duration_seconds: 100.0,
+        video_stream_count: 1,
+        audio_stream_count: 1,
+        subtitle_stream_count: 0,
+    }
+}
+
 struct TestFs {
-    files: Mutex<HashMap<PathBuf, (u64, f64)>>,
+    files: Mutex<HashMap<PathBuf, TestMediaFile>>,
     share_roots: HashMap<String, PathBuf>,
     free_space_default: u64,
     free_space_sequence: Mutex<Vec<u64>>,
     free_space_error: AtomicBool,
+    export_mutation: Mutex<Option<(PathBuf, u64)>>,
     recovery_walk_calls: AtomicUsize,
     walk_delay: Mutex<Option<Duration>>,
     active_walks: AtomicUsize,
@@ -41,6 +87,7 @@ impl TestFs {
             free_space_default: u64::MAX / 2,
             free_space_sequence: Mutex::new(Vec::new()),
             free_space_error: AtomicBool::new(false),
+            export_mutation: Mutex::new(None),
             recovery_walk_calls: AtomicUsize::new(0),
             walk_delay: Mutex::new(None),
             active_walks: AtomicUsize::new(0),
@@ -55,15 +102,21 @@ impl TestFs {
         self.files
             .lock()
             .unwrap()
-            .insert(path.to_path_buf(), (size, mtime));
+            .insert(path.to_path_buf(), default_media_file(path, size, mtime));
+    }
+
+    fn insert_transcoded(&self, path: &Path, size: u64, mtime: f64) {
+        let mut file = default_media_file(path, size, mtime);
+        file.codec = "av1".to_string();
+        self.files.lock().unwrap().insert(path.to_path_buf(), file);
     }
 
     fn get_size(&self, path: &Path) -> Option<u64> {
-        self.files.lock().unwrap().get(path).map(|v| v.0)
+        self.files.lock().unwrap().get(path).map(|v| v.size)
     }
 
-    fn get_mtime(&self, path: &Path) -> Option<f64> {
-        self.files.lock().unwrap().get(path).map(|v| v.1)
+    fn get_media(&self, path: &Path) -> Option<TestMediaFile> {
+        self.files.lock().unwrap().get(path).cloned()
     }
 
     fn has_path(&self, path: &Path) -> bool {
@@ -86,6 +139,10 @@ impl TestFs {
         *self.free_space_sequence.lock().unwrap() = sequence;
     }
 
+    fn set_export_mutation(&self, path: &Path, size: u64) {
+        *self.export_mutation.lock().unwrap() = Some((path.to_path_buf(), size));
+    }
+
     fn max_concurrent_walks(&self) -> usize {
         self.max_concurrent_walks.load(Ordering::Relaxed)
     }
@@ -98,9 +155,9 @@ impl TestFs {
 
     fn bump_first_share_file_mtime(&self, delta: f64) {
         let mut files = self.files.lock().unwrap();
-        for (path, (_size, mtime)) in files.iter_mut() {
+        for (path, media) in files.iter_mut() {
             if self.share_roots.values().any(|root| path.starts_with(root)) {
-                *mtime += delta;
+                media.mtime += delta;
                 break;
             }
         }
@@ -153,7 +210,7 @@ impl FileSystem for FsHandle {
 
         let files = self.0.files.lock().unwrap();
         let mut out = Vec::new();
-        for (path, (size, mtime)) in files.iter() {
+        for (path, media) in files.iter() {
             if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 break;
             }
@@ -170,8 +227,8 @@ impl FileSystem for FsHandle {
             }
             out.push(FileEntry {
                 path: path.clone(),
-                size: *size,
-                mtime: *mtime,
+                size: media.size,
+                mtime: media.mtime,
                 share_name: share_name.to_string(),
             });
         }
@@ -186,8 +243,7 @@ impl FileSystem for FsHandle {
             .lock()
             .unwrap()
             .get(path)
-            .copied()
-            .map(|v| v.0)
+            .map(|v| v.size)
             .ok_or_else(|| {
                 WatchdogError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -202,8 +258,7 @@ impl FileSystem for FsHandle {
             .lock()
             .unwrap()
             .get(path)
-            .copied()
-            .map(|v| v.1)
+            .map(|v| v.mtime)
             .ok_or_else(|| {
                 WatchdogError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -236,7 +291,9 @@ impl FileSystem for FsHandle {
                 "rename source missing",
             ))
         })?;
-        files.insert(to.to_path_buf(), (value.0, value.1 + 1.0));
+        let mut renamed = value;
+        renamed.mtime += 1.0;
+        files.insert(to.to_path_buf(), renamed);
         Ok(())
     }
 
@@ -301,25 +358,24 @@ struct TestProber {
 
 impl Prober for TestProber {
     fn probe(&self, path: &Path) -> Result<Option<ProbeResult>> {
-        let size = match self.fs.get_size(path) {
-            Some(s) => s,
+        let media = match self.fs.get_media(path) {
+            Some(media) => media,
             None => return Ok(None),
         };
-        let codec = if path.to_string_lossy().contains(".av1.") {
-            "av1"
-        } else {
-            "h264"
-        };
         Ok(Some(ProbeResult {
-            video_codec: Some(codec.to_string()),
+            video_codec: Some(media.codec.clone()),
             stream_bitrate_bps: 0,
-            format_bitrate_bps: ((size as f64 * 8.0) / 100.0) as u64,
-            size_bytes: size,
-            duration_seconds: 100.0,
-            video_stream_count: 1,
-            audio_stream_count: 1,
-            subtitle_stream_count: 0,
-            raw_json: serde_json::json!({}),
+            format_bitrate_bps: ((media.size as f64 * 8.0) / media.duration_seconds) as u64,
+            size_bytes: media.size,
+            duration_seconds: media.duration_seconds,
+            video_stream_count: media.video_stream_count,
+            audio_stream_count: media.audio_stream_count,
+            subtitle_stream_count: media.subtitle_stream_count,
+            raw_json: serde_json::json!({
+                "format": {
+                    "format_name": media.format_name
+                }
+            }),
         }))
     }
 
@@ -375,7 +431,7 @@ impl Transcoder for TestTranscoder {
                 stall_timeout_secs: 10,
             }),
             TranscodeMode::SuccessWithOutputSize(size) => {
-                self.fs.insert(output, size, 1000.0);
+                self.fs.insert_transcoded(output, size, 1000.0);
                 Ok(TranscodeResult {
                     success: true,
                     timed_out: false,
@@ -403,7 +459,7 @@ impl Transcoder for TestTranscoder {
                 mtime_delta,
             } => {
                 self.fs.bump_first_share_file_mtime(mtime_delta);
-                self.fs.insert(output, output_size, 1000.0);
+                self.fs.insert_transcoded(output, output_size, 1000.0);
                 Ok(TranscodeResult {
                     success: true,
                     timed_out: false,
@@ -427,21 +483,23 @@ impl FileTransfer for TestTransfer {
         stage: TransferStage,
         progress_tx: Option<mpsc::Sender<TransferProgress>>,
     ) -> Result<TransferResult> {
-        let size = self
+        let media = self
             .fs
-            .get_size(source)
+            .get_media(source)
             .ok_or_else(|| WatchdogError::Transfer {
                 path: source.to_path_buf(),
                 reason: "source missing".to_string(),
             })?;
-        let mtime = self
-            .fs
-            .get_mtime(source)
-            .ok_or_else(|| WatchdogError::Transfer {
-                path: source.to_path_buf(),
-                reason: "source missing".to_string(),
-            })?;
-        self.fs.insert(dest, size, mtime);
+        self.fs
+            .files
+            .lock()
+            .unwrap()
+            .insert(dest.to_path_buf(), media);
+        if stage == TransferStage::Export {
+            if let Some((path, size)) = self.fs.export_mutation.lock().unwrap().clone() {
+                self.fs.insert(&path, size, 1000.0);
+            }
+        }
         if let Some(tx) = progress_tx {
             let _ = tx.try_send(TransferProgress {
                 stage,
@@ -523,6 +581,10 @@ impl InUseDetector for TestInUseDetector {
 
 fn base_config() -> Config {
     let mut cfg = Config::default_config();
+    cfg.transcode.preset_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("AV1_MKV.json")
+        .display()
+        .to_string();
     cfg.shares = vec![ShareConfig {
         name: "movies".to_string(),
         remote_path: "/remote/movies".to_string(),
@@ -1532,6 +1594,55 @@ async fn source_changed_during_transcode_increments_failure_counters() {
 
     assert_eq!(stats.transcode_failures, 1);
     assert_eq!(state.snapshot().run_failures, 1);
+    let recent = db.get_recent_transcodes(1);
+    assert_eq!(
+        recent[0].failure_code.as_deref(),
+        Some("source_changed_during_transcode")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_changed_during_export_preserves_remote_temp_and_skips_swap() {
+    let mut cfg = base_config();
+    cfg.scan.video_extensions = vec![".mp4".to_string(), ".mkv".to_string()];
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Source.Changed.During.Export.mp4");
+    let preserved_temp = PathBuf::from("/mnt/movies/Source.Changed.During.Export.mkv.watchdog.tmp");
+    fs.insert(&source, 50_000_000, 1000.0);
+    fs.set_export_mutation(&source, 51_000_000);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let stats = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stats.transcode_failures, 1);
+    assert!(fs.has_path(&source));
+    assert!(fs.has_path(&preserved_temp));
     let recent = db.get_recent_transcodes(1);
     assert_eq!(
         recent[0].failure_code.as_deref(),

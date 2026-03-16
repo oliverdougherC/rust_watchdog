@@ -4,11 +4,15 @@ use crate::error::{Result, WatchdogError};
 use crate::event_journal::{append_event, resolve_event_journal_path};
 use crate::nfs::ensure_all_mounts;
 use crate::notify::{send_webhook, NotifyEvent};
-use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval};
+use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval, VerificationOutcome};
 use crate::state::{PipelinePhase, ProgressStage, StateManager};
 use crate::stats::RunStats;
 use crate::traits::*;
-use crate::transfer::{safe_replace, WATCHDOG_OLD_SUFFIX, WATCHDOG_TMP_SUFFIX};
+use crate::transcode::PresetContract;
+use crate::transfer::{
+    safe_replace, SafeReplaceOutcome, SafeReplacePlan, SourceFingerprint, WATCHDOG_OLD_SUFFIX,
+    WATCHDOG_TMP_SUFFIX,
+};
 use crate::util::{format_bytes, format_bytes_signed};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::json;
@@ -58,14 +62,12 @@ enum FailureCode {
     TranscodeFailed,
     OutputMissing,
     OutputZeroBytes,
-    VerificationFailed,
     VerificationError,
     OutputSuspiciouslySmall,
     InsufficientNfsSpace,
     NfsSpaceProbeError,
     SourceChangedDuringTranscode,
     FileInUse,
-    SafeReplaceFailed,
     SafeReplaceError,
     QuarantinedFile,
 }
@@ -91,14 +93,12 @@ impl FailureCode {
             Self::TranscodeFailed => "transcode_failed",
             Self::OutputMissing => "output_missing",
             Self::OutputZeroBytes => "output_zero_bytes",
-            Self::VerificationFailed => "verification_failed",
             Self::VerificationError => "verification_error",
             Self::OutputSuspiciouslySmall => "output_suspiciously_small",
             Self::InsufficientNfsSpace => "insufficient_nfs_space",
             Self::NfsSpaceProbeError => "nfs_space_probe_error",
             Self::SourceChangedDuringTranscode => "source_changed_during_transcode",
             Self::FileInUse => "file_in_use",
-            Self::SafeReplaceFailed => "safe_replace_failed",
             Self::SafeReplaceError => "safe_replace_error",
             Self::QuarantinedFile => FAILURE_CODE_QUARANTINED_FILE,
         }
@@ -158,6 +158,7 @@ fn build_local_temp_paths(
     temp_dir: &Path,
     share_name: &str,
     source_path: &Path,
+    output_extension: &str,
 ) -> (PathBuf, PathBuf) {
     let hash = format!("{:016x}", stable_path_hash(source_path));
     let source_name = source_path
@@ -170,15 +171,11 @@ fn build_local_temp_paths(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let original_ext = source_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mkv");
 
     let local_source = temp_dir.join(format!("{}_{}__{}", share_name, hash, source_name));
     let local_output = temp_dir.join(format!(
         "{}_{}__{}.av1.{}",
-        share_name, hash, name_no_ext, original_ext
+        share_name, hash, name_no_ext, output_extension
     ));
     (local_source, local_output)
 }
@@ -333,6 +330,11 @@ pub async fn run_watchdog_pass(
 
     // Prepare paths
     let preset_path = config.resolve_path(base_dir, &config.transcode.preset_file);
+    let preset_contract = PresetContract::resolve(
+        &preset_path,
+        &config.transcode.preset_name,
+        &config.transcode.target_codec,
+    )?;
     let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
     if !dry_run {
         deps.fs.create_dir_all(&temp_dir)?;
@@ -679,6 +681,8 @@ pub async fn run_watchdog_pass(
         let path = &entry.path;
         let share_name = &entry.share_name;
         let path_str = path.to_string_lossy().to_string();
+        let final_path = preset_contract.output_path_for(path);
+        let final_display_filename = final_path.file_name().unwrap_or_default().to_string_lossy();
 
         let attempt_num = {
             let count = attempt_counts.entry(path.clone()).or_insert(0);
@@ -817,7 +821,12 @@ pub async fn run_watchdog_pass(
         }
 
         // Build collision-resistant temp paths using a deterministic hash of full source path.
-        let (local_source, local_output) = build_local_temp_paths(&temp_dir, share_name, path);
+        let (local_source, local_output) = build_local_temp_paths(
+            &temp_dir,
+            share_name,
+            path,
+            &preset_contract.container_extension,
+        );
 
         // Step 1: rsync source to temp
         state.set_phase(PipelinePhase::Transferring);
@@ -1372,28 +1381,43 @@ pub async fn run_watchdog_pass(
 
         // Step 3b: Verify transcode metadata (duration, streams, health)
         let verified = tokio::task::block_in_place(|| {
-            verify_transcode(deps.prober.as_ref(), &local_source, &local_output)
+            verify_transcode(
+                deps.prober.as_ref(),
+                &local_source,
+                &local_output,
+                &preset_contract,
+            )
         });
 
         match verified {
-            Ok(true) => {
+            Ok(VerificationOutcome::Passed) => {
                 tui_log(
                     state,
                     "INFO",
                     &format!("Verification passed: {}", display_filename),
                 );
             }
-            Ok(false) => {
-                error!("[{}] Verification failed for {}", share_name, path_str);
+            Ok(VerificationOutcome::Failed(failure)) => {
+                error!(
+                    "[{}] Verification failed for {}: {} ({})",
+                    share_name,
+                    path_str,
+                    failure.summary(),
+                    failure.code()
+                );
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
                 tui_log(
                     state,
                     "ERROR",
-                    &format!("Verification failed: {}", display_filename),
+                    &format!(
+                        "Verification failed [{}]: {}",
+                        failure.code(),
+                        display_filename
+                    ),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                record_failure(
+                record_failure_with_code(
                     state,
                     db.as_ref(),
                     config,
@@ -1401,8 +1425,8 @@ pub async fn run_watchdog_pass(
                     &path_str,
                     db_row_id,
                     dur,
-                    FailureCode::VerificationFailed,
-                    "verification_failed",
+                    failure.code(),
+                    failure.code(),
                     true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
@@ -1501,7 +1525,7 @@ pub async fn run_watchdog_pass(
 
         // Step 5: Verify NFS share has enough free space for the replacement file.
         // We need at least the output file size free on the target share.
-        let share_path = path.parent().unwrap_or(path);
+        let share_path = final_path.parent().unwrap_or(path);
         match deps.fs.free_space(share_path) {
             Ok(share_free) if share_free < new_size as u64 => {
                 warn!(
@@ -1627,7 +1651,7 @@ pub async fn run_watchdog_pass(
 
         state.set_progress_stage(ProgressStage::Export);
         let replaced = tokio::task::block_in_place(|| {
-            let mut result: Option<Result<bool>> = None;
+            let mut result: Option<Result<SafeReplaceOutcome>> = None;
             let (transfer_tx, mut transfer_rx) = mpsc::channel::<TransferProgress>(32);
             std::thread::scope(|s| {
                 s.spawn(|| {
@@ -1638,8 +1662,18 @@ pub async fn run_watchdog_pass(
                 result = Some(safe_replace(
                     deps.fs.as_ref(),
                     deps.transfer.as_ref(),
-                    path,
-                    &local_output,
+                    deps.prober.as_ref(),
+                    &SafeReplacePlan {
+                        source_path: path,
+                        final_path: &final_path,
+                        new_local_path: &local_output,
+                        original_local_path: &local_source,
+                        expected_source: SourceFingerprint {
+                            size: entry.size,
+                            mtime: entry.mtime,
+                        },
+                        verification_contract: &preset_contract,
+                    },
                     Some(transfer_tx),
                 ));
             });
@@ -1647,16 +1681,17 @@ pub async fn run_watchdog_pass(
         });
 
         match replaced {
-            Ok(true) => {
+            Ok(SafeReplaceOutcome::Replaced { installed_path }) => {
                 state.set_export_progress(100.0, 0.0, String::new());
                 let space_saved = original_size - new_size;
                 stats.files_transcoded += 1;
                 stats.space_saved_bytes += space_saved;
+                let installed_path_str = installed_path.to_string_lossy().to_string();
 
                 // Update DB
-                if let Ok(new_mtime) = deps.fs.file_mtime(path) {
-                    let new_file_size = deps.fs.file_size(path).unwrap_or(0);
-                    db.mark_inspected(&path_str, new_file_size, new_mtime);
+                if let Ok(new_mtime) = deps.fs.file_mtime(&installed_path) {
+                    let new_file_size = deps.fs.file_size(&installed_path).unwrap_or(0);
+                    db.mark_inspected(&installed_path_str, new_file_size, new_mtime);
                 }
                 let dur = transcode_start.elapsed().as_secs_f64();
                 db.record_transcode_end(
@@ -1674,17 +1709,19 @@ pub async fn run_watchdog_pass(
                 db.log_space_saved(cumulative);
 
                 info!(
-                    "[{}] SUCCESS: Replaced {} | Saved {}",
+                    "[{}] SUCCESS: Replaced {} -> {} | Saved {}",
                     share_name,
                     path_str,
+                    installed_path_str,
                     format_bytes_signed(space_saved)
                 );
                 tui_log(
                     state,
                     "SUCCESS",
                     &format!(
-                        "Replaced {} | Saved {}",
+                        "Replaced {} -> {} | Saved {}",
                         display_filename,
+                        final_display_filename,
                         format_bytes_signed(space_saved)
                     ),
                 );
@@ -1702,6 +1739,7 @@ pub async fn run_watchdog_pass(
                     NotifyEvent::ReplacementSummary,
                     &json!({
                         "path": path_str,
+                        "installed_path": installed_path_str,
                         "share": share_name,
                         "original_size": original_size,
                         "new_size": new_size,
@@ -1709,17 +1747,27 @@ pub async fn run_watchdog_pass(
                     }),
                 );
             }
-            Ok(false) => {
-                error!("[{}] Safe replace failed for {}", share_name, path_str);
+            Ok(SafeReplaceOutcome::Failed(failure)) => {
+                error!(
+                    "[{}] Safe replace failed for {}: {} ({})",
+                    share_name,
+                    path_str,
+                    failure.summary(),
+                    failure.failure_code()
+                );
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
                 tui_log(
                     state,
                     "ERROR",
-                    &format!("Replace failed: {}", display_filename),
+                    &format!(
+                        "Replace failed [{}]: {}",
+                        failure.failure_code(),
+                        display_filename
+                    ),
                 );
                 let dur = transcode_start.elapsed().as_secs_f64();
-                record_failure(
+                record_failure_with_code(
                     state,
                     db.as_ref(),
                     config,
@@ -1727,8 +1775,8 @@ pub async fn run_watchdog_pass(
                     &path_str,
                     db_row_id,
                     dur,
-                    FailureCode::SafeReplaceFailed,
-                    "safe_replace_failed",
+                    failure.failure_code(),
+                    failure.failure_code(),
                     true,
                 );
             }
@@ -2259,6 +2307,30 @@ fn recover_orphaned_files(
             }
         }
 
+        if let Ok(tmp_files) = fs.walk_files_with_suffix(mount_path, WATCHDOG_TMP_SUFFIX) {
+            for tmp_path in tmp_files {
+                if shutdown_requested(shutdown_rx) {
+                    return false;
+                }
+                warn!(
+                    "[{}] Removing stale watchdog temp artifact: {}",
+                    share.name,
+                    tmp_path.display()
+                );
+                let _ = fs.remove(&tmp_path);
+                emit_event(
+                    config,
+                    base_dir,
+                    "orphan_recovery",
+                    json!({
+                        "share": share.name,
+                        "action": "remove_stale_temp",
+                        "path": tmp_path,
+                    }),
+                );
+            }
+        }
+
         // Legacy .old files are reported only, never auto-mutated.
         if let Ok(legacy_old_files) = fs.walk_files_with_suffix(mount_path, ".old") {
             for legacy in legacy_old_files {
@@ -2294,6 +2366,13 @@ fn cleanup_temp_files(fs: &dyn FileSystem, paths: &[&Path]) {
     }
 }
 
+fn quarantine_policy_matches(observed_code: &str, configured_code: &str) -> bool {
+    configured_code == observed_code
+        || (configured_code == "verification_failed"
+            && observed_code.starts_with("verification_")
+            && observed_code != FailureCode::VerificationError.as_str())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_failure_cooldown(
     state: &StateManager,
@@ -2321,7 +2400,7 @@ fn apply_failure_cooldown(
             .safety
             .quarantine_failure_codes
             .iter()
-            .any(|c| c == failure_code)
+            .any(|configured| quarantine_policy_matches(failure_code, configured))
             && cooldown.consecutive_failures >= config.safety.quarantine_after_failures.max(1);
         let retry_in_seconds = cooldown.next_eligible_at.saturating_sub(now_ts).max(0);
         warn!(
@@ -2395,20 +2474,63 @@ fn record_failure(
     apply_cooldown: bool,
 ) {
     let failure_code = code.as_str();
-    let now_ts = chrono::Utc::now().timestamp();
-    let summary = format!(
-        "Recording file failure: code={} path={} reason={} duration={:.1}s cooldown_tracking={}",
-        failure_code, path, reason, duration_seconds, apply_cooldown
-    );
     match code {
         FailureCode::InterruptedShutdown
         | FailureCode::InterruptedPause
         | FailureCode::Interrupted => {
+            let summary = format!(
+                "Recording file failure: code={} path={} reason={} duration={:.1}s cooldown_tracking={}",
+                failure_code, path, reason, duration_seconds, apply_cooldown
+            );
             info!("{}", summary);
+            state.update(|s| {
+                s.last_failure_code = Some(failure_code.to_string());
+            });
+            db.record_transcode_end_with_code(
+                row_id,
+                TranscodeOutcome::Failed,
+                0,
+                0,
+                duration_seconds,
+                Some(reason),
+                Some(failure_code),
+            );
         }
-        _ => warn!("{}", summary),
+        _ => {
+            record_failure_with_code(
+                state,
+                db,
+                config,
+                base_dir,
+                path,
+                row_id,
+                duration_seconds,
+                failure_code,
+                reason,
+                apply_cooldown,
+            );
+        }
     }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn record_failure_with_code(
+    state: &StateManager,
+    db: &WatchdogDb,
+    config: &Config,
+    base_dir: &Path,
+    path: &str,
+    row_id: i64,
+    duration_seconds: f64,
+    failure_code: &str,
+    reason: &str,
+    apply_cooldown: bool,
+) {
+    let now_ts = chrono::Utc::now().timestamp();
+    warn!(
+        "Recording file failure: code={} path={} reason={} duration={:.1}s cooldown_tracking={}",
+        failure_code, path, reason, duration_seconds, apply_cooldown
+    );
     state.update(|s| {
         s.last_failure_code = Some(failure_code.to_string());
     });
@@ -3151,8 +3273,8 @@ mod tests {
         let temp_dir = Path::new("/tmp/watchdog");
         let a = Path::new("/mnt/movies/A/Movie.mkv");
         let b = Path::new("/mnt/movies/B/Movie.mkv");
-        let (a_source, a_output) = build_local_temp_paths(temp_dir, "movies", a);
-        let (b_source, b_output) = build_local_temp_paths(temp_dir, "movies", b);
+        let (a_source, a_output) = build_local_temp_paths(temp_dir, "movies", a, "mkv");
+        let (b_source, b_output) = build_local_temp_paths(temp_dir, "movies", b, "mkv");
 
         assert_ne!(a_source, b_source);
         assert_ne!(a_output, b_output);
@@ -3160,6 +3282,19 @@ mod tests {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("movies_")));
+    }
+
+    #[test]
+    fn build_local_temp_paths_uses_resolved_output_extension() {
+        let temp_dir = Path::new("/tmp/watchdog");
+        let source = Path::new("/mnt/movies/Movie.mp4");
+        let (_local_source, local_output) =
+            build_local_temp_paths(temp_dir, "movies", source, "mkv");
+
+        assert!(local_output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("__Movie.av1.mkv")));
     }
 
     #[test]

@@ -1,10 +1,9 @@
 use std::path::PathBuf;
-use watchdog::probe::{verify_transcode, FfprobeProber};
+use watchdog::probe::{verify_transcode, FfprobeProber, VerificationOutcome};
 use watchdog::traits::Transcoder;
-use watchdog::transcode::HandBrakeTranscoder;
+use watchdog::transcode::{HandBrakeTranscoder, PresetContract};
 
-#[test]
-fn real_tools_transcode_smoke() {
+fn run_real_tools_smoke(input_env: &str) {
     if std::env::var("WATCHDOG_REAL_TOOLS").ok().as_deref() != Some("1") {
         return;
     }
@@ -12,7 +11,7 @@ fn real_tools_transcode_smoke() {
         return;
     }
 
-    let input = match std::env::var("WATCHDOG_REAL_INPUT") {
+    let input = match std::env::var(input_env) {
         Ok(v) => PathBuf::from(v),
         Err(_) => return,
     };
@@ -28,9 +27,13 @@ fn real_tools_transcode_smoke() {
     if !preset_file.exists() {
         return;
     }
+    let contract = PresetContract::resolve(&preset_file, &preset_name, "av1").unwrap();
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let output = temp_dir.path().join("real_tools_output.mkv");
+    let output = temp_dir.path().join(format!(
+        "real_tools_output.{}",
+        contract.container_extension
+    ));
     let (tx, _rx) = tokio::sync::mpsc::channel(32);
 
     let transcoder = HandBrakeTranscoder;
@@ -50,6 +53,16 @@ fn real_tools_transcode_smoke() {
     assert!(result.output_exists);
 
     let prober = FfprobeProber;
-    let verified = verify_transcode(&prober, &input, &output).unwrap();
-    assert!(verified);
+    let verified = verify_transcode(&prober, &input, &output, &contract).unwrap();
+    assert_eq!(verified, VerificationOutcome::Passed);
+}
+
+#[test]
+fn real_tools_transcode_smoke() {
+    run_real_tools_smoke("WATCHDOG_REAL_INPUT");
+}
+
+#[test]
+fn real_tools_transcode_smoke_non_mkv_input() {
+    run_real_tools_smoke("WATCHDOG_REAL_INPUT_NON_MKV");
 }

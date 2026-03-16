@@ -1,12 +1,16 @@
 use crate::error::{Result, WatchdogError};
+use crate::probe::{verify_transcode, VerificationFailure, VerificationOutcome};
 use crate::process::{
     configure_subprocess_group, describe_exit_status, format_command_for_log, infer_failure_hint,
     summarize_output_tail, terminate_subprocess,
 };
-use crate::traits::{FileSystem, FileTransfer, TransferProgress, TransferResult, TransferStage};
+use crate::traits::{
+    FileSystem, FileTransfer, Prober, TransferProgress, TransferResult, TransferStage,
+};
+use crate::transcode::PresetContract;
 use regex::Regex;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -17,6 +21,103 @@ use tracing::{error, info, warn};
 
 pub const WATCHDOG_TMP_SUFFIX: &str = ".watchdog.tmp";
 pub const WATCHDOG_OLD_SUFFIX: &str = ".watchdog.old";
+
+#[derive(Debug, Clone, Copy)]
+pub struct SourceFingerprint {
+    pub size: u64,
+    pub mtime: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SafeReplacePlan<'a> {
+    pub source_path: &'a Path,
+    pub final_path: &'a Path,
+    pub new_local_path: &'a Path,
+    pub original_local_path: &'a Path,
+    pub expected_source: SourceFingerprint,
+    pub verification_contract: &'a PresetContract,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SafeReplaceFailure {
+    SourceMissing,
+    DestinationConflict {
+        path: PathBuf,
+    },
+    TempMissing {
+        path: PathBuf,
+    },
+    TempSizeMismatch {
+        temp_path: PathBuf,
+        local_size: u64,
+        remote_size: u64,
+    },
+    TempVerificationFailed(VerificationFailure),
+    SourceChanged {
+        current_size: u64,
+        current_mtime: f64,
+        temp_path: PathBuf,
+    },
+    RenameOriginalFailed,
+    InstallRenameFailed,
+}
+
+impl SafeReplaceFailure {
+    pub fn failure_code(&self) -> &str {
+        match self {
+            Self::TempVerificationFailed(failure) => failure.code(),
+            Self::SourceChanged { .. } => "source_changed_during_transcode",
+            _ => "safe_replace_failed",
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            Self::SourceMissing => "source file disappeared before replace".to_string(),
+            Self::DestinationConflict { path } => {
+                format!("destination already exists: {}", path.display())
+            }
+            Self::TempMissing { path } => {
+                format!("remote temp missing after export: {}", path.display())
+            }
+            Self::TempSizeMismatch {
+                temp_path,
+                local_size,
+                remote_size,
+            } => format!(
+                "remote temp size mismatch at {}: local={} remote={}",
+                temp_path.display(),
+                local_size,
+                remote_size
+            ),
+            Self::TempVerificationFailed(failure) => {
+                format!("remote temp verification failed: {}", failure.summary())
+            }
+            Self::SourceChanged {
+                current_size,
+                current_mtime,
+                temp_path,
+            } => format!(
+                "source changed during export; current_size={} current_mtime={:.3} temp_preserved={}",
+                current_size,
+                current_mtime,
+                temp_path.display()
+            ),
+            Self::RenameOriginalFailed => "failed to rename source to backup".to_string(),
+            Self::InstallRenameFailed => "failed to install remote temp into final path".to_string(),
+        }
+    }
+
+    pub fn preserve_remote_temp(&self) -> bool {
+        matches!(self, Self::SourceChanged { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SafeReplaceOutcome {
+    Replaced { installed_path: PathBuf },
+    Failed(SafeReplaceFailure),
+}
 
 static RSYNC_PROGRESS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*[0-9,]+\s+(\d{1,3})%\s+([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z/]+)\s+([0-9:]{4,8})")
@@ -417,32 +518,53 @@ impl FileTransfer for RsyncTransfer {
 }
 
 /// Perform a safe replace operation: rsync new file to temp on remote,
-/// rename original to .watchdog.old, rename temp to original, delete backup.
+/// rename original to .watchdog.old, rename temp into the final path, delete backup.
 /// Rolls back on failure. Cleans up stale artifacts from previous crashes.
 pub fn safe_replace(
     fs: &dyn FileSystem,
     transfer: &dyn FileTransfer,
-    source_path: &Path,
-    new_local_path: &Path,
+    prober: &dyn Prober,
+    plan: &SafeReplacePlan<'_>,
     progress_tx: Option<mpsc::Sender<TransferProgress>>,
-) -> Result<bool> {
-    let source_dir = source_path.parent().unwrap_or(Path::new("."));
-    let source_filename = source_path
+) -> Result<SafeReplaceOutcome> {
+    let source_dir = plan.source_path.parent().unwrap_or(Path::new("."));
+    let final_dir = plan.final_path.parent().unwrap_or(Path::new("."));
+    let source_filename = plan
+        .source_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    let temp_remote = source_dir.join(format!("{}{}", source_filename, WATCHDOG_TMP_SUFFIX));
+    let final_filename = plan
+        .final_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let temp_remote = final_dir.join(format!("{}{}", final_filename, WATCHDOG_TMP_SUFFIX));
     let old_remote = source_dir.join(format!("{}{}", source_filename, WATCHDOG_OLD_SUFFIX));
-    let legacy_temp_remote = source_dir.join(format!("{}.tmp", source_filename));
+    let legacy_temp_remote = final_dir.join(format!("{}.tmp", final_filename));
     let legacy_old_remote = source_dir.join(format!("{}.old", source_filename));
 
     // Pre-flight: verify the original file still exists on the NFS share.
-    if !fs.exists(source_path) {
+    if !fs.exists(plan.source_path) {
         error!(
             "Original file no longer exists at {}; aborting replace",
-            source_path.display()
+            plan.source_path.display()
         );
-        return Ok(false);
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::SourceMissing,
+        ));
+    }
+
+    if plan.final_path != plan.source_path && fs.exists(plan.final_path) {
+        error!(
+            "Final destination already exists at {}; aborting replace to avoid clobbering",
+            plan.final_path.display()
+        );
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::DestinationConflict {
+                path: plan.final_path.to_path_buf(),
+            },
+        ));
     }
 
     // Pre-flight: clean up stale artifacts from previous crashes.
@@ -458,7 +580,11 @@ pub fn safe_replace(
                 temp_remote.display(),
                 e
             );
-            return Ok(false);
+            return Ok(SafeReplaceOutcome::Failed(
+                SafeReplaceFailure::TempMissing {
+                    path: temp_remote.clone(),
+                },
+            ));
         }
     }
     // If .watchdog.old exists AND source_path exists, it is from a previous successful
@@ -474,7 +600,9 @@ pub fn safe_replace(
                 old_remote.display(),
                 e
             );
-            return Ok(false);
+            return Ok(SafeReplaceOutcome::Failed(
+                SafeReplaceFailure::RenameOriginalFailed,
+            ));
         }
     }
     // Legacy suffixes from older versions are detected but never mutated automatically.
@@ -492,7 +620,7 @@ pub fn safe_replace(
     }
 
     // Step 1: rsync new file to temp path on remote.
-    let file_size = fs.file_size(new_local_path).unwrap_or(0);
+    let file_size = fs.file_size(plan.new_local_path).unwrap_or(0);
     let timeout = if file_size > 0 {
         (file_size / (1024 * 1024)).max(300)
     } else {
@@ -500,48 +628,99 @@ pub fn safe_replace(
     };
 
     let result = transfer.transfer(
-        new_local_path,
+        plan.new_local_path,
         &temp_remote,
         timeout,
         TransferStage::Export,
         progress_tx,
     )?;
     if !result.success {
-        error!("rsync to temp failed for {}", source_path.display());
+        error!("rsync to temp failed for {}", plan.source_path.display());
         let _ = fs.remove(&temp_remote);
-        return Ok(false);
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::TempMissing { path: temp_remote },
+        ));
     }
 
     // Verify temp file landed and size matches the local output
     if !fs.exists(&temp_remote) {
         error!("rsync reported success but temp file missing on remote");
-        return Ok(false);
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::TempMissing { path: temp_remote },
+        ));
     }
     let remote_size = fs.file_size(&temp_remote).unwrap_or(0);
-    let local_size = fs.file_size(new_local_path).unwrap_or(0);
+    let local_size = fs.file_size(plan.new_local_path).unwrap_or(0);
     if remote_size != local_size {
         error!(
             "Size mismatch after rsync: local={} remote={} — aborting replace to prevent corruption",
             local_size, remote_size
         );
         let _ = fs.remove(&temp_remote);
-        return Ok(false);
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::TempSizeMismatch {
+                temp_path: temp_remote,
+                local_size,
+                remote_size,
+            },
+        ));
+    }
+
+    match verify_transcode(
+        prober,
+        plan.original_local_path,
+        &temp_remote,
+        plan.verification_contract,
+    )? {
+        VerificationOutcome::Passed => {}
+        VerificationOutcome::Failed(failure) => {
+            error!(
+                "Remote temp verification failed for {}: {} ({})",
+                temp_remote.display(),
+                failure.summary(),
+                failure.code()
+            );
+            let _ = fs.remove(&temp_remote);
+            return Ok(SafeReplaceOutcome::Failed(
+                SafeReplaceFailure::TempVerificationFailed(failure),
+            ));
+        }
+    }
+
+    let current_size = fs.file_size(plan.source_path).unwrap_or(0);
+    let current_mtime = fs.file_mtime(plan.source_path).unwrap_or(0.0);
+    if current_size != plan.expected_source.size
+        || (current_mtime - plan.expected_source.mtime).abs() > 1.0
+    {
+        warn!(
+            "Source changed during export; preserving remote temp {} for inspection",
+            temp_remote.display()
+        );
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::SourceChanged {
+                current_size,
+                current_mtime,
+                temp_path: temp_remote,
+            },
+        ));
     }
 
     // Step 2: move original aside
-    if let Err(e) = fs.rename(source_path, &old_remote) {
+    if let Err(e) = fs.rename(plan.source_path, &old_remote) {
         error!("Failed to rename original to .watchdog.old: {}", e);
         let _ = fs.remove(&temp_remote);
-        return Ok(false);
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::RenameOriginalFailed,
+        ));
     }
 
     // Step 3: move new file into place
-    if let Err(e) = fs.rename(&temp_remote, source_path) {
+    if let Err(e) = fs.rename(&temp_remote, plan.final_path) {
         error!(
-            "Rename .watchdog.tmp->source failed ({}); rolling back from .watchdog.old",
+            "Rename .watchdog.tmp->final failed ({}); rolling back from .watchdog.old",
             e
         );
-        match fs.rename(&old_remote, source_path) {
+        match fs.rename(&old_remote, plan.source_path) {
             Ok(_) => info!("Rollback succeeded — original file restored"),
             Err(rb_err) => {
                 error!(
@@ -551,12 +730,14 @@ pub fn safe_replace(
                 error!(
                     "To recover manually: mv \"{}\" \"{}\"",
                     old_remote.display(),
-                    source_path.display()
+                    plan.source_path.display()
                 );
                 error!("Rollback error: {}", rb_err);
             }
         }
-        return Ok(false);
+        return Ok(SafeReplaceOutcome::Failed(
+            SafeReplaceFailure::InstallRenameFailed,
+        ));
     }
 
     // Step 4: remove old file (non-fatal — the old original is no longer needed)
@@ -568,13 +749,15 @@ pub fn safe_replace(
         );
     }
 
-    Ok(true)
+    Ok(SafeReplaceOutcome::Replaced {
+        installed_path: plan.final_path.to_path_buf(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::FileEntry;
+    use crate::traits::{FileEntry, ProbeResult};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -686,6 +869,7 @@ mod tests {
         succeed: bool,
         create_dest: bool,
         force_dest_size: Option<u64>,
+        mutate_source_to_size: Option<(std::path::PathBuf, u64)>,
     }
 
     impl FileTransfer for MockTransfer {
@@ -705,26 +889,119 @@ mod tests {
                 let size = self.force_dest_size.unwrap_or(source_size);
                 self.fs.insert(dest, size);
             }
+            if let Some((path, size)) = &self.mutate_source_to_size {
+                self.fs.insert(path, *size);
+            }
             Ok(TransferResult { success: true })
+        }
+    }
+
+    struct MockProber {
+        original_path: std::path::PathBuf,
+        original_probe: ProbeResult,
+        output_probe: ProbeResult,
+        health_ok: bool,
+    }
+
+    impl Prober for MockProber {
+        fn probe(&self, path: &Path) -> Result<Option<ProbeResult>> {
+            if path == self.original_path {
+                Ok(Some(self.original_probe.clone()))
+            } else {
+                Ok(Some(self.output_probe.clone()))
+            }
+        }
+
+        fn health_check(&self, _path: &Path) -> Result<bool> {
+            Ok(self.health_ok)
+        }
+    }
+
+    fn bundled_contract() -> PresetContract {
+        PresetContract::resolve(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("AV1_MKV.json"),
+            "AV1_MKV",
+            "av1",
+        )
+        .unwrap()
+    }
+
+    fn probe(codec: &str, format_name: &str) -> ProbeResult {
+        ProbeResult {
+            video_codec: Some(codec.to_string()),
+            stream_bitrate_bps: 0,
+            format_bitrate_bps: 0,
+            size_bytes: 1000,
+            duration_seconds: 100.0,
+            video_stream_count: 1,
+            audio_stream_count: 1,
+            subtitle_stream_count: 0,
+            raw_json: serde_json::json!({
+                "format": {
+                    "format_name": format_name
+                }
+            }),
+        }
+    }
+
+    fn plan<'a>(
+        source: &'a Path,
+        final_path: &'a Path,
+        local_source: &'a Path,
+        local_new: &'a Path,
+        contract: &'a PresetContract,
+    ) -> SafeReplacePlan<'a> {
+        SafeReplacePlan {
+            source_path: source,
+            final_path,
+            new_local_path: local_new,
+            original_local_path: local_source,
+            expected_source: SourceFingerprint {
+                size: 100,
+                mtime: 0.0,
+            },
+            verification_contract: contract,
         }
     }
 
     #[test]
     fn test_safe_replace_success() {
         let fs = Arc::new(MockFs::new());
+        let contract = bundled_contract();
         let source = Path::new("/media/movie.mkv");
+        let local_source = Path::new("/tmp/source.mkv");
         let local_new = Path::new("/tmp/new.mkv");
         fs.insert(source, 100);
+        fs.insert(local_source, 100);
         fs.insert(local_new, 50);
         let transfer = MockTransfer {
             fs: fs.clone(),
             succeed: true,
             create_dest: true,
             force_dest_size: None,
+            mutate_source_to_size: None,
+        };
+        let prober = MockProber {
+            original_path: local_source.to_path_buf(),
+            original_probe: probe("h264", "matroska,webm"),
+            output_probe: probe("av1", "matroska,webm"),
+            health_ok: true,
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
-        assert!(ok);
+        let outcome = safe_replace(
+            fs.as_ref(),
+            &transfer,
+            &prober,
+            &plan(source, source, local_source, local_new, &contract),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SafeReplaceOutcome::Replaced {
+                installed_path: source.to_path_buf()
+            }
+        );
         assert_eq!(fs.file_size(source).unwrap(), 50);
         assert!(!fs.exists(Path::new("/media/movie.mkv.watchdog.old")));
         assert!(!fs.exists(Path::new("/media/movie.mkv.watchdog.tmp")));
@@ -733,49 +1010,92 @@ mod tests {
     #[test]
     fn test_safe_replace_fails_when_temp_missing() {
         let fs = Arc::new(MockFs::new());
+        let contract = bundled_contract();
         let source = Path::new("/media/movie.mkv");
+        let local_source = Path::new("/tmp/source.mkv");
         let local_new = Path::new("/tmp/new.mkv");
         fs.insert(source, 100);
+        fs.insert(local_source, 100);
         fs.insert(local_new, 50);
         let transfer = MockTransfer {
             fs: fs.clone(),
             succeed: true,
             create_dest: false,
             force_dest_size: None,
+            mutate_source_to_size: None,
+        };
+        let prober = MockProber {
+            original_path: local_source.to_path_buf(),
+            original_probe: probe("h264", "matroska,webm"),
+            output_probe: probe("av1", "matroska,webm"),
+            health_ok: true,
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
-        assert!(!ok);
+        let outcome = safe_replace(
+            fs.as_ref(),
+            &transfer,
+            &prober,
+            &plan(source, source, local_source, local_new, &contract),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            SafeReplaceOutcome::Failed(SafeReplaceFailure::TempMissing { .. })
+        ));
         assert_eq!(fs.file_size(source).unwrap(), 100);
     }
 
     #[test]
     fn test_safe_replace_fails_on_size_mismatch() {
         let fs = Arc::new(MockFs::new());
+        let contract = bundled_contract();
         let source = Path::new("/media/movie.mkv");
+        let local_source = Path::new("/tmp/source.mkv");
         let local_new = Path::new("/tmp/new.mkv");
         let tmp_remote = Path::new("/media/movie.mkv.watchdog.tmp");
         fs.insert(source, 100);
+        fs.insert(local_source, 100);
         fs.insert(local_new, 50);
         let transfer = MockTransfer {
             fs: fs.clone(),
             succeed: true,
             create_dest: true,
             force_dest_size: Some(999),
+            mutate_source_to_size: None,
+        };
+        let prober = MockProber {
+            original_path: local_source.to_path_buf(),
+            original_probe: probe("h264", "matroska,webm"),
+            output_probe: probe("av1", "matroska,webm"),
+            health_ok: true,
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
-        assert!(!ok);
+        let outcome = safe_replace(
+            fs.as_ref(),
+            &transfer,
+            &prober,
+            &plan(source, source, local_source, local_new, &contract),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            SafeReplaceOutcome::Failed(SafeReplaceFailure::TempSizeMismatch { .. })
+        ));
         assert!(!fs.exists(tmp_remote));
     }
 
     #[test]
     fn test_safe_replace_rollback_failure_leaves_backup() {
         let fs = Arc::new(MockFs::new());
+        let contract = bundled_contract();
         let source = Path::new("/media/movie.mkv");
+        let local_source = Path::new("/tmp/source.mkv");
         let local_new = Path::new("/tmp/new.mkv");
         let old_remote = Path::new("/media/movie.mkv.watchdog.old");
         fs.insert(source, 100);
+        fs.insert(local_source, 100);
         fs.insert(local_new, 50);
         fs.fail_rename_to(source);
         let transfer = MockTransfer {
@@ -783,12 +1103,114 @@ mod tests {
             succeed: true,
             create_dest: true,
             force_dest_size: None,
+            mutate_source_to_size: None,
+        };
+        let prober = MockProber {
+            original_path: local_source.to_path_buf(),
+            original_probe: probe("h264", "matroska,webm"),
+            output_probe: probe("av1", "matroska,webm"),
+            health_ok: true,
         };
 
-        let ok = safe_replace(fs.as_ref(), &transfer, source, local_new, None).unwrap();
-        assert!(!ok);
+        let outcome = safe_replace(
+            fs.as_ref(),
+            &transfer,
+            &prober,
+            &plan(source, source, local_source, local_new, &contract),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SafeReplaceOutcome::Failed(SafeReplaceFailure::InstallRenameFailed)
+        );
         assert!(!fs.exists(source));
         assert!(fs.exists(old_remote));
+    }
+
+    #[test]
+    fn test_safe_replace_installs_to_new_container_path() {
+        let fs = Arc::new(MockFs::new());
+        let contract = bundled_contract();
+        let source = Path::new("/media/movie.mp4");
+        let final_path = Path::new("/media/movie.mkv");
+        let local_source = Path::new("/tmp/source.mp4");
+        let local_new = Path::new("/tmp/new.av1.mkv");
+        fs.insert(source, 100);
+        fs.insert(local_source, 100);
+        fs.insert(local_new, 50);
+        let transfer = MockTransfer {
+            fs: fs.clone(),
+            succeed: true,
+            create_dest: true,
+            force_dest_size: None,
+            mutate_source_to_size: None,
+        };
+        let prober = MockProber {
+            original_path: local_source.to_path_buf(),
+            original_probe: probe("h264", "mov,mp4,m4a,3gp,3g2,mj2"),
+            output_probe: probe("av1", "matroska,webm"),
+            health_ok: true,
+        };
+
+        let outcome = safe_replace(
+            fs.as_ref(),
+            &transfer,
+            &prober,
+            &plan(source, final_path, local_source, local_new, &contract),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SafeReplaceOutcome::Replaced {
+                installed_path: final_path.to_path_buf()
+            }
+        );
+        assert!(!fs.exists(source));
+        assert_eq!(fs.file_size(final_path).unwrap(), 50);
+    }
+
+    #[test]
+    fn test_safe_replace_preserves_remote_temp_when_source_changes_during_export() {
+        let fs = Arc::new(MockFs::new());
+        let contract = bundled_contract();
+        let source = Path::new("/media/movie.mp4");
+        let final_path = Path::new("/media/movie.mkv");
+        let local_source = Path::new("/tmp/source.mp4");
+        let local_new = Path::new("/tmp/new.av1.mkv");
+        let temp_remote = Path::new("/media/movie.mkv.watchdog.tmp");
+        fs.insert(source, 100);
+        fs.insert(local_source, 100);
+        fs.insert(local_new, 50);
+        let transfer = MockTransfer {
+            fs: fs.clone(),
+            succeed: true,
+            create_dest: true,
+            force_dest_size: None,
+            mutate_source_to_size: Some((source.to_path_buf(), 101)),
+        };
+        let prober = MockProber {
+            original_path: local_source.to_path_buf(),
+            original_probe: probe("h264", "mov,mp4,m4a,3gp,3g2,mj2"),
+            output_probe: probe("av1", "matroska,webm"),
+            health_ok: true,
+        };
+
+        let outcome = safe_replace(
+            fs.as_ref(),
+            &transfer,
+            &prober,
+            &plan(source, final_path, local_source, local_new, &contract),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            SafeReplaceOutcome::Failed(SafeReplaceFailure::SourceChanged { .. })
+        ));
+        assert!(fs.exists(source));
+        assert!(fs.exists(temp_remote));
     }
 
     #[test]
