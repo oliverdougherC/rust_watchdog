@@ -5,6 +5,25 @@ use crate::traits::{FileEntry, FileSystem, Prober};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualSelectionPhase {
+    Discovering,
+    Evaluating,
+    Enqueueing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualSelectionProgress {
+    pub phase: ManualSelectionPhase,
+    pub selected_roots: usize,
+    pub root_index: usize,
+    pub current_root: Option<PathBuf>,
+    pub current_path: Option<PathBuf>,
+    pub discovered_files: usize,
+    pub processed_files: usize,
+    pub queued_candidates: usize,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ManualSelectionSummary {
     pub selected_roots: usize,
@@ -35,11 +54,7 @@ fn share_for_path<'a>(config: &'a Config, path: &Path) -> Option<&'a ShareConfig
         .max_by_key(|share| share.local_mount.len())
 }
 
-fn manual_file_entry(
-    fs: &dyn FileSystem,
-    share: &ShareConfig,
-    path: &Path,
-) -> Option<FileEntry> {
+fn manual_file_entry(fs: &dyn FileSystem, share: &ShareConfig, path: &Path) -> Option<FileEntry> {
     let size = fs.file_size(path).ok()?;
     let mtime = fs.file_mtime(path).ok()?;
     Some(FileEntry {
@@ -57,6 +72,20 @@ pub fn enqueue_manual_paths(
     db: &WatchdogDb,
     paths: &[PathBuf],
 ) -> ManualSelectionSummary {
+    enqueue_manual_paths_with_progress(config, fs, prober, db, paths, |_| {})
+}
+
+pub fn enqueue_manual_paths_with_progress<F>(
+    config: &Config,
+    fs: &dyn FileSystem,
+    prober: &dyn Prober,
+    db: &WatchdogDb,
+    paths: &[PathBuf],
+    mut on_progress: F,
+) -> ManualSelectionSummary
+where
+    F: FnMut(ManualSelectionProgress),
+{
     let mut summary = ManualSelectionSummary {
         selected_roots: paths.len(),
         ..ManualSelectionSummary::default()
@@ -64,8 +93,20 @@ pub fn enqueue_manual_paths(
     let mut seen_paths = HashSet::<PathBuf>::new();
     let mut queue_items = Vec::new();
     let now_ts = chrono::Utc::now().timestamp() as f64;
+    let mut processed_files = 0usize;
 
-    for path in paths {
+    for (idx, path) in paths.iter().enumerate() {
+        on_progress(ManualSelectionProgress {
+            phase: ManualSelectionPhase::Discovering,
+            selected_roots: paths.len(),
+            root_index: idx + 1,
+            current_root: Some(path.clone()),
+            current_path: None,
+            discovered_files: summary.discovered_files,
+            processed_files,
+            queued_candidates: queue_items.len(),
+        });
+
         let Some(share) = share_for_path(config, path) else {
             summary.skipped_missing += 1;
             continue;
@@ -97,45 +138,74 @@ pub fn enqueue_manual_paths(
                 continue;
             }
             summary.discovered_files += 1;
+            let path_string = entry.path.to_string_lossy().to_string();
 
             let file_age_secs = (now_ts - entry.mtime).max(0.0);
             if file_age_secs < config.safety.min_file_age_seconds as f64 {
                 summary.skipped_young += 1;
-                continue;
-            }
-
-            let path_string = entry.path.to_string_lossy().to_string();
-            if db.is_quarantined(&path_string) {
+            } else if db.is_quarantined(&path_string) {
                 summary.skipped_quarantined += 1;
-                continue;
-            }
-            if let Some(failure_state) = db.get_file_failure_state(&path_string) {
-                if failure_state.next_eligible_at > now_ts as i64 {
+            } else {
+                let in_cooldown = db
+                    .get_file_failure_state(&path_string)
+                    .is_some_and(|failure_state| failure_state.next_eligible_at > now_ts as i64);
+                if in_cooldown {
                     summary.skipped_cooldown += 1;
-                    continue;
+                } else {
+                    let probe = match prober.probe(&entry.path) {
+                        Ok(Some(probe)) => probe,
+                        _ => {
+                            summary.skipped_probe_failed += 1;
+                            processed_files += 1;
+                            on_progress(ManualSelectionProgress {
+                                phase: ManualSelectionPhase::Evaluating,
+                                selected_roots: paths.len(),
+                                root_index: idx + 1,
+                                current_root: Some(path.clone()),
+                                current_path: Some(entry.path.clone()),
+                                discovered_files: summary.discovered_files,
+                                processed_files,
+                                queued_candidates: queue_items.len(),
+                            });
+                            continue;
+                        }
+                    };
+                    let eval = evaluate_transcode_need(&probe, &config.transcode);
+                    if !eval.needs_transcode {
+                        summary.skipped_ineligible += 1;
+                    } else {
+                        queue_items.push(NewQueueItem {
+                            source_path: path_string,
+                            share_name: entry.share_name.clone(),
+                            enqueue_source: "manual".to_string(),
+                        });
+                    }
                 }
             }
-
-            let probe = match prober.probe(&entry.path) {
-                Ok(Some(probe)) => probe,
-                _ => {
-                    summary.skipped_probe_failed += 1;
-                    continue;
-                }
-            };
-            let eval = evaluate_transcode_need(&probe, &config.transcode);
-            if !eval.needs_transcode {
-                summary.skipped_ineligible += 1;
-                continue;
-            }
-
-            queue_items.push(NewQueueItem {
-                source_path: path_string,
-                share_name: entry.share_name.clone(),
-                enqueue_source: "manual".to_string(),
+            processed_files += 1;
+            on_progress(ManualSelectionProgress {
+                phase: ManualSelectionPhase::Evaluating,
+                selected_roots: paths.len(),
+                root_index: idx + 1,
+                current_root: Some(path.clone()),
+                current_path: Some(entry.path.clone()),
+                discovered_files: summary.discovered_files,
+                processed_files,
+                queued_candidates: queue_items.len(),
             });
         }
     }
+
+    on_progress(ManualSelectionProgress {
+        phase: ManualSelectionPhase::Enqueueing,
+        selected_roots: paths.len(),
+        root_index: paths.len(),
+        current_root: paths.last().cloned(),
+        current_path: None,
+        discovered_files: summary.discovered_files,
+        processed_files,
+        queued_candidates: queue_items.len(),
+    });
 
     let inserted = db.enqueue_queue_items(&queue_items);
     summary.enqueued_files = inserted;
@@ -149,8 +219,8 @@ mod tests {
     use crate::config::ShareConfig;
     use crate::db::WatchdogDb;
     use crate::error::{Result, WatchdogError};
-    use crate::traits::{ProbeResult, Prober};
     use crate::traits::FileSystem;
+    use crate::traits::{ProbeResult, Prober};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -201,7 +271,9 @@ mod tests {
                 .unwrap()
                 .get(path)
                 .map(|(size, _)| *size)
-                .ok_or_else(|| WatchdogError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")))
+                .ok_or_else(|| {
+                    WatchdogError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                })
         }
 
         fn file_mtime(&self, path: &Path) -> Result<f64> {
@@ -210,7 +282,9 @@ mod tests {
                 .unwrap()
                 .get(path)
                 .map(|(_, mtime)| *mtime)
-                .ok_or_else(|| WatchdogError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")))
+                .ok_or_else(|| {
+                    WatchdogError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                })
         }
 
         fn exists(&self, path: &Path) -> bool {
@@ -259,7 +333,11 @@ mod tests {
             } else {
                 "av1"
             };
-            let bitrate = if codec == "h264" { 50_000_000 } else { 5_000_000 };
+            let bitrate = if codec == "h264" {
+                50_000_000
+            } else {
+                5_000_000
+            };
             Ok(Some(ProbeResult {
                 video_codec: Some(codec.to_string()),
                 stream_bitrate_bps: 0,
@@ -297,13 +375,8 @@ mod tests {
         fs.insert("/mnt/movies/already-av1.mkv", 10, 1.0);
         let db = WatchdogDb::open_in_memory().unwrap();
 
-        let summary = enqueue_manual_paths(
-            &cfg,
-            &fs,
-            &TestProber,
-            &db,
-            &[PathBuf::from("/mnt/movies")],
-        );
+        let summary =
+            enqueue_manual_paths(&cfg, &fs, &TestProber, &db, &[PathBuf::from("/mnt/movies")]);
 
         assert_eq!(summary.discovered_files, 2);
         assert_eq!(summary.enqueued_files, 1);
@@ -337,5 +410,37 @@ mod tests {
         assert_eq!(first.enqueued_files, 1);
         assert_eq!(second.enqueued_files, 0);
         assert!(second.skipped_duplicates >= 1);
+    }
+
+    #[test]
+    fn manual_selection_reports_progress_for_folder_expansion() {
+        let cfg = config();
+        let fs = TestFs::new();
+        fs.insert("/mnt/movies/needs-a.mkv", 10, 1.0);
+        fs.insert("/mnt/movies/needs-b.mkv", 10, 1.0);
+        let db = WatchdogDb::open_in_memory().unwrap();
+        let mut progress = Vec::new();
+
+        let summary = enqueue_manual_paths_with_progress(
+            &cfg,
+            &fs,
+            &TestProber,
+            &db,
+            &[PathBuf::from("/mnt/movies")],
+            |update| progress.push(update),
+        );
+
+        assert_eq!(summary.enqueued_files, 2);
+        assert!(progress
+            .iter()
+            .any(|update| update.phase == ManualSelectionPhase::Discovering));
+        assert!(progress.iter().any(|update| {
+            update.phase == ManualSelectionPhase::Evaluating
+                && update.discovered_files == 2
+                && update.processed_files == 2
+        }));
+        assert!(progress
+            .iter()
+            .any(|update| update.phase == ManualSelectionPhase::Enqueueing));
     }
 }

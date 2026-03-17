@@ -535,7 +535,7 @@ fn render_recent_activity(f: &mut Frame, area: Rect, state: &AppState) {
                 .map(|(reason, count)| format!("{} ({})", reason, count))
                 .collect::<Vec<_>>()
                 .join(", ");
-            header_lines.push(format!("Top failure reasons: {}", summary));
+            header_lines.push(format!("Top historical failure reasons: {}", summary));
         }
         if state.scan_timeout_count > 0 {
             header_lines.push(format!(

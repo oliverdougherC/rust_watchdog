@@ -7,10 +7,15 @@ pub mod widgets;
 
 use crate::config::Config;
 use crate::db::{ServiceState, WatchdogDb};
-use crate::event_journal::{append_event, append_log_event, read_recent_log_lines};
+use crate::event_journal::{
+    append_event, append_log_event, read_recent_log_lines_for_current_session,
+};
 use crate::probe::FfprobeProber;
 use crate::scanner::RealFileSystem;
-use crate::selection::enqueue_manual_paths;
+use crate::selection::{
+    enqueue_manual_paths_with_progress, ManualSelectionPhase, ManualSelectionProgress,
+    ManualSelectionSummary,
+};
 use crate::state::{AppState, PipelinePhase, ProgressStage, RunMode};
 use crate::status_snapshot::read_snapshot_file;
 use crate::traits::FileSystem;
@@ -33,6 +38,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, VecDeque};
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -235,7 +241,10 @@ impl BrowserState {
             self.current_dir = None;
         } else {
             self.current_dir = current.parent().map(Path::to_path_buf);
-            if self.current_dir.as_ref().is_some_and(|dir| dir == &share_root.parent().unwrap_or(Path::new("/")).to_path_buf() && !dir.starts_with(&share_root)) {
+            if self.current_dir.as_ref().is_some_and(|dir| {
+                dir == &share_root.parent().unwrap_or(Path::new("/")).to_path_buf()
+                    && !dir.starts_with(&share_root)
+            }) {
                 self.current_dir = Some(share_root);
             }
         }
@@ -295,6 +304,17 @@ impl QuitChoice {
     }
 }
 
+enum SelectionTaskUpdate {
+    Progress(ManualSelectionProgress),
+    Finished(ManualSelectionSummary),
+}
+
+struct SelectionTaskState {
+    rx: Receiver<SelectionTaskUpdate>,
+    latest_progress: ManualSelectionProgress,
+    started_at: Instant,
+}
+
 struct TuiApp {
     current_tab: Tab,
     logs_state: logs_tab::LogsTabState,
@@ -311,6 +331,7 @@ struct TuiApp {
     auto_opened_browser: bool,
     status_message: Option<String>,
     attach_hint: String,
+    selection_task: Option<SelectionTaskState>,
 }
 
 impl TuiApp {
@@ -331,6 +352,7 @@ impl TuiApp {
             auto_opened_browser: false,
             status_message: None,
             attach_hint,
+            selection_task: None,
         }
     }
 }
@@ -377,24 +399,26 @@ async fn run_tui_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut TuiApp,
     config: &Config,
-    db: &WatchdogDb,
+    db: &Arc<WatchdogDb>,
     snapshot_path: &Path,
     event_journal_path: &Path,
     tick_rate: Duration,
 ) -> anyhow::Result<()> {
     loop {
-        refresh_runtime_state(app, db, snapshot_path, event_journal_path);
+        refresh_runtime_state(app, db.as_ref(), snapshot_path, event_journal_path);
+        poll_selection_task(app, db.as_ref(), event_journal_path);
 
         if app.last_db_refresh.elapsed() > Duration::from_secs(2) {
-            app.history_state.refresh(db);
-            app.cooldown_state.refresh(db);
-            app.queue_state.refresh(db);
+            app.history_state.refresh(db.as_ref());
+            app.cooldown_state.refresh(db.as_ref());
+            app.queue_state.refresh(db.as_ref());
             app.last_db_refresh = Instant::now();
         }
 
         if !app.auto_opened_browser
             && matches!(app.current_state.run_mode, RunMode::Precision)
             && db.get_queue_count() == 0
+            && app.selection_task.is_none()
         {
             app.browser = Some(BrowserState::new(config));
             app.auto_opened_browser = true;
@@ -440,6 +464,63 @@ fn refresh_runtime_state(
         event_journal_path,
         worker_pid,
     );
+}
+
+fn poll_selection_task(app: &mut TuiApp, db: &WatchdogDb, event_journal_path: &Path) {
+    let mut latest_progress = None;
+    let mut completion = None;
+    let mut disconnected = false;
+
+    if let Some(task) = app.selection_task.as_mut() {
+        loop {
+            match task.rx.try_recv() {
+                Ok(SelectionTaskUpdate::Progress(progress)) => latest_progress = Some(progress),
+                Ok(SelectionTaskUpdate::Finished(summary)) => completion = Some(summary),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if let Some(progress) = latest_progress {
+            task.latest_progress = progress;
+        }
+    }
+
+    if let Some(summary) = completion {
+        let message = format_manual_selection_message(&summary);
+        append_client_log(event_journal_path, "INFO", &message);
+        append_event(
+            Some(event_journal_path),
+            "manual_selection",
+            json!({
+                "selected_roots": summary.selected_roots,
+                "discovered_files": summary.discovered_files,
+                "enqueued_files": summary.enqueued_files,
+                "skipped_duplicates": summary.skipped_duplicates,
+                "skipped_ineligible": summary.skipped_ineligible,
+                "skipped_cooldown": summary.skipped_cooldown,
+                "skipped_quarantined": summary.skipped_quarantined,
+                "skipped_young": summary.skipped_young,
+                "skipped_missing": summary.skipped_missing,
+                "skipped_non_video": summary.skipped_non_video,
+                "skipped_probe_failed": summary.skipped_probe_failed,
+            }),
+        );
+        app.status_message = Some(message);
+        app.browser = None;
+        app.queue_state.refresh(db);
+        app.last_db_refresh = Instant::now();
+        app.selection_task = None;
+        return;
+    }
+
+    if disconnected {
+        app.status_message = Some("Manual selection stopped unexpectedly".to_string());
+        app.selection_task = None;
+    }
 }
 
 fn state_from_runtime(
@@ -535,10 +616,7 @@ fn state_from_runtime(
                 .get("transcoded")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            state.total_inspected = totals
-                .get("inspected")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            state.total_inspected = totals.get("inspected").and_then(Value::as_u64).unwrap_or(0);
             state.total_space_saved = totals
                 .get("space_saved_bytes")
                 .and_then(Value::as_i64)
@@ -597,7 +675,8 @@ fn state_from_runtime(
             state.consecutive_pass_failures = reliability
                 .get("consecutive_pass_failures")
                 .and_then(Value::as_u64)
-                .unwrap_or(state.consecutive_pass_failures as u64) as u32;
+                .unwrap_or(state.consecutive_pass_failures as u64)
+                as u32;
             state.auto_paused = reliability
                 .get("auto_paused")
                 .and_then(Value::as_bool)
@@ -621,13 +700,11 @@ fn state_from_runtime(
             .get("top_failure_reasons")
             .and_then(Value::as_array)
             .map(|items| {
-                items.iter()
+                items
+                    .iter()
                     .filter_map(|item| {
                         let pair = item.as_array()?;
-                        Some((
-                            pair.first()?.as_str()?.to_string(),
-                            pair.get(1)?.as_u64()?,
-                        ))
+                        Some((pair.first()?.as_str()?.to_string(), pair.get(1)?.as_u64()?))
                     })
                     .collect::<Vec<_>>()
             })
@@ -636,7 +713,8 @@ fn state_from_runtime(
             .get("share_health")
             .and_then(Value::as_array)
             .map(|items| {
-                items.iter()
+                items
+                    .iter()
                     .filter_map(|item| {
                         Some((
                             item.get("name")?.as_str()?.to_string(),
@@ -670,7 +748,7 @@ fn state_from_runtime(
         state.transcode_eta.clear();
     }
 
-    state.log_lines = read_recent_log_lines(event_journal_path, 500)
+    state.log_lines = read_recent_log_lines_for_current_session(event_journal_path, 500)
         .into_iter()
         .collect::<VecDeque<_>>();
 
@@ -720,15 +798,57 @@ fn append_client_log(event_journal_path: &Path, level: &str, message: &str) {
     append_log_event(Some(event_journal_path), level, message, &line);
 }
 
+fn start_manual_selection_task(
+    app: &mut TuiApp,
+    config: &Config,
+    db: &Arc<WatchdogDb>,
+    selected: Vec<PathBuf>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let config = config.clone();
+    let db = db.clone();
+    let initial_progress = ManualSelectionProgress {
+        phase: ManualSelectionPhase::Discovering,
+        selected_roots: selected.len(),
+        root_index: 1,
+        current_root: selected.first().cloned(),
+        current_path: None,
+        discovered_files: 0,
+        processed_files: 0,
+        queued_candidates: 0,
+    };
+
+    std::thread::spawn(move || {
+        let tx_progress = tx.clone();
+        let summary = enqueue_manual_paths_with_progress(
+            &config,
+            &RealFileSystem,
+            &FfprobeProber,
+            db.as_ref(),
+            &selected,
+            |progress| {
+                let _ = tx_progress.send(SelectionTaskUpdate::Progress(progress));
+            },
+        );
+        let _ = tx.send(SelectionTaskUpdate::Finished(summary));
+    });
+
+    app.selection_task = Some(SelectionTaskState {
+        rx,
+        latest_progress: initial_progress,
+        started_at: Instant::now(),
+    });
+}
+
 fn handle_key_event(
     app: &mut TuiApp,
     config: &Config,
-    db: &WatchdogDb,
+    db: &Arc<WatchdogDb>,
     event_journal_path: &Path,
     code: KeyCode,
 ) -> anyhow::Result<bool> {
     if app.show_quit_modal {
-        return handle_quit_modal_key(app, db, event_journal_path, code);
+        return handle_quit_modal_key(app, db.as_ref(), event_journal_path, code);
     }
 
     if app.browser.is_some() {
@@ -737,6 +857,11 @@ fn handle_key_event(
 
     match code {
         KeyCode::Char('q') | KeyCode::Esc => {
+            if app.selection_task.is_some() {
+                app.status_message =
+                    Some("Manual selection is still scanning; wait for it to finish.".to_string());
+                return Ok(false);
+            }
             if app.worker_pid.is_some() {
                 app.show_quit_modal = true;
                 app.quit_choice = QuitChoice::Background;
@@ -751,7 +876,13 @@ fn handle_key_event(
         KeyCode::Char('4') => app.current_tab = Tab::History,
         KeyCode::Char('5') => app.current_tab = Tab::Cooldown,
         KeyCode::Tab => app.current_tab = app.current_tab.next(),
-        KeyCode::Char('b') => app.browser = Some(BrowserState::new(config)),
+        KeyCode::Char('b') => {
+            if app.selection_task.is_some() {
+                app.status_message = Some("Manual selection is already scanning.".to_string());
+            } else {
+                app.browser = Some(BrowserState::new(config));
+            }
+        }
         KeyCode::Char('j') | KeyCode::Down => match app.current_tab {
             Tab::Logs => app.logs_state.scroll_down(),
             Tab::History => app.history_state.scroll_down(),
@@ -794,50 +925,56 @@ fn handle_key_event(
 fn handle_browser_key(
     app: &mut TuiApp,
     config: &Config,
-    db: &WatchdogDb,
-    event_journal_path: &Path,
+    db: &Arc<WatchdogDb>,
+    _event_journal_path: &Path,
     code: KeyCode,
 ) -> anyhow::Result<bool> {
-    let Some(browser) = app.browser.as_mut() else {
+    if app.selection_task.is_some() {
+        if matches!(code, KeyCode::Esc) {
+            app.browser = None;
+        }
         return Ok(false);
-    };
+    }
 
     match code {
         KeyCode::Esc => app.browser = None,
-        KeyCode::Char('j') | KeyCode::Down => browser.move_down(),
-        KeyCode::Char('k') | KeyCode::Up => browser.move_up(),
-        KeyCode::Enter => browser.descend_or_toggle(config),
-        KeyCode::Char(' ') => browser.toggle_current_target(),
-        KeyCode::Backspace => browser.go_up(config),
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(browser) = app.browser.as_mut() {
+                browser.move_down();
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(browser) = app.browser.as_mut() {
+                browser.move_up();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(browser) = app.browser.as_mut() {
+                browser.descend_or_toggle(config);
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(browser) = app.browser.as_mut() {
+                browser.toggle_current_target();
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(browser) = app.browser.as_mut() {
+                browser.go_up(config);
+            }
+        }
         KeyCode::Char('a') => {
-            let selected = browser
-                .selected_targets
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            let summary = enqueue_manual_paths(config, &RealFileSystem, &FfprobeProber, db, &selected);
-            let message = format_manual_selection_message(&summary);
-            append_client_log(event_journal_path, "INFO", &message);
-            append_event(
-                Some(event_journal_path),
-                "manual_selection",
-                json!({
-                    "selected_roots": summary.selected_roots,
-                    "discovered_files": summary.discovered_files,
-                    "enqueued_files": summary.enqueued_files,
-                    "skipped_duplicates": summary.skipped_duplicates,
-                    "skipped_ineligible": summary.skipped_ineligible,
-                    "skipped_cooldown": summary.skipped_cooldown,
-                    "skipped_quarantined": summary.skipped_quarantined,
-                    "skipped_young": summary.skipped_young,
-                    "skipped_missing": summary.skipped_missing,
-                    "skipped_non_video": summary.skipped_non_video,
-                    "skipped_probe_failed": summary.skipped_probe_failed,
-                }),
-            );
-            app.status_message = Some(message);
-            app.browser = None;
-            app.queue_state.refresh(db);
+            let selected = app
+                .browser
+                .as_ref()
+                .map(|browser| browser.selected_targets.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if selected.is_empty() {
+                app.status_message =
+                    Some("Select at least one file or folder before adding.".to_string());
+            } else {
+                start_manual_selection_task(app, config, db, selected);
+            }
         }
         _ => {}
     }
@@ -867,7 +1004,14 @@ fn handle_quit_modal_key(
         _ => return Ok(false),
     }
 
-    if !matches!(code, KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('b') | KeyCode::Char('k') | KeyCode::Char('c')) {
+    if !matches!(
+        code,
+        KeyCode::Enter
+            | KeyCode::Char('q')
+            | KeyCode::Char('b')
+            | KeyCode::Char('k')
+            | KeyCode::Char('c')
+    ) {
         return Ok(false);
     }
 
@@ -913,11 +1057,11 @@ fn handle_quit_modal_key(
     }
 }
 
-fn format_manual_selection_message(
-    summary: &crate::selection::ManualSelectionSummary,
-) -> String {
+fn format_manual_selection_message(summary: &crate::selection::ManualSelectionSummary) -> String {
     format!(
-        "Manual selection: added={} duplicates={} ineligible={} cooldown={} quarantined={} young={} missing={} non_video={} probe_failed={}",
+        "Manual selection: selected={} discovered={} added={} duplicates={} ineligible={} cooldown={} quarantined={} young={} missing={} non_video={} probe_failed={}",
+        summary.selected_roots,
+        summary.discovered_files,
         summary.enqueued_files,
         summary.skipped_duplicates,
         summary.skipped_ineligible,
@@ -930,25 +1074,103 @@ fn format_manual_selection_message(
     )
 }
 
+fn manual_selection_progress_message(progress: &ManualSelectionProgress, spinner: &str) -> String {
+    match progress.phase {
+        ManualSelectionPhase::Discovering => format!(
+            "{} Scanning selection {}/{}: {}",
+            spinner,
+            progress.root_index.max(1),
+            progress.selected_roots.max(1),
+            progress
+                .current_root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "pending".to_string())
+        ),
+        ManualSelectionPhase::Evaluating => format!(
+            "{} Reviewing selected files: {} processed / {} discovered / {} queued",
+            spinner,
+            progress.processed_files,
+            progress.discovered_files,
+            progress.queued_candidates
+        ),
+        ManualSelectionPhase::Enqueueing => format!(
+            "{} Adding {} file(s) to the queue...",
+            spinner, progress.queued_candidates
+        ),
+    }
+}
+
+fn manual_selection_browser_line(progress: &ManualSelectionProgress, spinner: &str) -> String {
+    match progress.phase {
+        ManualSelectionPhase::Discovering => format!(
+            "{} scanning {}/{} {}",
+            spinner,
+            progress.root_index.max(1),
+            progress.selected_roots.max(1),
+            progress
+                .current_root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "pending".to_string())
+        ),
+        ManualSelectionPhase::Evaluating => format!(
+            "{} checked {}/{} queued={} {}",
+            spinner,
+            progress.processed_files,
+            progress.discovered_files.max(progress.processed_files),
+            progress.queued_candidates,
+            progress
+                .current_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+        ManualSelectionPhase::Enqueueing => {
+            format!(
+                "{} adding {} file(s) to queue",
+                spinner, progress.queued_candidates
+            )
+        }
+    }
+}
+
+fn activity_spinner(started_at: Instant) -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let frame = ((started_at.elapsed().as_millis() / 125) % FRAMES.len() as u128) as usize;
+    FRAMES[frame]
+}
+
 fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
     let size = f.area();
     let outer_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
         .split(size);
 
     render_title_bar(f, outer_chunks[0], app);
     match app.current_tab {
         Tab::Dashboard => dashboard_tab::render_dashboard(f, outer_chunks[1], &app.current_state),
         Tab::Queue => queue_tab::render_queue(f, outer_chunks[1], &mut app.queue_state),
-        Tab::Logs => logs_tab::render_logs(f, outer_chunks[1], &app.current_state, &mut app.logs_state),
+        Tab::Logs => {
+            logs_tab::render_logs(f, outer_chunks[1], &app.current_state, &mut app.logs_state)
+        }
         Tab::History => history_tab::render_history(f, outer_chunks[1], &mut app.history_state),
         Tab::Cooldown => cooldown_tab::render_cooldown(f, outer_chunks[1], &mut app.cooldown_state),
     }
     render_footer(f, outer_chunks[2], app);
 
+    let browser_progress = app
+        .selection_task
+        .as_ref()
+        .map(|task| (task.latest_progress.clone(), task.started_at));
     if let Some(browser) = app.browser.as_mut() {
-        render_browser_modal(f, size, browser);
+        render_browser_modal(f, size, browser, browser_progress.as_ref());
     }
     if app.show_quit_modal {
         render_quit_modal(f, size, app);
@@ -985,7 +1207,9 @@ fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
-    let help = if app.browser.is_some() {
+    let help = if app.browser.is_some() && app.selection_task.is_some() {
+        selection_help_line(area.width)
+    } else if app.browser.is_some() {
         browser_help_line(area.width)
     } else {
         main_help_line(area.width)
@@ -997,10 +1221,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
         .split(area);
     f.render_widget(Paragraph::new(help), footer[0]);
 
-    let status_line = app
-        .status_message
-        .clone()
-        .unwrap_or_else(|| format!("Reattach with {}", app.attach_hint));
+    let status_line = if let Some(task) = app.selection_task.as_ref() {
+        manual_selection_progress_message(&task.latest_progress, activity_spinner(task.started_at))
+    } else {
+        app.status_message
+            .clone()
+            .unwrap_or_else(|| format!("Reattach with {}", app.attach_hint))
+    };
     f.render_widget(
         Paragraph::new(status_line).style(Style::default().fg(Color::DarkGray)),
         footer[1],
@@ -1012,18 +1239,65 @@ fn browser_help_line(width: u16) -> Line<'static> {
         Line::from("j/k move  Enter open  Space select  a add  Esc close")
     } else {
         Line::from(vec![
-            Span::styled(" j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " j/k",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":move  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":open/toggle  "),
-            Span::styled("Space", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Space",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":select  "),
-            Span::styled("Backspace", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Backspace",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":up  "),
-            Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":add queue  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":close"),
+        ])
+    }
+}
+
+fn selection_help_line(width: u16) -> Line<'static> {
+    if width < 72 {
+        Line::from("Manual selection scan running  Esc hide")
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":hide browser  "),
+            Span::raw("Manual selection scan is still running"),
         ])
     }
 }
@@ -1033,28 +1307,61 @@ fn main_help_line(width: u16) -> Line<'static> {
         Line::from("q quit  1-5 tabs  b browse  j/k scroll  f log-filter")
     } else {
         Line::from(vec![
-            Span::styled(" q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " q",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":quit  "),
-            Span::styled("1-5", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "1-5",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":tabs  "),
-            Span::styled("b", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "b",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":browse  "),
-            Span::styled("j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "j/k",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":scroll  "),
-            Span::styled("f", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "f",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(":log-filter"),
         ])
     }
 }
 
-fn render_browser_modal(f: &mut Frame, area: Rect, browser: &mut BrowserState) {
+fn render_browser_modal(
+    f: &mut Frame,
+    area: Rect,
+    browser: &mut BrowserState,
+    selection_progress: Option<&(ManualSelectionProgress, Instant)>,
+) {
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
 
     let title = if let Some(dir) = browser.current_dir.as_ref() {
         format!(
             " Browse {} ",
-            truncate_left(&dir.display().to_string(), popup.width.saturating_sub(14) as usize)
+            truncate_left(
+                &dir.display().to_string(),
+                popup.width.saturating_sub(14) as usize
+            )
         )
     } else {
         " Browse Shares ".to_string()
@@ -1065,7 +1372,24 @@ fn render_browser_modal(f: &mut Frame, area: Rect, browser: &mut BrowserState) {
         .border_style(Style::default().fg(Color::LightBlue));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let visible_rows = inner.height as usize;
+    let sections = if selection_progress.is_some() && inner.height > 1 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1)])
+            .split(inner)
+    };
+    let list_area = sections[0];
+    let progress_area = if sections.len() > 1 {
+        Some(sections[1])
+    } else {
+        None
+    };
+    let visible_rows = list_area.height as usize;
     browser.ensure_visible(visible_rows);
 
     let items = browser
@@ -1087,12 +1411,25 @@ fn render_browser_modal(f: &mut Frame, area: Rect, browser: &mut BrowserState) {
                     .add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
             ListItem::new(Line::from(Span::styled(
-                truncate_right(&format!("{} {}", marker, entry.label), inner.width as usize),
+                truncate_right(
+                    &format!("{} {}", marker, entry.label),
+                    list_area.width as usize,
+                ),
                 style,
             )))
         })
         .collect::<Vec<_>>();
-    f.render_widget(List::new(items), inner);
+    f.render_widget(List::new(items), list_area);
+
+    if let (Some((progress, started_at)), Some(progress_area)) = (selection_progress, progress_area)
+    {
+        let line = manual_selection_browser_line(progress, activity_spinner(*started_at));
+        f.render_widget(
+            Paragraph::new(truncate_right(&line, progress_area.width as usize))
+                .style(Style::default().fg(Color::DarkGray)),
+            progress_area,
+        );
+    }
 }
 
 fn render_quit_modal(f: &mut Frame, area: Rect, app: &TuiApp) {
@@ -1108,7 +1445,11 @@ fn render_quit_modal(f: &mut Frame, area: Rect, app: &TuiApp) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
         .split(inner);
 
     let pid_text = app

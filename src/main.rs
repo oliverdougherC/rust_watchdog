@@ -14,8 +14,8 @@ use watchdog::event_journal::{append_event, resolve_event_journal_path};
 use watchdog::in_use::CommandInUseDetector;
 use watchdog::nfs::SystemMountManager;
 use watchdog::pipeline::{run_pipeline_loop, set_tui_log_event_path, PipelineDeps};
-use watchdog::process::terminate_registered_subprocesses;
 use watchdog::probe::FfprobeProber;
+use watchdog::process::terminate_registered_subprocesses;
 use watchdog::process::{
     describe_exit_status, format_command_for_log, run_command, summarize_output_tail, RunOptions,
 };
@@ -743,6 +743,14 @@ async fn run() -> anyhow::Result<()> {
             db.reset_stale_queue_items();
             db.set_worker_state(std::process::id(), requested_run_mode.as_str());
             set_tui_log_event_path(Some(runtime_paths.event_journal.clone()));
+            append_event(
+                Some(&runtime_paths.event_journal),
+                "session_start",
+                json!({
+                    "pid": std::process::id(),
+                    "run_mode": requested_run_mode.as_str(),
+                }),
+            );
         }
 
         let snapshot_handle = if !cli.dry_run {
@@ -836,15 +844,14 @@ async fn run() -> anyhow::Result<()> {
         pipeline_result.with_context(|| {
             format!(
                 "Pipeline loop failed (headless={}, dry_run={}, once={}, run_mode={})",
-                cli.headless,
-                cli.dry_run,
-                cli.once,
-                requested_run_mode
+                cli.headless, cli.dry_run, cli.once, requested_run_mode
             )
         })?;
     } else {
         let service_state = db.get_service_state();
-        let live_worker_pid = service_state.worker_pid.filter(|pid| util::pid_is_running(*pid));
+        let live_worker_pid = service_state
+            .worker_pid
+            .filter(|pid| util::pid_is_running(*pid));
         let active_run_mode = match service_state.worker_run_mode.as_deref() {
             Some("precision") => RunMode::Precision,
             _ => RunMode::Watchdog,

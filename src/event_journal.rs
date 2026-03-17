@@ -109,3 +109,67 @@ pub fn read_recent_log_lines(path: &Path, limit: usize) -> Vec<String> {
 
     lines.into_iter().collect()
 }
+
+pub fn read_recent_log_lines_for_current_session(path: &Path, limit: usize) -> Vec<String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let mut lines = VecDeque::with_capacity(limit.max(1));
+
+    for raw_line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&raw_line) else {
+            continue;
+        };
+        match value.get("event").and_then(Value::as_str) {
+            Some("session_start") => {
+                lines.clear();
+            }
+            Some("log") => {
+                let rendered = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("line"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let Some(rendered) = rendered else {
+                    continue;
+                };
+                if lines.len() >= limit.max(1) {
+                    lines.pop_front();
+                }
+                lines.push_back(rendered);
+            }
+            _ => {}
+        }
+    }
+
+    lines.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn current_session_logs_ignore_previous_runs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.ndjson");
+
+        append_log_event(Some(&path), "INFO", "old", "old log");
+        append_event(
+            Some(&path),
+            "session_start",
+            json!({"pid": 100, "run_mode": "watchdog"}),
+        );
+        append_log_event(Some(&path), "INFO", "new-1", "new log 1");
+        append_log_event(Some(&path), "INFO", "new-2", "new log 2");
+
+        let lines = read_recent_log_lines_for_current_session(&path, 10);
+        assert_eq!(
+            lines,
+            vec!["new log 1".to_string(), "new log 2".to_string()]
+        );
+    }
+}
