@@ -14,6 +14,7 @@ use watchdog::event_journal::{append_event, resolve_event_journal_path};
 use watchdog::in_use::CommandInUseDetector;
 use watchdog::nfs::SystemMountManager;
 use watchdog::pipeline::{run_pipeline_loop, set_tui_log_event_path, PipelineDeps};
+use watchdog::process::terminate_registered_subprocesses;
 use watchdog::probe::FfprobeProber;
 use watchdog::process::{
     describe_exit_status, format_command_for_log, run_command, summarize_output_tail, RunOptions,
@@ -771,11 +772,28 @@ async fn run() -> anyhow::Result<()> {
                         None
                     }
                 };
-
             if let Some(sigterm) = sigterm.as_mut() {
-                tokio::select! {
-                    _ = sigterm.recv() => info!("Received SIGTERM"),
-                    _ = tokio::signal::ctrl_c() => info!("Received SIGINT"),
+                let mut shutdown_signalled = false;
+                loop {
+                    tokio::select! {
+                        _ = sigterm.recv() => {
+                            if shutdown_signalled {
+                                info!("Received follow-up SIGTERM force-stop request");
+                                terminate_registered_subprocesses(Duration::from_millis(250));
+                                break;
+                            }
+                            info!("Received SIGTERM");
+                            info!("Signalling pipeline shutdown...");
+                            let _ = signal_shutdown_tx.send(());
+                            shutdown_signalled = true;
+                        },
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("Received SIGINT");
+                            info!("Signalling pipeline shutdown...");
+                            let _ = signal_shutdown_tx.send(());
+                            break;
+                        },
+                    }
                 }
             } else {
                 match tokio::signal::ctrl_c().await {
@@ -785,9 +803,9 @@ async fn run() -> anyhow::Result<()> {
                         return;
                     }
                 }
+                info!("Signalling pipeline shutdown...");
+                let _ = signal_shutdown_tx.send(());
             }
-            info!("Signalling pipeline shutdown...");
-            let _ = signal_shutdown_tx.send(());
         });
 
         let pipeline_result = run_pipeline_loop(

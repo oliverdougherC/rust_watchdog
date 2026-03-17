@@ -2,7 +2,7 @@ use crate::error::{Result, WatchdogError};
 use crate::probe::{verify_transcode, VerificationFailure, VerificationOutcome};
 use crate::process::{
     configure_subprocess_group, describe_exit_status, format_command_for_log, infer_failure_hint,
-    summarize_output_tail, terminate_subprocess,
+    register_subprocess, summarize_output_tail, terminate_subprocess,
 };
 use crate::traits::{
     FileSystem, FileTransfer, Prober, TransferProgress, TransferResult, TransferStage,
@@ -323,6 +323,7 @@ impl FileTransfer for RsyncTransfer {
             path: source.to_path_buf(),
             reason: format!("Failed to execute rsync command `{}`: {}", command_repr, e),
         })?;
+        let _child_registration = register_subprocess(child.id());
 
         let stdout = child.stdout.take().ok_or_else(|| WatchdogError::Transfer {
             path: source.to_path_buf(),

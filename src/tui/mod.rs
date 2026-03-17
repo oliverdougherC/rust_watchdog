@@ -90,6 +90,7 @@ struct BrowserState {
     current_dir: Option<PathBuf>,
     entries: Vec<BrowserEntry>,
     selected_index: usize,
+    scroll_offset: usize,
     selected_targets: BTreeSet<PathBuf>,
 }
 
@@ -99,6 +100,7 @@ impl BrowserState {
             current_dir: None,
             entries: Vec::new(),
             selected_index: 0,
+            scroll_offset: 0,
             selected_targets: BTreeSet::new(),
         };
         browser.refresh_entries(config);
@@ -168,6 +170,11 @@ impl BrowserState {
         if self.selected_index >= self.entries.len() {
             self.selected_index = self.entries.len().saturating_sub(1);
         }
+        if self.scroll_offset >= self.entries.len() {
+            self.scroll_offset = self
+                .selected_index
+                .min(self.entries.len().saturating_sub(1));
+        }
     }
 
     fn move_down(&mut self) {
@@ -206,6 +213,7 @@ impl BrowserState {
             if entry.available {
                 self.current_dir = Some(entry.path);
                 self.selected_index = 0;
+                self.scroll_offset = 0;
                 self.refresh_entries(config);
             }
         } else {
@@ -232,7 +240,33 @@ impl BrowserState {
             }
         }
         self.selected_index = 0;
+        self.scroll_offset = 0;
         self.refresh_entries(config);
+    }
+
+    fn ensure_visible(&mut self, viewport_rows: usize) {
+        if viewport_rows == 0 {
+            self.scroll_offset = self.selected_index;
+            return;
+        }
+
+        if self.selected_index < self.scroll_offset {
+            self.scroll_offset = self.selected_index;
+        } else {
+            let visible_end = self.scroll_offset.saturating_add(viewport_rows);
+            if self.selected_index >= visible_end {
+                self.scroll_offset = self.selected_index + 1 - viewport_rows;
+            }
+        }
+    }
+
+    fn visible_entries(&self, viewport_rows: usize) -> &[BrowserEntry] {
+        if viewport_rows == 0 || self.entries.is_empty() {
+            return &[];
+        }
+        let start = self.scroll_offset.min(self.entries.len().saturating_sub(1));
+        let end = start.saturating_add(viewport_rows).min(self.entries.len());
+        &self.entries[start..end]
     }
 }
 
@@ -847,6 +881,10 @@ fn handle_quit_modal_key(
             if let Some(pid) = app.worker_pid {
                 if pid_is_running(pid) {
                     kill(Pid::from_raw(pid as i32), Signal::SIGTERM)?;
+                    std::thread::sleep(Duration::from_millis(150));
+                    if pid_is_running(pid) {
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                    }
                     if !wait_for_pid_exit(pid, Duration::from_secs(15)) {
                         app.status_message =
                             Some(format!("Timed out waiting for worker {} to exit", pid));
@@ -909,8 +947,8 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
     }
     render_footer(f, outer_chunks[2], app);
 
-    if let Some(browser) = app.browser.as_ref() {
-        render_browser_modal(f, size, app, browser);
+    if let Some(browser) = app.browser.as_mut() {
+        render_browser_modal(f, size, browser);
     }
     if app.show_quit_modal {
         render_quit_modal(f, size, app);
@@ -948,33 +986,9 @@ fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
 
 fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
     let help = if app.browser.is_some() {
-        Line::from(vec![
-            Span::styled(" j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":move  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":open/toggle  "),
-            Span::styled("Space", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":select  "),
-            Span::styled("Backspace", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":up  "),
-            Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":add queue  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":close"),
-        ])
+        browser_help_line(area.width)
     } else {
-        Line::from(vec![
-            Span::styled(" q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":quit  "),
-            Span::styled("1-5", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":tabs  "),
-            Span::styled("b", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":browse  "),
-            Span::styled("j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":scroll  "),
-            Span::styled("f", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(":log-filter"),
-        ])
+        main_help_line(area.width)
     };
 
     let footer = Layout::default()
@@ -993,12 +1007,55 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
     );
 }
 
-fn render_browser_modal(f: &mut Frame, area: Rect, app: &TuiApp, browser: &BrowserState) {
+fn browser_help_line(width: u16) -> Line<'static> {
+    if width < 72 {
+        Line::from("j/k move  Enter open  Space select  a add  Esc close")
+    } else {
+        Line::from(vec![
+            Span::styled(" j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":move  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":open/toggle  "),
+            Span::styled("Space", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":select  "),
+            Span::styled("Backspace", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":up  "),
+            Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":add queue  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":close"),
+        ])
+    }
+}
+
+fn main_help_line(width: u16) -> Line<'static> {
+    if width < 72 {
+        Line::from("q quit  1-5 tabs  b browse  j/k scroll  f log-filter")
+    } else {
+        Line::from(vec![
+            Span::styled(" q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":quit  "),
+            Span::styled("1-5", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":tabs  "),
+            Span::styled("b", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":browse  "),
+            Span::styled("j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":scroll  "),
+            Span::styled("f", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(":log-filter"),
+        ])
+    }
+}
+
+fn render_browser_modal(f: &mut Frame, area: Rect, browser: &mut BrowserState) {
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
 
     let title = if let Some(dir) = browser.current_dir.as_ref() {
-        format!(" Browse {} ", dir.display())
+        format!(
+            " Browse {} ",
+            truncate_left(&dir.display().to_string(), popup.width.saturating_sub(14) as usize)
+        )
     } else {
         " Browse Shares ".to_string()
     };
@@ -1008,12 +1065,15 @@ fn render_browser_modal(f: &mut Frame, area: Rect, app: &TuiApp, browser: &Brows
         .border_style(Style::default().fg(Color::LightBlue));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
+    let visible_rows = inner.height as usize;
+    browser.ensure_visible(visible_rows);
 
     let items = browser
-        .entries
+        .visible_entries(visible_rows)
         .iter()
         .enumerate()
         .map(|(idx, entry)| {
+            let absolute_idx = browser.scroll_offset + idx;
             let selected = browser.selected_targets.contains(&entry.path);
             let marker = if selected { "[+]" } else { "[ ]" };
             let mut style = if entry.available {
@@ -1021,33 +1081,18 @@ fn render_browser_modal(f: &mut Frame, area: Rect, app: &TuiApp, browser: &Brows
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            if idx == browser.selected_index {
+            if absolute_idx == browser.selected_index {
                 style = style
                     .fg(Color::White)
                     .add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
             ListItem::new(Line::from(Span::styled(
-                format!("{} {}", marker, entry.label),
+                truncate_right(&format!("{} {}", marker, entry.label), inner.width as usize),
                 style,
             )))
         })
         .collect::<Vec<_>>();
     f.render_widget(List::new(items), inner);
-
-    let hint = Paragraph::new(
-        "Enter: open dir / toggle file   Space: select file or folder   Backspace: up   a: add to queue   Esc: cancel",
-    )
-    .alignment(Alignment::Center)
-    .style(Style::default().fg(Color::DarkGray));
-    let hint_area = Rect {
-        x: popup.x + 1,
-        y: popup.y + popup.height.saturating_sub(2),
-        width: popup.width.saturating_sub(2),
-        height: 1,
-    };
-    f.render_widget(hint, hint_area);
-
-    let _ = app;
 }
 
 fn render_quit_modal(f: &mut Frame, area: Rect, app: &TuiApp) {
@@ -1134,4 +1179,75 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn truncate_right(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let len = text.chars().count();
+    if len <= width {
+        return text.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut out = text.chars().take(width - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn truncate_left(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let len = text.chars().count();
+    if len <= width {
+        return text.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let suffix = text.chars().skip(len - (width - 3)).collect::<String>();
+    format!("...{}", suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_state_scrolls_to_keep_selection_visible() {
+        let mut browser = BrowserState {
+            current_dir: None,
+            entries: (0..10)
+                .map(|idx| BrowserEntry {
+                    path: PathBuf::from(format!("/tmp/{}", idx)),
+                    label: format!("Item {}", idx),
+                    is_dir: true,
+                    available: true,
+                })
+                .collect(),
+            selected_index: 0,
+            scroll_offset: 0,
+            selected_targets: BTreeSet::new(),
+        };
+
+        browser.selected_index = 6;
+        browser.ensure_visible(4);
+        assert_eq!(browser.scroll_offset, 3);
+
+        browser.selected_index = 2;
+        browser.ensure_visible(4);
+        assert_eq!(browser.scroll_offset, 2);
+        assert_eq!(browser.visible_entries(4).len(), 4);
+    }
+
+    #[test]
+    fn truncate_helpers_add_ellipsis_when_needed() {
+        assert_eq!(truncate_right("abcdef", 4), "a...");
+        assert_eq!(truncate_left("abcdef", 4), "...f");
+        assert_eq!(truncate_right("abc", 8), "abc");
+        assert_eq!(truncate_left("abc", 8), "abc");
+    }
 }

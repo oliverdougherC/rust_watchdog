@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -108,6 +109,64 @@ fn configure_process_group(_cmd: &mut Command) {}
 /// Configure a command to start in its own process group.
 pub fn configure_subprocess_group(cmd: &mut Command) {
     configure_process_group(cmd);
+}
+
+static ACTIVE_SUBPROCESS_PGIDS: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+pub struct RegisteredSubprocess {
+    pid: u32,
+}
+
+impl Drop for RegisteredSubprocess {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_SUBPROCESS_PGIDS.lock() {
+            active.remove(&self.pid);
+        }
+    }
+}
+
+pub fn register_subprocess(pid: u32) -> RegisteredSubprocess {
+    if let Ok(mut active) = ACTIVE_SUBPROCESS_PGIDS.lock() {
+        active.insert(pid);
+    }
+    RegisteredSubprocess { pid }
+}
+
+pub fn terminate_registered_subprocesses(grace: Duration) {
+    let tracked = ACTIVE_SUBPROCESS_PGIDS
+        .lock()
+        .map(|active| active.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+
+        for pid in &tracked {
+            let _ = killpg(Pid::from_raw(*pid as i32), Signal::SIGTERM);
+        }
+
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if tracked.iter().all(|pid| !crate::util::pid_is_running(*pid)) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        for pid in tracked {
+            if crate::util::pid_is_running(pid) {
+                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = grace;
+    }
 }
 
 #[cfg(unix)]
@@ -360,5 +419,29 @@ mod tests {
         .unwrap();
         assert!(out.stderr_tail.len() <= 256);
         assert!(out.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_registered_subprocesses_stops_tracked_group() {
+        let mut cmd = Command::new("sh");
+        configure_subprocess_group(&mut cmd);
+        cmd.args(["-c", "sleep 30"]);
+
+        let mut child = cmd.spawn().unwrap();
+        let _registration = register_subprocess(child.id());
+        terminate_registered_subprocesses(Duration::from_millis(25));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(exited, "tracked subprocess should exit after force termination");
     }
 }

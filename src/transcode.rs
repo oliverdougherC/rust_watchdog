@@ -1,7 +1,7 @@
 use crate::error::{Result, WatchdogError};
 use crate::process::{
     configure_subprocess_group, describe_exit_status, format_command_for_log, infer_failure_hint,
-    run_command, summarize_output_tail, terminate_subprocess, RunOptions,
+    register_subprocess, run_command, summarize_output_tail, terminate_subprocess, RunOptions,
 };
 use crate::traits::{TranscodeProgress, TranscodeResult, Transcoder};
 use regex::Regex;
@@ -552,6 +552,7 @@ impl Transcoder for HandBrakeTranscoder {
                 command_repr, e
             ),
         })?;
+        let _child_registration = register_subprocess(child.id());
 
         let stdout = child
             .stdout
