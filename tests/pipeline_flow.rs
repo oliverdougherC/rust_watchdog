@@ -1037,8 +1037,68 @@ async fn precision_mode_waits_for_manual_queue_and_processes_it() {
 
     let recent = db.get_recent_transcodes(10);
     assert!(
-        recent.iter().any(|record| record.source_path == source.to_string_lossy()),
+        recent
+            .iter()
+            .any(|record| record.source_path == source.to_string_lossy()),
         "expected precision-mode queue item to be processed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precision_mode_processes_manual_override_for_already_compliant_file() {
+    let mut cfg = base_config();
+    cfg.scan.interval_seconds = 60;
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Precision.Movie.av1.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (shutdown_tx, _) = broadcast::channel(1);
+
+    let handle = tokio::spawn(run_pipeline_loop(
+        cfg,
+        PathBuf::from("."),
+        deps,
+        db.clone(),
+        state,
+        RunMode::Precision,
+        false,
+        false,
+        shutdown_tx.subscribe(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    db.enqueue_queue_items(&[NewQueueItem {
+        source_path: source.to_string_lossy().to_string(),
+        share_name: "movies".to_string(),
+        enqueue_source: "manual".to_string(),
+    }]);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let _ = shutdown_tx.send(());
+    let result = handle.await.unwrap();
+    assert!(result.is_ok());
+
+    let recent = db.get_recent_transcodes(10);
+    assert!(
+        recent
+            .iter()
+            .any(|record| record.source_path == source.to_string_lossy()),
+        "expected already-compliant manual queue item to be processed"
     );
 }
 

@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-17T05:41:14.612522+00:00",
+  "timestamp": "2026-03-17T06:31:31.515907+00:00",
   "phase": "Idle",
   "paused": false,
   "nfs_healthy": true,
@@ -69,9 +69,9 @@
   ],
   "unhealthy_shares": [],
   "latest_failure": {
-    "source_path": "/Volumes/JellyfinMovies/The.Matrix.1999/The.Matrix.1999.mp4",
+    "source_path": "/Volumes/JellyfinTV/Breaking.Bad/Season 01/Breaking.Bad.S01E10.mp4",
     "failure_reason": "transcode_failed",
     "failure_code": "transcode_failed",
-    "completed_at": "2026-03-17T05:41:14"
+    "completed_at": "2026-03-17T06:31:31"
   }
 }

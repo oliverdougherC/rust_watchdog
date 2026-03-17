@@ -40,3 +40,15 @@
 {"event":"log","payload":{"level":"INFO","line":"22:41:06 | INFO | Processing 2/2: The.Matrix.1999.mp4","message":"Processing 2/2: The.Matrix.1999.mp4"},"timestamp":"2026-03-17T05:41:06.950975+00:00"}
 {"event":"log","payload":{"level":"INFO","line":"22:41:14 | INFO | Pass complete: 0 transcoded, 2 failures, 0 retries scheduled, 0 bytes saved","message":"Pass complete: 0 transcoded, 2 failures, 0 retries scheduled, 0 bytes saved"},"timestamp":"2026-03-17T05:41:14.611806+00:00"}
 {"event":"pass_end","payload":{"discovered_files":2,"failed_files":2,"inspected_files":2,"queued_files":2,"result":"ok","retries_scheduled":0,"space_saved_bytes":0,"transcoded_files":0},"timestamp":"2026-03-17T05:41:14.612129+00:00"}
+{"event":"session_start","payload":{"pid":70075,"run_mode":"watchdog"},"timestamp":"2026-03-17T06:31:13.409727+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:13 | INFO | Starting watchdog scan pass","message":"Starting watchdog scan pass"},"timestamp":"2026-03-17T06:31:13.410906+00:00"}
+{"event":"pass_start","payload":{"dry_run":false,"share_count":2},"timestamp":"2026-03-17T06:31:13.410994+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:13 | INFO | NFS mounts verified (2 shares)","message":"NFS mounts verified (2 shares)"},"timestamp":"2026-03-17T06:31:13.411131+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:13 | INFO | Probing with 14 parallel worker(s)","message":"Probing with 14 parallel worker(s)"},"timestamp":"2026-03-17T06:31:13.411438+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:13 | INFO | Scanning: 1 files (pending probe: 0, inspected this pass: 0)","message":"Scanning: 1 files (pending probe: 0, inspected this pass: 0)"},"timestamp":"2026-03-17T06:31:13.414858+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:13 | INFO | Probing progress: 2/2 files","message":"Probing progress: 2/2 files"},"timestamp":"2026-03-17T06:31:13.415239+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:13 | INFO | Scan complete: 2 files discovered, 2 inspected, 2 queued for transcode","message":"Scan complete: 2 files discovered, 2 inspected, 2 queued for transcode"},"timestamp":"2026-03-17T06:31:13.415394+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:13 | INFO | Processing 1/2: The.Matrix.1999.avi","message":"Processing 1/2: The.Matrix.1999.avi"},"timestamp":"2026-03-17T06:31:13.416025+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:26 | INFO | Processing 2/2: Breaking.Bad.S01E10.mp4","message":"Processing 2/2: Breaking.Bad.S01E10.mp4"},"timestamp":"2026-03-17T06:31:26.120810+00:00"}
+{"event":"log","payload":{"level":"INFO","line":"23:31:31 | INFO | Pass complete: 0 transcoded, 2 failures, 0 retries scheduled, 0 bytes saved","message":"Pass complete: 0 transcoded, 2 failures, 0 retries scheduled, 0 bytes saved"},"timestamp":"2026-03-17T06:31:31.514921+00:00"}
+{"event":"pass_end","payload":{"discovered_files":2,"failed_files":2,"inspected_files":2,"queued_files":2,"result":"ok","retries_scheduled":0,"space_saved_bytes":0,"transcoded_files":0},"timestamp":"2026-03-17T06:31:31.515218+00:00"}

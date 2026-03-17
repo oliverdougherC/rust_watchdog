@@ -274,7 +274,10 @@ fn queue_row_to_candidate(
     let mtime = match deps.fs.file_mtime(&path) {
         Ok(mtime) => mtime,
         Err(err) => {
-            warn!("Failed to read mtime for queued file {}: {}", record.source_path, err);
+            warn!(
+                "Failed to read mtime for queued file {}: {}",
+                record.source_path, err
+            );
             db.remove_queue_item(&record.source_path);
             return None;
         }
@@ -303,22 +306,41 @@ fn queue_row_to_candidate(
             tui_log(
                 state,
                 "WARN",
-                &format!("Probe failed for queued item, dropping: {}", record.source_path),
+                &format!(
+                    "Probe failed for queued item, dropping: {}",
+                    record.source_path
+                ),
             );
             db.remove_queue_item(&record.source_path);
             return None;
         }
     };
-    let eval = evaluate_transcode_need(&probe, &config.transcode);
+    let mut eval = evaluate_transcode_need(&probe, &config.transcode);
     if !eval.needs_transcode {
-        db.mark_inspected(&record.source_path, size, mtime);
-        db.remove_queue_item(&record.source_path);
-        tui_log(
-            state,
-            "INFO",
-            &format!("Queued file no longer needs transcode, skipping: {}", record.source_path),
-        );
-        return None;
+        if record.enqueue_source == "manual" {
+            eval.needs_transcode = true;
+            eval.reasons = vec!["manual selection override".to_string()];
+            tui_log(
+                state,
+                "INFO",
+                &format!(
+                    "Manual queue override: transcoding selected file despite matching target settings: {}",
+                    record.source_path
+                ),
+            );
+        } else {
+            db.mark_inspected(&record.source_path, size, mtime);
+            db.remove_queue_item(&record.source_path);
+            tui_log(
+                state,
+                "INFO",
+                &format!(
+                    "Queued file no longer needs transcode, skipping: {}",
+                    record.source_path
+                ),
+            );
+            return None;
+        }
     }
 
     Some((
@@ -525,9 +547,16 @@ async fn run_queued_pass(
         ),
     );
 
-    let stats =
-        process_transcode_queue(config, base_dir, deps, db, state, transcode_queue, shutdown_rx)
-            .await?;
+    let stats = process_transcode_queue(
+        config,
+        base_dir,
+        deps,
+        db,
+        state,
+        transcode_queue,
+        shutdown_rx,
+    )
+    .await?;
     tui_log(
         state,
         "INFO",
@@ -933,9 +962,16 @@ pub async fn run_watchdog_pass(
     }
 
     enqueue_queue_candidates(db, &transcode_queue, "scan");
-    let mut process_stats =
-        process_transcode_queue(config, base_dir, deps, db, state, transcode_queue, shutdown_rx)
-            .await?;
+    let mut process_stats = process_transcode_queue(
+        config,
+        base_dir,
+        deps,
+        db,
+        state,
+        transcode_queue,
+        shutdown_rx,
+    )
+    .await?;
     process_stats.files_inspected += stats.files_inspected;
     process_stats.files_queued = process_stats.files_queued.max(stats.files_queued);
     tui_log(
@@ -1309,8 +1345,12 @@ async fn process_transcode_queue(
                     s.transcode_percent = s.transcode_percent.max(100.0);
                 });
             }
-            Err(WatchdogError::TranscodeTimeout { .. }) | Err(WatchdogError::TranscodeStalled { .. }) => {
-                let is_timeout = matches!(transcode_result, Err(WatchdogError::TranscodeTimeout { .. }));
+            Err(WatchdogError::TranscodeTimeout { .. })
+            | Err(WatchdogError::TranscodeStalled { .. }) => {
+                let is_timeout = matches!(
+                    transcode_result,
+                    Err(WatchdogError::TranscodeTimeout { .. })
+                );
                 let dur = transcode_start.elapsed().as_secs_f64();
                 if attempt_num <= config.transcode.max_retries {
                     let failure_code = if is_timeout {
@@ -2857,7 +2897,11 @@ async fn wait_for_watchdog_interval_or_queue(
     let deadline = Instant::now() + tokio::time::Duration::from_secs(config.scan.interval_seconds);
     loop {
         if db.get_queue_count() > 0 {
-            tui_log(state, "INFO", "Manual queue update detected; resuming immediately");
+            tui_log(
+                state,
+                "INFO",
+                "Manual queue update detected; resuming immediately",
+            );
             return Ok(true);
         }
 
@@ -2865,7 +2909,10 @@ async fn wait_for_watchdog_interval_or_queue(
         if now >= deadline {
             return Ok(true);
         }
-        let sleep_for = std::cmp::min(Duration::from_secs(1), deadline.saturating_duration_since(now));
+        let sleep_for = std::cmp::min(
+            Duration::from_secs(1),
+            deadline.saturating_duration_since(now),
+        );
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {}
             _ = shutdown_rx.recv() => {
@@ -3325,14 +3372,9 @@ pub async fn run_pipeline_loop(
                 )
                 .await?
             }
-            RunMode::Precision => wait_for_precision_queue(
-                &config,
-                &base_dir,
-                &db,
-                &state,
-                &mut shutdown_rx,
-            )
-            .await?,
+            RunMode::Precision => {
+                wait_for_precision_queue(&config, &base_dir, &db, &state, &mut shutdown_rx).await?
+            }
         };
         if !should_continue {
             return Ok(());

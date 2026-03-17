@@ -332,7 +332,10 @@ impl WatchdogDb {
             |row| row.get(0),
         )?;
         if worker_pid_col_exists == 0 {
-            conn.execute("ALTER TABLE service_state ADD COLUMN worker_pid INTEGER", [])?;
+            conn.execute(
+                "ALTER TABLE service_state ADD COLUMN worker_pid INTEGER",
+                [],
+            )?;
         }
 
         let worker_run_mode_col_exists: i64 = conn.query_row(
@@ -1026,7 +1029,10 @@ impl WatchdogDb {
             "UPDATE queue_items SET started_at = ?1 WHERE source_path = ?2",
             params![now, source_path],
         ) {
-            error!("DB error in mark_queue_item_started('{}'): {}", source_path, e);
+            error!(
+                "DB error in mark_queue_item_started('{}'): {}",
+                source_path, e
+            );
         }
     }
 

@@ -1,6 +1,5 @@
 use crate::config::{Config, ShareConfig};
 use crate::db::{NewQueueItem, WatchdogDb};
-use crate::probe::evaluate_transcode_need;
 use crate::traits::{FileEntry, FileSystem, Prober};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -78,7 +77,7 @@ pub fn enqueue_manual_paths(
 pub fn enqueue_manual_paths_with_progress<F>(
     config: &Config,
     fs: &dyn FileSystem,
-    prober: &dyn Prober,
+    _prober: &dyn Prober,
     db: &WatchdogDb,
     paths: &[PathBuf],
     mut on_progress: F,
@@ -152,34 +151,11 @@ where
                 if in_cooldown {
                     summary.skipped_cooldown += 1;
                 } else {
-                    let probe = match prober.probe(&entry.path) {
-                        Ok(Some(probe)) => probe,
-                        _ => {
-                            summary.skipped_probe_failed += 1;
-                            processed_files += 1;
-                            on_progress(ManualSelectionProgress {
-                                phase: ManualSelectionPhase::Evaluating,
-                                selected_roots: paths.len(),
-                                root_index: idx + 1,
-                                current_root: Some(path.clone()),
-                                current_path: Some(entry.path.clone()),
-                                discovered_files: summary.discovered_files,
-                                processed_files,
-                                queued_candidates: queue_items.len(),
-                            });
-                            continue;
-                        }
-                    };
-                    let eval = evaluate_transcode_need(&probe, &config.transcode);
-                    if !eval.needs_transcode {
-                        summary.skipped_ineligible += 1;
-                    } else {
-                        queue_items.push(NewQueueItem {
-                            source_path: path_string,
-                            share_name: entry.share_name.clone(),
-                            enqueue_source: "manual".to_string(),
-                        });
-                    }
+                    queue_items.push(NewQueueItem {
+                        source_path: path_string,
+                        share_name: entry.share_name.clone(),
+                        enqueue_source: "manual".to_string(),
+                    });
                 }
             }
             processed_files += 1;
@@ -368,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_selection_expands_folders_and_skips_ineligible_files() {
+    fn manual_selection_expands_folders_and_queues_already_compliant_files() {
         let cfg = config();
         let fs = TestFs::new();
         fs.insert("/mnt/movies/needs-a.mkv", 10, 1.0);
@@ -379,9 +355,9 @@ mod tests {
             enqueue_manual_paths(&cfg, &fs, &TestProber, &db, &[PathBuf::from("/mnt/movies")]);
 
         assert_eq!(summary.discovered_files, 2);
-        assert_eq!(summary.enqueued_files, 1);
-        assert_eq!(summary.skipped_ineligible, 1);
-        assert_eq!(db.get_queue_count(), 1);
+        assert_eq!(summary.enqueued_files, 2);
+        assert_eq!(summary.skipped_ineligible, 0);
+        assert_eq!(db.get_queue_count(), 2);
     }
 
     #[test]

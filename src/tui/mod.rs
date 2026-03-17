@@ -1059,18 +1059,16 @@ fn handle_quit_modal_key(
 
 fn format_manual_selection_message(summary: &crate::selection::ManualSelectionSummary) -> String {
     format!(
-        "Manual selection: selected={} discovered={} added={} duplicates={} ineligible={} cooldown={} quarantined={} young={} missing={} non_video={} probe_failed={}",
+        "Manual selection: selected={} discovered={} added={} duplicates={} cooldown={} quarantined={} young={} missing={} non_video={}",
         summary.selected_roots,
         summary.discovered_files,
         summary.enqueued_files,
         summary.skipped_duplicates,
-        summary.skipped_ineligible,
         summary.skipped_cooldown,
         summary.skipped_quarantined,
         summary.skipped_young,
         summary.skipped_missing,
         summary.skipped_non_video,
-        summary.skipped_probe_failed,
     )
 }
 

@@ -442,6 +442,9 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
 
-        assert!(exited, "tracked subprocess should exit after force termination");
+        assert!(
+            exited,
+            "tracked subprocess should exit after force termination"
+        );
     }
 }

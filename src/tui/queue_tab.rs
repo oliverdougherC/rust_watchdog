@@ -54,18 +54,14 @@ pub fn render_queue(f: &mut Frame, area: Rect, tab_state: &mut QueueTabState) {
         .constraints([Constraint::Min(8), Constraint::Length(5)])
         .split(area);
 
-    let header = Row::new(
-        ["Status", "Source", "File", "Share"]
-            .iter()
-            .map(|h| {
-                Cell::from(Span::styled(
-                    *h,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            }),
-    )
+    let header = Row::new(["Status", "Source", "File", "Share"].iter().map(|h| {
+        Cell::from(Span::styled(
+            *h,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    }))
     .height(1);
 
     let rows = tab_state.records.iter().map(|record| {
