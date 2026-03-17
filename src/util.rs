@@ -2,6 +2,7 @@ use std::fmt::Write;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// An exclusive file lock that prevents concurrent instances.
 /// Uses `flock(LOCK_EX | LOCK_NB)` which is automatically released when the
@@ -62,6 +63,64 @@ impl Drop for InstanceLock {
         // but remove the lock file for cleanliness.
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+pub fn pid_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        kill(Pid::from_raw(pid as i32), None).is_ok()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+pub fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !pid_is_running(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    !pid_is_running(pid)
+}
+
+#[cfg(unix)]
+fn configure_detached_command(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // SAFETY: pre_exec runs in the child immediately before exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_detached_command(cmd: &mut Command) {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+}
+
+pub fn spawn_detached_command(mut cmd: Command) -> io::Result<u32> {
+    configure_detached_command(&mut cmd);
+    let child = cmd.spawn()?;
+    Ok(child.id())
 }
 
 /// Format a byte count into human-friendly binary units (KiB, MiB, GiB, TiB).

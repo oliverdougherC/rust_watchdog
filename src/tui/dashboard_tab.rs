@@ -43,6 +43,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
         PipelinePhase::Paused => Color::LightYellow,
         PipelinePhase::Transcoding => Color::Green,
         PipelinePhase::Waiting => Color::Blue,
+        PipelinePhase::AwaitingSelection => Color::LightBlue,
     };
 
     let nfs_color = if state.nfs_healthy {
@@ -51,12 +52,12 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
         Color::Red
     };
 
-    let mode_label = if state.simulate_mode {
+    let env_label = if state.simulate_mode {
         "Simulate"
     } else {
         "Live"
     };
-    let mode_color = if state.simulate_mode {
+    let env_color = if state.simulate_mode {
         Color::Magenta
     } else {
         Color::Green
@@ -77,8 +78,15 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     spans.extend(nfs_badge.to_spans());
     spans.push(Span::raw("    Mode: "));
     spans.push(Span::styled(
-        mode_label,
-        Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        env_label,
+        Style::default().fg(env_color).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw("    Run: "));
+    spans.push(Span::styled(
+        state.run_mode.to_string(),
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
     ));
 
     let status_line = Line::from(spans);
@@ -249,6 +257,7 @@ fn render_current_transcode(f: &mut Frame, area: Rect, state: &AppState) {
             PipelinePhase::Paused => "Paused (pause file present)",
             PipelinePhase::Transcoding => "Transcoding media file...",
             PipelinePhase::Waiting => "Waiting for next scan interval...",
+            PipelinePhase::AwaitingSelection => "Waiting for manual selection...",
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(

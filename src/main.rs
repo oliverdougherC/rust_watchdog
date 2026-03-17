@@ -13,14 +13,15 @@ use watchdog::diagnostics::{log_anyhow_error, print_anyhow_error_report};
 use watchdog::event_journal::{append_event, resolve_event_journal_path};
 use watchdog::in_use::CommandInUseDetector;
 use watchdog::nfs::SystemMountManager;
-use watchdog::pipeline::{run_pipeline_loop, PipelineDeps};
+use watchdog::pipeline::{run_pipeline_loop, set_tui_log_event_path, PipelineDeps};
 use watchdog::probe::FfprobeProber;
 use watchdog::process::{
     describe_exit_status, format_command_for_log, run_command, summarize_output_tail, RunOptions,
 };
+use watchdog::runtime::resolve_runtime_paths;
 use watchdog::scanner::RealFileSystem;
 use watchdog::simulate::create_simulated_deps;
-use watchdog::state::StateManager;
+use watchdog::state::{RunMode, StateManager};
 use watchdog::status_snapshot::{resolve_status_snapshot_path, run_status_snapshot_task};
 use watchdog::traits::MountManager;
 use watchdog::transcode::{HandBrakeTranscoder, PresetContract};
@@ -54,6 +55,7 @@ struct HealthcheckResult {
     paused: bool,
     cooldown_files: i64,
     mode: String,
+    run_mode: String,
     missing_dependencies: Vec<String>,
     unhealthy_shares: Vec<String>,
     db_query_ok: bool,
@@ -101,6 +103,7 @@ struct StatusResult {
     status: String,
     exit_code: i32,
     mode: String,
+    run_mode: String,
     paused: bool,
     auto_paused: bool,
     auto_pause_reason: Option<String>,
@@ -150,6 +153,14 @@ struct Cli {
     /// No TUI, log to stdout (for running as a service)
     #[arg(long)]
     headless: bool,
+
+    /// Run in precision/manual-selection mode instead of automatic watchdog scanning
+    #[arg(long)]
+    precision: bool,
+
+    /// Attach the TUI to an already-running worker without spawning a new one
+    #[arg(long)]
+    attach: bool,
 
     /// Custom config file path
     #[arg(long, default_value = "watchdog.toml")]
@@ -215,6 +226,11 @@ async fn main() {
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let requested_run_mode = if cli.precision {
+        RunMode::Precision
+    } else {
+        RunMode::Watchdog
+    };
     if cli.pause && cli.resume {
         anyhow::bail!("Use only one of --pause or --resume");
     }
@@ -263,6 +279,21 @@ async fn run() -> anyhow::Result<()> {
         anyhow::bail!(
             "--clear-scan-cache cannot be combined with --dry-run, --status/--status-json, or --healthcheck/--healthcheck-json"
         );
+    }
+    if cli.attach
+        && (cli.headless
+            || cli.dry_run
+            || cli.once
+            || cli.doctor
+            || run_status_mode
+            || run_healthcheck_mode
+            || cli.pause
+            || cli.resume
+            || cli.quarantine_list
+            || cli.quarantine_clear.is_some()
+            || cli.quarantine_clear_all)
+    {
+        anyhow::bail!("--attach is only valid for interactive TUI sessions");
     }
 
     // Set up tracing — suppress stderr output in TUI mode to avoid corrupting the display
@@ -365,6 +396,13 @@ async fn run() -> anyhow::Result<()> {
     };
     info!("Resolved base directory: {}", base_dir.display());
 
+    let runtime_paths = resolve_runtime_paths(&config, &base_dir);
+    if !cli.dry_run {
+        config.paths.database = runtime_paths.database.to_string_lossy().to_string();
+        config.paths.status_snapshot = runtime_paths.status_snapshot.to_string_lossy().to_string();
+        config.paths.event_journal = runtime_paths.event_journal.to_string_lossy().to_string();
+    }
+
     let needs_preset_contract = !run_status_mode
         && !run_healthcheck_mode
         && !cli.pause
@@ -440,7 +478,11 @@ async fn run() -> anyhow::Result<()> {
         std::process::exit(STATUS_INTERNAL_FAIL);
     }
 
-    let status_snapshot_path = resolve_status_snapshot_path(&config, &base_dir);
+    let status_snapshot_path = if cli.dry_run {
+        None
+    } else {
+        Some(runtime_paths.status_snapshot.clone())
+    };
     if let Some(path) = status_snapshot_path.as_ref() {
         info!("Status snapshot path: {}", path.display());
     } else {
@@ -451,7 +493,7 @@ async fn run() -> anyhow::Result<()> {
     let db = if cli.simulate {
         Arc::new(WatchdogDb::open_in_memory()?)
     } else {
-        let db_path = config.resolve_path(&base_dir, &config.paths.database);
+        let db_path = runtime_paths.database.clone();
         info!("Database: {}", db_path.display());
         if cli.dry_run {
             if db_path.exists() {
@@ -501,6 +543,12 @@ async fn run() -> anyhow::Result<()> {
             }
         }
     };
+
+    if let Some(pid) = db.get_service_state().worker_pid {
+        if !util::pid_is_running(pid) {
+            db.clear_worker_state();
+        }
+    }
 
     if cli.clear_scan_cache {
         let cleared = db.clear_inspected_files();
@@ -629,29 +677,6 @@ async fn run() -> anyhow::Result<()> {
         );
     }
 
-    // Acquire instance lock (skip in simulation mode)
-    let _instance_lock = if !cli.simulate && !cli.dry_run {
-        let lock_path = config
-            .resolve_path(&base_dir, &config.paths.database)
-            .with_extension("lock");
-        match util::InstanceLock::acquire(&lock_path) {
-            Ok(lock) => {
-                info!("Instance lock acquired: {}", lock.path().display());
-                Some(lock)
-            }
-            Err(e) => {
-                error!("{}", e);
-                anyhow::bail!(
-                    "Failed to acquire instance lock at {}: {}",
-                    lock_path.display(),
-                    e
-                );
-            }
-        }
-    } else {
-        None
-    };
-
     // Verify dependencies (skip in simulation mode)
     if !cli.simulate {
         if let Err(missing) = util::verify_dependencies() {
@@ -674,70 +699,65 @@ async fn run() -> anyhow::Result<()> {
             ffprobe_ver, handbrake_ver, rsync_ver
         );
     }
-
-    // Create state manager and seed cumulative stats from DB
-    let (state, _state_rx) = StateManager::new();
-
-    {
-        let total_saved = db.get_total_space_saved();
-        let total_transcoded = db.get_transcode_count();
-        let total_inspected = db.get_inspected_count();
-        let top_reasons = db.get_top_failure_reasons(3);
-        let service_state = db.get_service_state();
-        let quarantined = db.quarantine_count();
-        state.update(|s| {
-            s.total_space_saved = total_saved;
-            s.total_transcoded = total_transcoded as u64;
-            s.total_inspected = total_inspected as u64;
-            s.simulate_mode = cli.simulate;
-            s.consecutive_pass_failures = service_state.consecutive_pass_failures;
-            s.auto_paused = service_state.auto_paused_at.is_some();
-            s.auto_paused_at = service_state.auto_paused_at.clone();
-            s.auto_pause_reason = service_state.auto_pause_reason.clone();
-            s.quarantined_files = quarantined.max(0) as u64;
-            s.top_failure_reasons = top_reasons
-                .iter()
-                .map(|(reason, count)| (reason.clone(), *count as u64))
-                .collect();
-        });
-    }
-
-    // Create shutdown channel
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
-    // Build dependencies
-    let deps = if cli.simulate {
-        create_simulated_deps(&config)
-    } else {
-        PipelineDeps {
-            fs: Arc::new(RealFileSystem),
-            prober: Box::new(FfprobeProber),
-            transcoder: Box::new(HandBrakeTranscoder),
-            transfer: Box::new(RsyncTransfer),
-            mount_manager: Box::new(SystemMountManager),
-            in_use_detector: Box::new(CommandInUseDetector::new(
-                config.safety.in_use_guard_command.clone(),
-            )),
-        }
-    };
-
-    let snapshot_handle = if !cli.dry_run {
-        status_snapshot_path.clone().map(|snapshot_path| {
-            tokio::spawn(run_status_snapshot_task(
-                state.subscribe(),
-                db.clone(),
-                snapshot_path,
-                shutdown_tx.subscribe(),
-                Duration::from_secs(2),
-            ))
-        })
-    } else {
-        None
-    };
-
-    // Run based on mode
     if cli.headless || cli.dry_run || cli.once {
-        // Headless mode: run pipeline with signal handling for graceful shutdown
+        let _instance_lock = if !cli.simulate && !cli.dry_run {
+            let lock_path = runtime_paths.database.with_extension("lock");
+            match util::InstanceLock::acquire(&lock_path) {
+                Ok(lock) => {
+                    info!("Instance lock acquired: {}", lock.path().display());
+                    Some(lock)
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    anyhow::bail!(
+                        "Failed to acquire instance lock at {}: {}",
+                        lock_path.display(),
+                        e
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let (state, _state_rx) = StateManager::new();
+        seed_state_from_db(&state, &db, cli.simulate);
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let deps = if cli.simulate {
+            create_simulated_deps(&config)
+        } else {
+            PipelineDeps {
+                fs: Arc::new(RealFileSystem),
+                prober: Box::new(FfprobeProber),
+                transcoder: Box::new(HandBrakeTranscoder),
+                transfer: Box::new(RsyncTransfer),
+                mount_manager: Box::new(SystemMountManager),
+                in_use_detector: Box::new(CommandInUseDetector::new(
+                    config.safety.in_use_guard_command.clone(),
+                )),
+            }
+        };
+
+        if !cli.dry_run {
+            db.reset_stale_queue_items();
+            db.set_worker_state(std::process::id(), requested_run_mode.as_str());
+            set_tui_log_event_path(Some(runtime_paths.event_journal.clone()));
+        }
+
+        let snapshot_handle = if !cli.dry_run {
+            status_snapshot_path.clone().map(|snapshot_path| {
+                tokio::spawn(run_status_snapshot_task(
+                    state.subscribe(),
+                    db.clone(),
+                    snapshot_path,
+                    shutdown_tx.subscribe(),
+                    Duration::from_secs(2),
+                ))
+            })
+        } else {
+            None
+        };
+
         let signal_shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let mut sigterm =
@@ -776,6 +796,7 @@ async fn run() -> anyhow::Result<()> {
             deps,
             db.clone(),
             state.clone(),
+            requested_run_mode,
             cli.dry_run,
             cli.once,
             shutdown_tx.subscribe(),
@@ -783,80 +804,179 @@ async fn run() -> anyhow::Result<()> {
         .await;
 
         let _ = shutdown_tx.send(());
+        if !cli.dry_run {
+            db.clear_worker_state();
+        }
+
+        if let Some(handle) = snapshot_handle {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) => warn!("Status snapshot task join error: {}", e),
+            }
+        }
+
         pipeline_result.with_context(|| {
             format!(
-                "Pipeline loop failed (headless={}, dry_run={}, once={})",
-                cli.headless, cli.dry_run, cli.once
+                "Pipeline loop failed (headless={}, dry_run={}, once={}, run_mode={})",
+                cli.headless,
+                cli.dry_run,
+                cli.once,
+                requested_run_mode
             )
         })?;
     } else {
-        // TUI mode: run pipeline in background, TUI in foreground
-        let pipeline_config = config.clone();
-        let pipeline_base_dir = base_dir.clone();
-        let pipeline_db = db.clone();
-        let pipeline_shutdown_rx = shutdown_tx.subscribe();
+        let service_state = db.get_service_state();
+        let live_worker_pid = service_state.worker_pid.filter(|pid| util::pid_is_running(*pid));
+        let active_run_mode = match service_state.worker_run_mode.as_deref() {
+            Some("precision") => RunMode::Precision,
+            _ => RunMode::Watchdog,
+        };
 
-        // The state manager needs to be shared between pipeline and TUI.
-        // Pipeline writes via StateManager, TUI reads via watch::Receiver.
-        // We'll give the pipeline the StateManager and the TUI the Receiver.
-        let tui_state_rx = state.subscribe();
-        let pipeline_state = state.clone();
-
-        let pipeline_handle = tokio::spawn(async move {
-            run_pipeline_loop(
-                pipeline_config,
-                pipeline_base_dir,
-                deps,
-                pipeline_db,
-                pipeline_state,
-                false,
-                false,
-                pipeline_shutdown_rx,
-            )
-            .await
-        });
-
-        // Run TUI on the main thread (crossterm needs it)
-        let tui_result = tui::run_tui(tui_state_rx, db.clone(), shutdown_tx.clone()).await;
-
-        // Signal shutdown to pipeline
-        let _ = shutdown_tx.send(());
-
-        // Wait for pipeline to finish
-        match pipeline_handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                error!(
-                    "Pipeline error: {} (code={} category={})",
-                    e,
-                    e.code(),
-                    e.category()
+        let attach_run_mode = if cli.attach {
+            if live_worker_pid.is_none() {
+                anyhow::bail!(
+                    "No active worker is running. Start one with `watchdog{}` first.",
+                    if matches!(requested_run_mode, RunMode::Precision) {
+                        " --precision"
+                    } else {
+                        ""
+                    }
                 );
-                for (key, value) in e.diagnostic_fields() {
-                    error!("pipeline_error_context {}={}", key, value);
-                }
-                if let Some(hint) = e.operator_hint() {
-                    warn!("Pipeline remediation hint: {}", hint);
-                }
             }
-            Err(e) => error!("Pipeline task join error: {}", e),
-        }
+            if cli.precision && !matches!(active_run_mode, RunMode::Precision) {
+                anyhow::bail!("The active worker is not running in precision mode");
+            }
+            active_run_mode
+        } else {
+            if let Some(_pid) = live_worker_pid {
+                if active_run_mode != requested_run_mode {
+                    anyhow::bail!(
+                        "A {} worker is already running. Reattach with `{}` or stop it before starting {} mode.",
+                        active_run_mode,
+                        build_attach_hint(&cli, &base_dir, active_run_mode),
+                        requested_run_mode
+                    );
+                }
+            } else {
+                let worker_pid = spawn_worker_process(&cli, requested_run_mode)?;
+                wait_for_worker_ready(&db, worker_pid, Duration::from_secs(5))?;
+            }
+            requested_run_mode
+        };
 
-        if let Err(e) = tui_result {
+        let attach_hint = build_attach_hint(&cli, &base_dir, attach_run_mode);
+        if let Err(e) = tui::run_tui(
+            config,
+            db.clone(),
+            runtime_paths.status_snapshot.clone(),
+            runtime_paths.event_journal.clone(),
+            attach_hint,
+        )
+        .await
+        {
             log_anyhow_error("TUI error", &e);
             print_anyhow_error_report("tui failed", &e);
         }
     }
 
-    if let Some(handle) = snapshot_handle {
-        match handle.await {
-            Ok(()) => {}
-            Err(e) => warn!("Status snapshot task join error: {}", e),
-        }
-    }
-
     info!("Watchdog shut down cleanly");
     Ok(())
+}
+
+fn seed_state_from_db(state: &StateManager, db: &WatchdogDb, simulate: bool) {
+    let total_saved = db.get_total_space_saved();
+    let total_transcoded = db.get_transcode_count();
+    let total_inspected = db.get_inspected_count();
+    let top_reasons = db.get_top_failure_reasons(3);
+    let service_state = db.get_service_state();
+    let quarantined = db.quarantine_count();
+    state.update(|s| {
+        s.total_space_saved = total_saved;
+        s.total_transcoded = total_transcoded as u64;
+        s.total_inspected = total_inspected as u64;
+        s.simulate_mode = simulate;
+        s.consecutive_pass_failures = service_state.consecutive_pass_failures;
+        s.auto_paused = service_state.auto_paused_at.is_some();
+        s.auto_paused_at = service_state.auto_paused_at.clone();
+        s.auto_pause_reason = service_state.auto_pause_reason.clone();
+        s.quarantined_files = quarantined.max(0) as u64;
+        s.top_failure_reasons = top_reasons
+            .iter()
+            .map(|(reason, count)| (reason.clone(), *count as u64))
+            .collect();
+    });
+}
+
+fn build_attach_hint(cli: &Cli, base_dir: &Path, run_mode: RunMode) -> String {
+    let mut parts = vec!["watchdog".to_string(), "--attach".to_string()];
+    if matches!(run_mode, RunMode::Precision) {
+        parts.push("--precision".to_string());
+    }
+    if cli.simulate {
+        parts.push("--simulate".to_string());
+    } else {
+        let config_path = cli
+            .config
+            .canonicalize()
+            .unwrap_or_else(|_| base_dir.join(&cli.config));
+        parts.push("--config".to_string());
+        parts.push(shell_quote(&config_path.to_string_lossy()));
+    }
+    parts.join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn spawn_worker_process(cli: &Cli, run_mode: RunMode) -> anyhow::Result<u32> {
+    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--headless");
+    if cli.simulate {
+        cmd.arg("--simulate");
+    } else {
+        cmd.arg("--config").arg(&cli.config);
+    }
+    if matches!(run_mode, RunMode::Precision) {
+        cmd.arg("--precision");
+    }
+    if let Some(level) = cli.log_level.as_deref() {
+        cmd.arg("--log-level").arg(level);
+    }
+    util::spawn_detached_command(cmd).context("Failed to spawn detached worker process")
+}
+
+fn wait_for_worker_ready(
+    db: &WatchdogDb,
+    spawned_pid: u32,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !util::pid_is_running(spawned_pid) {
+            anyhow::bail!("Worker process {} exited during startup", spawned_pid);
+        }
+        if db
+            .get_service_state()
+            .worker_pid
+            .is_some_and(|pid| pid == spawned_pid)
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!(
+        "Timed out waiting for worker {} to register itself",
+        spawned_pid
+    )
 }
 
 fn run_healthcheck(
@@ -875,6 +995,7 @@ fn run_healthcheck(
         println!("  status: {}", result.status);
         println!("  exit_code: {}", result.exit_code);
         println!("  mode: {}", result.mode);
+        println!("  run_mode: {}", result.run_mode);
         println!("  paused: {}", result.paused);
         println!("  cooldown_files: {}", result.cooldown_files);
         println!(
@@ -947,6 +1068,14 @@ fn evaluate_healthcheck(
     let service_state = db.get_service_state();
     let quarantine_count = db.quarantine_count();
     let snapshot_diag = collect_snapshot_diagnostics(config, base_dir);
+    let run_mode = snapshot_diag
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.get("run_mode"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or(service_state.worker_run_mode.clone())
+        .unwrap_or_else(|| "watchdog".to_string());
 
     let dep_names = ["ffprobe", "HandBrakeCLI", "rsync"];
     let forced_missing = read_list_env("WATCHDOG_HEALTHCHECK_FORCE_MISSING_DEPS");
@@ -1038,6 +1167,7 @@ fn evaluate_healthcheck(
         } else {
             "live".to_string()
         },
+        run_mode,
         missing_dependencies,
         unhealthy_shares,
         db_query_ok,
@@ -1187,6 +1317,7 @@ fn run_status(
             } else {
                 "live".to_string()
             },
+            run_mode: "watchdog".to_string(),
             paused: false,
             auto_paused: false,
             auto_pause_reason: None,
@@ -1243,6 +1374,12 @@ fn run_status(
     let nfs_healthy = snapshot
         .and_then(|s| s.get("nfs_healthy"))
         .and_then(Value::as_bool);
+    let run_mode = snapshot
+        .and_then(|s| s.get("run_mode"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or(service_state.worker_run_mode.clone())
+        .unwrap_or_else(|| "watchdog".to_string());
     let unhealthy_shares = snapshot
         .and_then(|s| s.get("unhealthy_shares"))
         .and_then(Value::as_array)
@@ -1296,6 +1433,7 @@ fn run_status(
         } else {
             "live".to_string()
         },
+        run_mode,
         paused,
         auto_paused,
         auto_pause_reason: service_state.auto_pause_reason,
@@ -1324,6 +1462,7 @@ fn run_status(
         println!("  status: {}", result.status);
         println!("  exit_code: {}", result.exit_code);
         println!("  mode: {}", result.mode);
+        println!("  run_mode: {}", result.run_mode);
         println!("  paused: {}", result.paused);
         println!("  auto_paused: {}", result.auto_paused);
         if let Some(reason) = result.auto_pause_reason.as_deref() {
@@ -1491,7 +1630,7 @@ fn run_doctor(
     let has_missing_deps = dep_results.iter().any(|d| !d.found);
     let has_unhealthy_mounts = mount_checks.iter().any(|m| !m.healthy);
     let snapshot_degraded =
-        snapshot_diag.snapshot_path.is_some() && snapshot_diag.freshness != "fresh";
+        !simulate && snapshot_diag.snapshot_path.is_some() && snapshot_diag.freshness != "fresh";
     let safety_trip = service_state.auto_paused_at.is_some()
         || service_state.consecutive_pass_failures
             >= config.safety.max_consecutive_pass_failures.max(1);

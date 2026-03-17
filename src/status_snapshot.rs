@@ -15,6 +15,7 @@ struct SnapshotPayload<'a> {
     paused: bool,
     nfs_healthy: bool,
     simulate_mode: bool,
+    run_mode: &'a str,
     queue_position: u32,
     queue_total: u32,
     current_file: Option<&'a str>,
@@ -94,6 +95,11 @@ pub fn resolve_status_snapshot_path(config: &Config, base_dir: &Path) -> Option<
     }
 }
 
+pub fn read_snapshot_file(path: &Path) -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 pub fn write_snapshot(
     path: &Path,
     state: &AppState,
@@ -110,6 +116,7 @@ pub fn write_snapshot(
         paused: matches!(state.phase, crate::state::PipelinePhase::Paused),
         nfs_healthy: state.nfs_healthy,
         simulate_mode: state.simulate_mode,
+        run_mode: state.run_mode.as_str(),
         queue_position: state.queue_position,
         queue_total: state.queue_total,
         current_file: state.current_file.as_deref(),
@@ -247,7 +254,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("status.json");
         let (state, _) = StateManager::new();
-        state.set_phase(crate::state::PipelinePhase::Scanning);
+        state.set_phase(crate::state::PipelinePhase::AwaitingSelection);
+        state.set_run_mode(crate::state::RunMode::Precision);
         state.update(|s| {
             s.run_skipped_in_use = 2;
             s.total_transcoded = 3;
@@ -258,6 +266,8 @@ mod tests {
         let content = std::fs::read_to_string(path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(json["cooldown_files"], 5);
+        assert_eq!(json["phase"], "Awaiting Selection");
+        assert_eq!(json["run_mode"], "precision");
         assert_eq!(json["run"]["skipped_in_use"], 2);
         assert_eq!(json["totals"]["transcoded"], 3);
         assert_eq!(json["reliability"]["scan_timeouts"], 0);

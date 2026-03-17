@@ -11,6 +11,7 @@ pub enum PipelinePhase {
     Paused,
     Transcoding,
     Waiting,
+    AwaitingSelection,
 }
 
 impl std::fmt::Display for PipelinePhase {
@@ -22,7 +23,29 @@ impl std::fmt::Display for PipelinePhase {
             PipelinePhase::Paused => write!(f, "Paused"),
             PipelinePhase::Transcoding => write!(f, "Transcoding"),
             PipelinePhase::Waiting => write!(f, "Waiting"),
+            PipelinePhase::AwaitingSelection => write!(f, "Awaiting Selection"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Watchdog,
+    Precision,
+}
+
+impl RunMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Watchdog => "watchdog",
+            Self::Precision => "precision",
+        }
+    }
+}
+
+impl std::fmt::Display for RunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -52,6 +75,7 @@ pub struct AppState {
     pub phase: PipelinePhase,
     pub nfs_healthy: bool,
     pub simulate_mode: bool,
+    pub run_mode: RunMode,
 
     // Current transcode info
     pub current_file: Option<String>,
@@ -110,6 +134,7 @@ impl Default for AppState {
             phase: PipelinePhase::Idle,
             nfs_healthy: true,
             simulate_mode: false,
+            run_mode: RunMode::Watchdog,
             current_file: None,
             queue_position: 0,
             queue_total: 0,
@@ -191,6 +216,12 @@ impl StateManager {
     pub fn set_phase(&self, phase: PipelinePhase) {
         self.tx.send_modify(|state| {
             state.phase = phase;
+        });
+    }
+
+    pub fn set_run_mode(&self, run_mode: RunMode) {
+        self.tx.send_modify(|state| {
+            state.run_mode = run_mode;
         });
     }
 

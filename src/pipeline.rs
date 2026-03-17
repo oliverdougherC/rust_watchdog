@@ -1,11 +1,11 @@
 use crate::config::Config;
-use crate::db::{TranscodeOutcome, WatchdogDb};
+use crate::db::{NewQueueItem, QueueRecord, TranscodeOutcome, WatchdogDb};
 use crate::error::{Result, WatchdogError};
-use crate::event_journal::{append_event, resolve_event_journal_path};
+use crate::event_journal::{append_event, append_log_event, resolve_event_journal_path};
 use crate::nfs::ensure_all_mounts;
 use crate::notify::{send_webhook, NotifyEvent};
 use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval, VerificationOutcome};
-use crate::state::{PipelinePhase, ProgressStage, StateManager};
+use crate::state::{PipelinePhase, ProgressStage, RunMode, StateManager};
 use crate::stats::RunStats;
 use crate::traits::*;
 use crate::transcode::PresetContract;
@@ -21,7 +21,7 @@ use std::collections::BinaryHeap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
@@ -216,7 +216,346 @@ fn transcode_timeouts_for_attempt(config: &Config, attempt_num: u32) -> (u64, u6
 /// Log a formatted message to both tracing and the TUI state log.
 fn tui_log(state: &StateManager, level: &str, msg: &str) {
     let ts = chrono::Local::now().format("%H:%M:%S");
-    state.append_log(format!("{} | {} | {}", ts, level, msg));
+    let line = format!("{} | {} | {}", ts, level, msg);
+    state.append_log(line.clone());
+    append_log_event(tui_log_event_path().as_deref(), level, msg, &line);
+}
+
+static TUI_LOG_EVENT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn tui_log_event_path() -> &'static Option<PathBuf> {
+    TUI_LOG_EVENT_PATH.get_or_init(|| None)
+}
+
+pub fn set_tui_log_event_path(path: Option<PathBuf>) {
+    let _ = TUI_LOG_EVENT_PATH.set(path);
+}
+
+fn finalize_runtime_state(state: &StateManager, db: &Arc<WatchdogDb>) {
+    let top_reasons = db.get_top_failure_reasons(3);
+    state.update(|s| {
+        s.top_failure_reasons = top_reasons
+            .iter()
+            .map(|(reason, count)| (reason.clone(), *count as u64))
+            .collect();
+    });
+    state.set_last_pass_time();
+    state.set_current_file(None);
+    state.reset_file_progress();
+    state.set_queue_info(0, db.get_queue_count().max(0) as u32);
+}
+
+fn queue_row_to_candidate(
+    config: &Config,
+    deps: &PipelineDeps,
+    db: &Arc<WatchdogDb>,
+    state: &StateManager,
+    record: &QueueRecord,
+) -> Option<(FileEntry, TranscodeEval)> {
+    let path = PathBuf::from(&record.source_path);
+    if !deps.fs.exists(&path) {
+        tui_log(
+            state,
+            "WARN",
+            &format!("Queued file missing, dropping: {}", record.source_path),
+        );
+        db.remove_queue_item(&record.source_path);
+        return None;
+    }
+
+    let size = match deps.fs.file_size(&path) {
+        Ok(size) => size,
+        Err(err) => {
+            warn!("Failed to stat queued file {}: {}", record.source_path, err);
+            db.remove_queue_item(&record.source_path);
+            return None;
+        }
+    };
+    let mtime = match deps.fs.file_mtime(&path) {
+        Ok(mtime) => mtime,
+        Err(err) => {
+            warn!("Failed to read mtime for queued file {}: {}", record.source_path, err);
+            db.remove_queue_item(&record.source_path);
+            return None;
+        }
+    };
+
+    if db.is_quarantined(&record.source_path) {
+        db.record_quarantine_skip(&record.source_path, "quarantined_file");
+        db.remove_queue_item(&record.source_path);
+        return None;
+    }
+    if let Some(failure_state) = db.get_file_failure_state(&record.source_path) {
+        if failure_state.next_eligible_at > chrono::Utc::now().timestamp() {
+            db.remove_queue_item(&record.source_path);
+            return None;
+        }
+    }
+    let file_age_secs = (chrono::Utc::now().timestamp() as f64 - mtime).max(0.0);
+    if file_age_secs < config.safety.min_file_age_seconds as f64 {
+        db.remove_queue_item(&record.source_path);
+        return None;
+    }
+
+    let probe = match deps.prober.probe(&path) {
+        Ok(Some(probe)) => probe,
+        _ => {
+            tui_log(
+                state,
+                "WARN",
+                &format!("Probe failed for queued item, dropping: {}", record.source_path),
+            );
+            db.remove_queue_item(&record.source_path);
+            return None;
+        }
+    };
+    let eval = evaluate_transcode_need(&probe, &config.transcode);
+    if !eval.needs_transcode {
+        db.mark_inspected(&record.source_path, size, mtime);
+        db.remove_queue_item(&record.source_path);
+        tui_log(
+            state,
+            "INFO",
+            &format!("Queued file no longer needs transcode, skipping: {}", record.source_path),
+        );
+        return None;
+    }
+
+    Some((
+        FileEntry {
+            path,
+            size,
+            mtime,
+            share_name: record.share_name.clone(),
+        },
+        eval,
+    ))
+}
+
+fn load_queue_candidates(
+    config: &Config,
+    deps: &PipelineDeps,
+    db: &Arc<WatchdogDb>,
+    state: &StateManager,
+) -> Vec<(FileEntry, TranscodeEval)> {
+    db.list_queue_items(10_000)
+        .into_iter()
+        .filter_map(|record| queue_row_to_candidate(config, deps, db, state, &record))
+        .collect()
+}
+
+fn append_new_db_queue_items(
+    config: &Config,
+    deps: &PipelineDeps,
+    db: &Arc<WatchdogDb>,
+    state: &StateManager,
+    transcode_queue: &mut Vec<(FileEntry, TranscodeEval)>,
+    outstanding_paths: &HashSet<PathBuf>,
+) -> usize {
+    let mut appended = 0usize;
+    for record in db.list_queue_items(10_000) {
+        let path = PathBuf::from(&record.source_path);
+        if outstanding_paths.contains(&path) {
+            continue;
+        }
+        if let Some(candidate) = queue_row_to_candidate(config, deps, db, state, &record) {
+            transcode_queue.push(candidate);
+            appended += 1;
+        }
+    }
+    appended
+}
+
+fn enqueue_queue_candidates(
+    db: &Arc<WatchdogDb>,
+    transcode_queue: &[(FileEntry, TranscodeEval)],
+    enqueue_source: &str,
+) -> usize {
+    let items = transcode_queue
+        .iter()
+        .map(|(entry, _)| NewQueueItem {
+            source_path: entry.path.to_string_lossy().to_string(),
+            share_name: entry.share_name.clone(),
+            enqueue_source: enqueue_source.to_string(),
+        })
+        .collect::<Vec<_>>();
+    db.enqueue_queue_items(&items)
+}
+
+fn reset_run_state(state: &StateManager, db: &Arc<WatchdogDb>) {
+    state.set_current_file(None);
+    state.reset_file_progress();
+    state.update(|s| {
+        s.run_inspected = 0;
+        s.run_transcoded = 0;
+        s.run_failures = 0;
+        s.run_retries_scheduled = 0;
+        s.run_space_saved = 0;
+        s.run_skipped_inspected = 0;
+        s.run_skipped_young = 0;
+        s.run_skipped_cooldown = 0;
+        s.run_skipped_filtered = 0;
+        s.run_skipped_in_use = 0;
+        s.run_skipped_quarantined = 0;
+        s.quarantined_files = db.quarantine_count().max(0) as u64;
+    });
+}
+
+fn verify_mounts_and_update_state(
+    config: &Config,
+    deps: &PipelineDeps,
+    state: &StateManager,
+    dry_run: bool,
+) -> Result<()> {
+    let shares: Vec<(String, String, String)> = config
+        .shares
+        .iter()
+        .map(|s| (s.name.clone(), s.remote_path.clone(), s.local_mount.clone()))
+        .collect();
+
+    if dry_run {
+        let unhealthy: Vec<String> = shares
+            .iter()
+            .filter_map(|(name, _remote, local_mount)| {
+                (!deps.mount_manager.is_healthy(Path::new(local_mount))).then_some(name.clone())
+            })
+            .collect();
+        if let Some(first) = unhealthy.first() {
+            return Err(WatchdogError::NfsMount {
+                share: first.clone(),
+                reason: format!(
+                    "Dry-run mode is read-only and will not remount unhealthy shares ({} unhealthy)",
+                    unhealthy.len()
+                ),
+            });
+        }
+    } else {
+        ensure_all_mounts(deps.mount_manager.as_ref(), &config.nfs.server, &shares)?;
+    }
+
+    let share_health = config
+        .shares
+        .iter()
+        .map(|share| {
+            let healthy = deps.mount_manager.is_healthy(Path::new(&share.local_mount));
+            (share.name.clone(), healthy)
+        })
+        .collect::<Vec<_>>();
+    state.set_share_health(share_health.clone());
+    state.set_nfs_healthy(share_health.iter().all(|(_, healthy)| *healthy));
+    tui_log(
+        state,
+        "INFO",
+        &format!("NFS mounts verified ({} shares)", shares.len()),
+    );
+    Ok(())
+}
+
+async fn run_queued_pass(
+    config: &Config,
+    base_dir: &Path,
+    deps: &PipelineDeps,
+    db: &Arc<WatchdogDb>,
+    state: &StateManager,
+    dry_run: bool,
+    shutdown_rx: broadcast::Receiver<()>,
+) -> Result<RunStats> {
+    if !dry_run {
+        let stale = db.close_stale_transcodes();
+        if stale > 0 {
+            info!(
+                "Cleaned up {} stale transcode row(s) from previous run",
+                stale
+            );
+        }
+    }
+
+    reset_run_state(state, db);
+    state.set_phase(PipelinePhase::Idle);
+    tui_log(state, "INFO", "Starting queued transcode pass");
+    emit_event(
+        config,
+        base_dir,
+        "pass_start",
+        json!({
+            "dry_run": dry_run,
+            "share_count": config.shares.len(),
+            "source": "queue",
+        }),
+    );
+
+    if is_pause_requested(config, base_dir) {
+        state.set_phase(PipelinePhase::Paused);
+        tui_log(state, "WARN", "Pause file present; pausing pipeline");
+        return Err(WatchdogError::Paused);
+    }
+
+    verify_mounts_and_update_state(config, deps, state, dry_run)?;
+    let transcode_queue = load_queue_candidates(config, deps, db, state);
+    if transcode_queue.is_empty() {
+        tui_log(state, "INFO", "Durable queue is empty after refresh");
+        finalize_runtime_state(state, db);
+        state.set_phase(PipelinePhase::Idle);
+        emit_event(
+            config,
+            base_dir,
+            "pass_end",
+            json!({
+                "result": "ok",
+                "source": "queue",
+                "discovered_files": 0,
+                "inspected_files": 0,
+                "queued_files": 0,
+                "transcoded_files": 0,
+                "failed_files": 0,
+                "retries_scheduled": 0,
+                "space_saved_bytes": 0,
+            }),
+        );
+        return Ok(RunStats::default());
+    }
+
+    state.set_queue_info(0, transcode_queue.len() as u32);
+    tui_log(
+        state,
+        "INFO",
+        &format!(
+            "Queue ready: {} file(s) pending from durable queue",
+            transcode_queue.len()
+        ),
+    );
+
+    let stats =
+        process_transcode_queue(config, base_dir, deps, db, state, transcode_queue, shutdown_rx)
+            .await?;
+    tui_log(
+        state,
+        "INFO",
+        &format!(
+            "Pass complete: {} transcoded, {} failures, {} retries scheduled, {} saved",
+            stats.files_transcoded,
+            stats.transcode_failures,
+            stats.retries_scheduled,
+            format_bytes_signed(stats.space_saved_bytes)
+        ),
+    );
+    emit_event(
+        config,
+        base_dir,
+        "pass_end",
+        json!({
+            "result": "ok",
+            "source": "queue",
+            "discovered_files": 0,
+            "inspected_files": stats.files_inspected,
+            "queued_files": stats.files_queued,
+            "transcoded_files": stats.files_transcoded,
+            "failed_files": stats.transcode_failures,
+            "retries_scheduled": stats.retries_scheduled,
+            "space_saved_bytes": stats.space_saved_bytes,
+        }),
+    );
+    Ok(stats)
 }
 
 /// All injectable dependencies for the pipeline.
@@ -253,22 +592,7 @@ pub async fn run_watchdog_pass(
     }
 
     state.set_phase(PipelinePhase::Scanning);
-    state.set_current_file(None);
-    state.reset_file_progress();
-    state.update(|s| {
-        s.run_inspected = 0;
-        s.run_transcoded = 0;
-        s.run_failures = 0;
-        s.run_retries_scheduled = 0;
-        s.run_space_saved = 0;
-        s.run_skipped_inspected = 0;
-        s.run_skipped_young = 0;
-        s.run_skipped_cooldown = 0;
-        s.run_skipped_filtered = 0;
-        s.run_skipped_in_use = 0;
-        s.run_skipped_quarantined = 0;
-        s.quarantined_files = db.quarantine_count().max(0) as u64;
-    });
+    reset_run_state(state, db);
     tui_log(state, "INFO", "Starting watchdog scan pass");
     emit_event(
         config,
@@ -286,55 +610,9 @@ pub async fn run_watchdog_pass(
         return Err(WatchdogError::Paused);
     }
 
-    // Ensure NFS mounts (dry-run is read-only: do not perform remount attempts)
-    let shares: Vec<(String, String, String)> = config
-        .shares
-        .iter()
-        .map(|s| (s.name.clone(), s.remote_path.clone(), s.local_mount.clone()))
-        .collect();
-
-    if dry_run {
-        let unhealthy: Vec<String> = shares
-            .iter()
-            .filter_map(|(name, _remote, local_mount)| {
-                (!deps.mount_manager.is_healthy(Path::new(local_mount))).then_some(name.clone())
-            })
-            .collect();
-        if let Some(first) = unhealthy.first() {
-            return Err(WatchdogError::NfsMount {
-                share: first.clone(),
-                reason: format!(
-                    "Dry-run mode is read-only and will not remount unhealthy shares ({} unhealthy)",
-                    unhealthy.len()
-                ),
-            });
-        }
-    } else {
-        ensure_all_mounts(deps.mount_manager.as_ref(), &config.nfs.server, &shares)?;
-    }
-    let share_health = config
-        .shares
-        .iter()
-        .map(|share| {
-            let healthy = deps.mount_manager.is_healthy(Path::new(&share.local_mount));
-            (share.name.clone(), healthy)
-        })
-        .collect::<Vec<_>>();
-    state.set_share_health(share_health.clone());
-    state.set_nfs_healthy(share_health.iter().all(|(_, healthy)| *healthy));
-    tui_log(
-        state,
-        "INFO",
-        &format!("NFS mounts verified ({} shares)", shares.len()),
-    );
+    verify_mounts_and_update_state(config, deps, state, dry_run)?;
 
     // Prepare paths
-    let preset_path = config.resolve_path(base_dir, &config.transcode.preset_file);
-    let preset_contract = PresetContract::resolve(
-        &preset_path,
-        &config.transcode.preset_name,
-        &config.transcode.target_codec,
-    )?;
     let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
     if !dry_run {
         deps.fs.create_dir_all(&temp_dir)?;
@@ -394,7 +672,6 @@ pub async fn run_watchdog_pass(
 
     let include_globs = build_glob_matcher(&config.scan.include_globs)?;
     let exclude_globs = build_glob_matcher(&config.scan.exclude_globs)?;
-    let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
     let now_ts = chrono::Utc::now().timestamp();
     let queue_cap = if config.scan.max_files_per_pass > 0 {
         Some(config.scan.max_files_per_pass as usize)
@@ -655,16 +932,92 @@ pub async fn run_watchdog_pass(
         return Ok(stats);
     }
 
-    // Per-file processing loop (import -> transcode -> export)
+    enqueue_queue_candidates(db, &transcode_queue, "scan");
+    let mut process_stats =
+        process_transcode_queue(config, base_dir, deps, db, state, transcode_queue, shutdown_rx)
+            .await?;
+    process_stats.files_inspected += stats.files_inspected;
+    process_stats.files_queued = process_stats.files_queued.max(stats.files_queued);
+    tui_log(
+        state,
+        "INFO",
+        &format!(
+            "Pass complete: {} transcoded, {} failures, {} retries scheduled, {} saved",
+            process_stats.files_transcoded,
+            process_stats.transcode_failures,
+            process_stats.retries_scheduled,
+            format_bytes_signed(process_stats.space_saved_bytes)
+        ),
+    );
+    emit_event(
+        config,
+        base_dir,
+        "pass_end",
+        json!({
+            "result": "ok",
+            "discovered_files": discovered_count,
+            "inspected_files": process_stats.files_inspected,
+            "queued_files": process_stats.files_queued,
+            "transcoded_files": process_stats.files_transcoded,
+            "failed_files": process_stats.transcode_failures,
+            "retries_scheduled": process_stats.retries_scheduled,
+            "space_saved_bytes": process_stats.space_saved_bytes,
+        }),
+    );
 
+    Ok(process_stats)
+}
+
+async fn process_transcode_queue(
+    config: &Config,
+    base_dir: &Path,
+    deps: &PipelineDeps,
+    db: &Arc<WatchdogDb>,
+    state: &StateManager,
+    mut transcode_queue: Vec<(FileEntry, TranscodeEval)>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> Result<RunStats> {
+    let mut stats = RunStats {
+        files_queued: transcode_queue.len() as u64,
+        ..RunStats::default()
+    };
     let mut attempt_counts: std::collections::HashMap<PathBuf, u32> =
         std::collections::HashMap::new();
-    let initial_queue_length = transcode_queue.len();
+    let mut outstanding_paths = transcode_queue
+        .iter()
+        .map(|(entry, _)| entry.path.clone())
+        .collect::<HashSet<_>>();
     let mut processed = 0u32;
-    let mut idx = 0;
+    let mut idx = 0usize;
+
+    let preset_path = config.resolve_path(base_dir, &config.transcode.preset_file);
+    let preset_contract = PresetContract::resolve(
+        &preset_path,
+        &config.transcode.preset_name,
+        &config.transcode.target_codec,
+    )?;
+    let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
+    deps.fs.create_dir_all(&temp_dir)?;
+    let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
+    state.set_queue_info(0, db.get_queue_count().max(0) as u32);
 
     while idx < transcode_queue.len() {
-        // Check shutdown
+        let previous_len = transcode_queue.len();
+        let appended = append_new_db_queue_items(
+            config,
+            deps,
+            db,
+            state,
+            &mut transcode_queue,
+            &outstanding_paths,
+        );
+        if appended > 0 {
+            stats.files_queued += appended as u64;
+            for (entry, _) in &transcode_queue[previous_len..] {
+                outstanding_paths.insert(entry.path.clone());
+            }
+        }
+
         if shutdown_requested(&mut shutdown_rx) {
             info!("Shutdown requested, stopping pipeline");
             return Err(WatchdogError::Shutdown);
@@ -681,9 +1034,8 @@ pub async fn run_watchdog_pass(
         let path = &entry.path;
         let share_name = &entry.share_name;
         let path_str = path.to_string_lossy().to_string();
+        db.mark_queue_item_started(&path_str);
         let final_path = preset_contract.output_path_for(path);
-        let final_display_filename = final_path.file_name().unwrap_or_default().to_string_lossy();
-
         let attempt_num = {
             let count = attempt_counts.entry(path.clone()).or_insert(0);
             *count += 1;
@@ -691,9 +1043,8 @@ pub async fn run_watchdog_pass(
         };
         processed += 1;
 
-        let progress_total =
-            initial_queue_length.max((processed as usize) + (transcode_queue.len() - idx));
-
+        let progress_total = (processed.saturating_sub(1) as usize) + db.get_queue_count() as usize;
+        let display_filename = path.file_name().unwrap_or_default().to_string_lossy();
         info!(
             "------ Beginning analysis on item {}/{}: {} (attempt {}/{}) ------",
             processed,
@@ -702,7 +1053,6 @@ pub async fn run_watchdog_pass(
             attempt_num,
             config.transcode.max_retries + 1
         );
-        let display_filename = path.file_name().unwrap_or_default().to_string_lossy();
         tui_log(
             state,
             "INFO",
@@ -717,8 +1067,6 @@ pub async fn run_watchdog_pass(
 
         let transcode_start = Instant::now();
         let original_size = deps.fs.file_size(path).unwrap_or(entry.size) as i64;
-
-        // Record in DB
         let db_row_id = match db.record_transcode_start(
             &path_str,
             share_name,
@@ -728,15 +1076,6 @@ pub async fn run_watchdog_pass(
         ) {
             Ok(id) => id,
             Err(e) => {
-                error!(
-                    "[{}] Failed to record transcode start for {}: {}",
-                    share_name, path_str, e
-                );
-                tui_log(
-                    state,
-                    "ERROR",
-                    "Database write failed (transcode start); aborting pass",
-                );
                 return Err(WatchdogError::Database(e));
             }
         };
@@ -754,28 +1093,16 @@ pub async fn run_watchdog_pass(
             db_row_id,
             transcode_start.elapsed().as_secs_f64(),
         ) {
+            db.remove_queue_item(&path_str);
+            outstanding_paths.remove(path);
             continue;
         }
 
-        // Check disk space
         let required = (original_size as f64 * config.transcode.min_free_space_multiplier) as u64;
         match deps.fs.free_space(&temp_dir) {
             Ok(free) if free < required => {
-                warn!(
-                    "[{}] Skipping {}: insufficient temp space (need {}, have {})",
-                    share_name,
-                    path_str,
-                    format_bytes(required),
-                    format_bytes(free)
-                );
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "WARN",
-                    &format!("Skipped {}: insufficient disk space", display_filename),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
                     state,
                     db.as_ref(),
@@ -783,27 +1110,19 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     FailureCode::InsufficientTempSpace,
                     "insufficient_temp_space",
                     true,
                 );
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
                 continue;
             }
             Ok(_) => {}
-            Err(e) => {
-                warn!(
-                    "[{}] Skipping {}: failed to determine temp free space ({}), failing closed",
-                    share_name, path_str, e
-                );
+            Err(_) => {
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "WARN",
-                    &format!("Skipped {}: temp-space probe failed", display_filename),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
                     state,
                     db.as_ref(),
@@ -811,16 +1130,17 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     FailureCode::TempSpaceProbeError,
                     "temp_space_probe_error",
                     true,
                 );
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
                 continue;
             }
         }
 
-        // Build collision-resistant temp paths using a deterministic hash of full source path.
         let (local_source, local_output) = build_local_temp_paths(
             &temp_dir,
             share_name,
@@ -828,13 +1148,7 @@ pub async fn run_watchdog_pass(
             &preset_contract.container_extension,
         );
 
-        // Step 1: rsync source to temp
         state.set_phase(PipelinePhase::Transferring);
-        tui_log(
-            state,
-            "INFO",
-            &format!("Rsync source -> temp: {}", display_filename),
-        );
         state.set_progress_stage(ProgressStage::Import);
         let rsync_timeout = if original_size > 0 {
             (original_size as u64 / (1024 * 1024)).max(300)
@@ -845,10 +1159,14 @@ pub async fn run_watchdog_pass(
         let transfer_result = tokio::task::block_in_place(|| {
             let mut result: Option<Result<TransferResult>> = None;
             let (transfer_tx, mut transfer_rx) = mpsc::channel::<TransferProgress>(32);
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    while let Some(p) = transfer_rx.blocking_recv() {
-                        state.set_import_progress(p.percent, p.rate_mib_per_sec, p.eta);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while let Some(progress) = transfer_rx.blocking_recv() {
+                        state.set_import_progress(
+                            progress.percent,
+                            progress.rate_mib_per_sec,
+                            progress.eta,
+                        );
                     }
                 });
 
@@ -864,41 +1182,36 @@ pub async fn run_watchdog_pass(
         });
 
         match transfer_result {
-            Ok(r) if r.success => {
+            Ok(result) if result.success => {
                 state.set_import_progress(100.0, 0.0, String::new());
-                tui_log(
-                    state,
-                    "INFO",
-                    &format!("Rsync complete: {}", display_filename),
-                );
             }
-            Ok(_) => {
-                error!("[{}] Failed to rsync source: {}", share_name, path_str);
+            Ok(_) | Err(_) => {
+                let failure_code = if transfer_result.is_ok() {
+                    FailureCode::TransferFailedRequeued
+                } else {
+                    FailureCode::TransferErrorRequeued
+                };
+                let hard_failure = if transfer_result.is_ok() {
+                    FailureCode::TransferFailed
+                } else {
+                    FailureCode::TransferError
+                };
                 let dur = transcode_start.elapsed().as_secs_f64();
                 if attempt_num <= config.transcode.max_retries {
-                    tui_log(
-                        state,
-                        "WARN",
-                        &format!("Transfer failed, requeuing: {}", display_filename),
-                    );
-                    transcode_queue.push((entry.clone(), eval.clone()));
                     db.record_transcode_end_with_code(
                         db_row_id,
                         TranscodeOutcome::Failed,
                         0,
                         0,
                         dur,
-                        Some("rsync failed (requeued)"),
-                        Some(FailureCode::TransferFailedRequeued.as_str()),
+                        Some(failure_code.as_str()),
+                        Some(failure_code.as_str()),
                     );
+                    db.requeue_queue_item(&path_str);
+                    transcode_queue.push((entry.clone(), eval.clone()));
                 } else {
                     stats.transcode_failures += 1;
                     state.update(|s| s.run_failures += 1);
-                    tui_log(
-                        state,
-                        "ERROR",
-                        &format!("Transfer failed (retries exhausted): {}", display_filename),
-                    );
                     record_failure(
                         state,
                         db.as_ref(),
@@ -907,71 +1220,21 @@ pub async fn run_watchdog_pass(
                         &path_str,
                         db_row_id,
                         dur,
-                        FailureCode::TransferFailed,
-                        "transfer_failed",
+                        hard_failure,
+                        hard_failure.as_str(),
                         true,
                     );
-                }
-                cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
-                continue;
-            }
-            Err(e) => {
-                error!("[{}] rsync error: {}", share_name, e);
-                let dur = transcode_start.elapsed().as_secs_f64();
-                if attempt_num <= config.transcode.max_retries {
-                    tui_log(
-                        state,
-                        "WARN",
-                        &format!("Transfer error, requeuing: {}", display_filename),
-                    );
-                    transcode_queue.push((entry.clone(), eval.clone()));
-                    db.record_transcode_end_with_code(
-                        db_row_id,
-                        TranscodeOutcome::Failed,
-                        0,
-                        0,
-                        dur,
-                        Some("rsync error (requeued)"),
-                        Some(FailureCode::TransferErrorRequeued.as_str()),
-                    );
-                } else {
-                    stats.transcode_failures += 1;
-                    state.update(|s| s.run_failures += 1);
-                    tui_log(
-                        state,
-                        "ERROR",
-                        &format!("Transfer error (retries exhausted): {}", display_filename),
-                    );
-                    record_failure(
-                        state,
-                        db.as_ref(),
-                        config,
-                        base_dir,
-                        &path_str,
-                        db_row_id,
-                        dur,
-                        FailureCode::TransferError,
-                        "transfer_error",
-                        true,
-                    );
+                    db.remove_queue_item(&path_str);
+                    outstanding_paths.remove(path);
                 }
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
         }
 
-        // Step 2: Transcode
         let (effective_timeout_secs, effective_stall_timeout_secs) =
             transcode_timeouts_for_attempt(config, attempt_num);
         state.set_phase(PipelinePhase::Transcoding);
-        tui_log(
-            state,
-            "INFO",
-            &format!(
-                "Starting HandBrake encode: {} (timeout={}s stall={}s)",
-                display_filename, effective_timeout_secs, effective_stall_timeout_secs
-            ),
-        );
         state.set_progress_stage(ProgressStage::Transcode);
         let (progress_tx, mut progress_rx) = mpsc::channel::<TranscodeProgress>(32);
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1010,17 +1273,19 @@ pub async fn run_watchdog_pass(
                 }
             }
         });
-
         let transcode_result = tokio::task::block_in_place(|| {
             let mut result: Option<Result<TranscodeResult>> = None;
-            std::thread::scope(|s| {
-                // Drain progress in a scoped thread so we can borrow `state`
-                s.spawn(|| {
-                    while let Some(p) = progress_rx.blocking_recv() {
-                        state.set_transcode_progress(p.percent, p.fps, p.avg_fps, p.eta);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while let Some(progress) = progress_rx.blocking_recv() {
+                        state.set_transcode_progress(
+                            progress.percent,
+                            progress.fps,
+                            progress.avg_fps,
+                            progress.eta,
+                        );
                     }
                 });
-
                 result = Some(deps.transcoder.transcode(
                     &local_source,
                     &local_output,
@@ -1038,155 +1303,43 @@ pub async fn run_watchdog_pass(
         let _ = monitor_task.await;
 
         match transcode_result {
-            Err(WatchdogError::TranscodeTimeout { timeout_secs, .. }) => {
-                warn!(
-                    "[{}] Transcode timed out after {}s: {}",
-                    share_name, timeout_secs, path_str
-                );
-
-                if attempt_num <= config.transcode.max_retries {
-                    info!(
-                        "[{}] Requeueing after timeout (attempt {}/{}): {}",
-                        share_name,
-                        attempt_num,
-                        config.transcode.max_retries + 1,
-                        path_str
-                    );
-                    tui_log(
-                        state,
-                        "WARN",
-                        &format!(
-                            "Timeout, requeuing: {} (attempt {})",
-                            display_filename, attempt_num
-                        ),
-                    );
-                    transcode_queue.push((
-                        entry.clone(),
-                        TranscodeEval {
-                            needs_transcode: true,
-                            reasons: vec!["retry after timeout".to_string()],
-                            bitrate_mbps: eval.bitrate_mbps,
-                            video_codec: eval.video_codec.clone(),
-                            bitrate_bps: eval.bitrate_bps,
-                        },
-                    ));
-                    let dur = transcode_start.elapsed().as_secs_f64();
-                    db.record_transcode_end_with_code(
-                        db_row_id,
-                        TranscodeOutcome::RetryScheduled,
-                        0,
-                        0,
-                        dur,
-                        Some("timeout (retrying in-pass)"),
-                        Some(FailureCode::TimeoutRequeued.as_str()),
-                    );
-                    stats.retries_scheduled += 1;
-                    state.update(|s| {
-                        s.run_retries_scheduled += 1;
-                        s.total_retries_scheduled += 1;
-                    });
-                } else {
-                    warn!(
-                        "[{}] Timeout retries exhausted; scheduling delayed retry for {}",
-                        share_name, path_str
-                    );
-                    let dur = transcode_start.elapsed().as_secs_f64();
-                    match record_retry_scheduled(
-                        state,
-                        db.as_ref(),
-                        config,
-                        base_dir,
-                        &path_str,
-                        db_row_id,
-                        dur,
-                        FailureCode::TimeoutExhausted,
-                        "timeout_exhausted",
-                        true,
-                    ) {
-                        RetryScheduleDisposition::Scheduled => {
-                            stats.retries_scheduled += 1;
-                            state.update(|s| {
-                                s.run_retries_scheduled += 1;
-                                s.total_retries_scheduled += 1;
-                            });
-                            tui_log(
-                                state,
-                                "WARN",
-                                &format!(
-                                    "Timeout retries exhausted, delayed retry scheduled: {}",
-                                    display_filename
-                                ),
-                            );
-                        }
-                        RetryScheduleDisposition::Quarantined => {
-                            stats.transcode_failures += 1;
-                            state.update(|s| s.run_failures += 1);
-                            tui_log(
-                                state,
-                                "ERROR",
-                                &format!("Timed out repeatedly; quarantined: {}", display_filename),
-                            );
-                        }
-                    }
-                }
-                cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
-                continue;
+            Ok(result) if result.success && result.output_exists => {
+                state.update(|s| {
+                    s.progress_stage = ProgressStage::Transcode;
+                    s.transcode_percent = s.transcode_percent.max(100.0);
+                });
             }
-            Err(WatchdogError::TranscodeStalled {
-                stall_timeout_secs, ..
-            }) => {
-                warn!(
-                    "[{}] Transcode stalled after {}s with no progress: {}",
-                    share_name, stall_timeout_secs, path_str
-                );
-
+            Err(WatchdogError::TranscodeTimeout { .. }) | Err(WatchdogError::TranscodeStalled { .. }) => {
+                let is_timeout = matches!(transcode_result, Err(WatchdogError::TranscodeTimeout { .. }));
+                let dur = transcode_start.elapsed().as_secs_f64();
                 if attempt_num <= config.transcode.max_retries {
-                    info!(
-                        "[{}] Requeueing after stall (attempt {}/{}): {}",
-                        share_name,
-                        attempt_num,
-                        config.transcode.max_retries + 1,
-                        path_str
-                    );
-                    tui_log(
-                        state,
-                        "WARN",
-                        &format!(
-                            "Stalled, requeuing: {} (attempt {})",
-                            display_filename, attempt_num
-                        ),
-                    );
-                    transcode_queue.push((
-                        entry.clone(),
-                        TranscodeEval {
-                            needs_transcode: true,
-                            reasons: vec!["retry after stall".to_string()],
-                            bitrate_mbps: eval.bitrate_mbps,
-                            video_codec: eval.video_codec.clone(),
-                            bitrate_bps: eval.bitrate_bps,
-                        },
-                    ));
-                    let dur = transcode_start.elapsed().as_secs_f64();
+                    let failure_code = if is_timeout {
+                        FailureCode::TimeoutRequeued
+                    } else {
+                        FailureCode::StalledRequeued
+                    };
                     db.record_transcode_end_with_code(
                         db_row_id,
                         TranscodeOutcome::RetryScheduled,
                         0,
                         0,
                         dur,
-                        Some("stalled (retrying in-pass)"),
-                        Some(FailureCode::StalledRequeued.as_str()),
+                        Some(failure_code.as_str()),
+                        Some(failure_code.as_str()),
                     );
                     stats.retries_scheduled += 1;
                     state.update(|s| {
                         s.run_retries_scheduled += 1;
                         s.total_retries_scheduled += 1;
                     });
+                    db.requeue_queue_item(&path_str);
+                    transcode_queue.push((entry.clone(), eval.clone()));
                 } else {
-                    warn!(
-                        "[{}] Stall retries exhausted; scheduling delayed retry for {}",
-                        share_name, path_str
-                    );
-                    let dur = transcode_start.elapsed().as_secs_f64();
+                    let failure_code = if is_timeout {
+                        FailureCode::TimeoutExhausted
+                    } else {
+                        FailureCode::StalledExhausted
+                    };
                     match record_retry_scheduled(
                         state,
                         db.as_ref(),
@@ -1195,8 +1348,8 @@ pub async fn run_watchdog_pass(
                         &path_str,
                         db_row_id,
                         dur,
-                        FailureCode::StalledExhausted,
-                        "stalled_exhausted",
+                        failure_code,
+                        failure_code.as_str(),
                         true,
                     ) {
                         RetryScheduleDisposition::Scheduled => {
@@ -1205,38 +1358,24 @@ pub async fn run_watchdog_pass(
                                 s.run_retries_scheduled += 1;
                                 s.total_retries_scheduled += 1;
                             });
-                            tui_log(
-                                state,
-                                "WARN",
-                                &format!(
-                                    "Stall retries exhausted, delayed retry scheduled: {}",
-                                    display_filename
-                                ),
-                            );
                         }
                         RetryScheduleDisposition::Quarantined => {
                             stats.transcode_failures += 1;
                             state.update(|s| s.run_failures += 1);
-                            tui_log(
-                                state,
-                                "ERROR",
-                                &format!("Stalled repeatedly; quarantined: {}", display_filename),
-                            );
                         }
                     }
+                    db.remove_queue_item(&path_str);
+                    outstanding_paths.remove(path);
                 }
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
                 continue;
             }
             Err(WatchdogError::TranscodeCancelled { .. }) => {
-                let dur = transcode_start.elapsed().as_secs_f64();
                 let reason = match cancel_reason.load(Ordering::Relaxed) {
                     CANCEL_SHUTDOWN => "interrupted_by_shutdown",
                     CANCEL_PAUSE => "interrupted_by_pause",
                     _ => "interrupted",
                 };
-                // Operator-driven interruptions are recorded in history but should not
-                // increment per-file cooldown counters.
                 record_failure(
                     state,
                     db.as_ref(),
@@ -1244,7 +1383,7 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     match cancel_reason.load(Ordering::Relaxed) {
                         CANCEL_SHUTDOWN => FailureCode::InterruptedShutdown,
                         CANCEL_PAUSE => FailureCode::InterruptedPause,
@@ -1260,16 +1399,13 @@ pub async fn run_watchdog_pass(
                 }
                 return Err(WatchdogError::Shutdown);
             }
-            Err(e) => {
-                error!("[{}] Transcode error: {}", share_name, e);
+            Err(_) | Ok(_) => {
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!("Transcode error: {}", display_filename),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
+                let failure_code = match transcode_result {
+                    Err(_) => FailureCode::TranscodeError,
+                    Ok(_) => FailureCode::TranscodeFailed,
+                };
                 record_failure(
                     state,
                     db.as_ref(),
@@ -1277,62 +1413,26 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
-                    FailureCode::TranscodeError,
-                    "transcode_error",
+                    transcode_start.elapsed().as_secs_f64(),
+                    failure_code,
+                    failure_code.as_str(),
                     true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
                 continue;
             }
-            Ok(ref r) if !r.success || !r.output_exists => {
-                error!("[{}] Transcode failed for {}", share_name, path_str);
-                stats.transcode_failures += 1;
-                state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!("Transcode failed: {}", display_filename),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
-                record_failure(
-                    state,
-                    db.as_ref(),
-                    config,
-                    base_dir,
-                    &path_str,
-                    db_row_id,
-                    dur,
-                    FailureCode::TranscodeFailed,
-                    "transcode_failed",
-                    true,
-                );
-                cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
-                continue;
-            }
-            Ok(_) => {
-                state.update(|s| {
-                    s.progress_stage = ProgressStage::Transcode;
-                    s.transcode_percent = s.transcode_percent.max(100.0);
-                });
-            } // Success, continue to verification
         }
 
-        // Step 3: Pre-verify output file exists and is non-zero
-        if !deps.fs.exists(&local_output) {
-            error!(
-                "[{}] Transcoded output file does not exist: {}",
-                share_name,
-                local_output.display()
-            );
+        if !deps.fs.exists(&local_output) || deps.fs.file_size(&local_output).unwrap_or(0) == 0 {
             stats.transcode_failures += 1;
             state.update(|s| s.run_failures += 1);
-            tui_log(
-                state,
-                "ERROR",
-                &format!("Output missing after transcode: {}", display_filename),
-            );
-            let dur = transcode_start.elapsed().as_secs_f64();
+            let failure_code = if deps.fs.exists(&local_output) {
+                FailureCode::OutputZeroBytes
+            } else {
+                FailureCode::OutputMissing
+            };
             record_failure(
                 state,
                 db.as_ref(),
@@ -1340,46 +1440,17 @@ pub async fn run_watchdog_pass(
                 base_dir,
                 &path_str,
                 db_row_id,
-                dur,
-                FailureCode::OutputMissing,
-                "output_missing",
+                transcode_start.elapsed().as_secs_f64(),
+                failure_code,
+                failure_code.as_str(),
                 true,
             );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
-            continue;
-        }
-        let output_file_size = deps.fs.file_size(&local_output).unwrap_or(0);
-        if output_file_size == 0 {
-            error!(
-                "[{}] Transcoded output file is 0 bytes: {}",
-                share_name,
-                local_output.display()
-            );
-            stats.transcode_failures += 1;
-            state.update(|s| s.run_failures += 1);
-            tui_log(
-                state,
-                "ERROR",
-                &format!("Output is 0 bytes: {}", display_filename),
-            );
-            let dur = transcode_start.elapsed().as_secs_f64();
-            record_failure(
-                state,
-                db.as_ref(),
-                config,
-                base_dir,
-                &path_str,
-                db_row_id,
-                dur,
-                FailureCode::OutputZeroBytes,
-                "output_zero_bytes",
-                true,
-            );
-            cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+            db.remove_queue_item(&path_str);
+            outstanding_paths.remove(path);
             continue;
         }
 
-        // Step 3b: Verify transcode metadata (duration, streams, health)
         let verified = tokio::task::block_in_place(|| {
             verify_transcode(
                 deps.prober.as_ref(),
@@ -1388,35 +1459,11 @@ pub async fn run_watchdog_pass(
                 &preset_contract,
             )
         });
-
         match verified {
-            Ok(VerificationOutcome::Passed) => {
-                tui_log(
-                    state,
-                    "INFO",
-                    &format!("Verification passed: {}", display_filename),
-                );
-            }
+            Ok(VerificationOutcome::Passed) => {}
             Ok(VerificationOutcome::Failed(failure)) => {
-                error!(
-                    "[{}] Verification failed for {}: {} ({})",
-                    share_name,
-                    path_str,
-                    failure.summary(),
-                    failure.code()
-                );
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!(
-                        "Verification failed [{}]: {}",
-                        failure.code(),
-                        display_filename
-                    ),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure_with_code(
                     state,
                     db.as_ref(),
@@ -1424,24 +1471,19 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     failure.code(),
                     failure.code(),
                     true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
                 continue;
             }
-            Err(e) => {
-                error!("[{}] Verification error: {}", share_name, e);
+            Err(_) => {
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!("Verification error: {}", display_filename),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
                     state,
                     db.as_ref(),
@@ -1449,38 +1491,23 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     FailureCode::VerificationError,
                     "verification_error",
                     true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
                 continue;
             }
         }
 
-        // Step 4: Size sanity checks
         let new_size = deps.fs.file_size(&local_output).unwrap_or(0) as i64;
-
-        // Reject suspiciously tiny output (< 1MB or < 1% of original).
-        // This catches truncated/garbage transcodes that somehow passed verification.
         let min_size = (original_size as f64 * 0.01).max(1_000_000.0) as i64;
         if new_size < min_size {
-            error!(
-                "[{}] Output file suspiciously small ({} vs min {}); rejecting: {}",
-                share_name,
-                format_bytes(new_size as u64),
-                format_bytes(min_size as u64),
-                path_str
-            );
             stats.transcode_failures += 1;
             state.update(|s| s.run_failures += 1);
-            tui_log(
-                state,
-                "ERROR",
-                &format!("Output too small, rejecting: {}", display_filename),
-            );
-            let dur = transcode_start.elapsed().as_secs_f64();
             record_failure(
                 state,
                 db.as_ref(),
@@ -1488,61 +1515,37 @@ pub async fn run_watchdog_pass(
                 base_dir,
                 &path_str,
                 db_row_id,
-                dur,
+                transcode_start.elapsed().as_secs_f64(),
                 FailureCode::OutputSuspiciouslySmall,
                 "output_suspiciously_small",
                 true,
             );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+            db.remove_queue_item(&path_str);
+            outstanding_paths.remove(path);
             continue;
         }
-
         if new_size >= original_size {
-            info!(
-                "[{}] Not space-efficient (new {} >= orig {}); skipping replace",
-                share_name,
-                format_bytes(new_size as u64),
-                format_bytes(original_size as u64)
-            );
-            tui_log(
-                state,
-                "INFO",
-                &format!("Skipped (no space savings): {}", display_filename),
-            );
             db.mark_inspected(&path_str, entry.size, entry.mtime);
-            let dur = transcode_start.elapsed().as_secs_f64();
             db.record_transcode_end(
                 db_row_id,
                 TranscodeOutcome::SkippedNoSavings,
                 new_size,
                 0,
-                dur,
+                transcode_start.elapsed().as_secs_f64(),
                 None,
             );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+            db.remove_queue_item(&path_str);
+            outstanding_paths.remove(path);
             continue;
         }
 
-        // Step 5: Verify NFS share has enough free space for the replacement file.
-        // We need at least the output file size free on the target share.
         let share_path = final_path.parent().unwrap_or(path);
         match deps.fs.free_space(share_path) {
             Ok(share_free) if share_free < new_size as u64 => {
-                warn!(
-                    "[{}] Insufficient space on NFS share for replacement (need {}, have {}): {}",
-                    share_name,
-                    format_bytes(new_size as u64),
-                    format_bytes(share_free),
-                    path_str
-                );
-                tui_log(
-                    state,
-                    "WARN",
-                    &format!("Insufficient NFS space, skipping: {}", display_filename),
-                );
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
                     state,
                     db.as_ref(),
@@ -1550,28 +1553,20 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     FailureCode::InsufficientNfsSpace,
                     "insufficient_nfs_space",
                     true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
                 continue;
             }
             Ok(_) => {}
-            Err(e) => {
-                warn!(
-                    "[{}] Skipping {}: failed to determine NFS free space ({}), failing closed",
-                    share_name, path_str, e
-                );
+            Err(_) => {
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "WARN",
-                    &format!("Skipped {}: NFS-space probe failed", display_filename),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
                     state,
                     db.as_ref(),
@@ -1579,41 +1574,23 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     FailureCode::NfsSpaceProbeError,
                     "nfs_space_probe_error",
                     true,
                 );
                 cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
                 continue;
             }
         }
 
-        // Step 6: Verify the original file hasn't changed since we started.
-        // If it was modified (e.g., by Jellyfin, the user, or another tool),
-        // we must NOT replace it — we'd overwrite the newer version.
         let current_size = deps.fs.file_size(path).unwrap_or(0);
         let current_mtime = deps.fs.file_mtime(path).unwrap_or(0.0);
         if current_size != entry.size || (current_mtime - entry.mtime).abs() > 1.0 {
-            warn!(
-                "[{}] Original file changed during transcode (size: {} -> {}, mtime delta: {:.1}s); aborting replace: {}",
-                share_name,
-                entry.size,
-                current_size,
-                (current_mtime - entry.mtime).abs(),
-                path_str
-            );
-            tui_log(
-                state,
-                "WARN",
-                &format!(
-                    "File changed during transcode, skipping replace: {}",
-                    display_filename
-                ),
-            );
             stats.transcode_failures += 1;
             state.update(|s| s.run_failures += 1);
-            let dur = transcode_start.elapsed().as_secs_f64();
             record_failure(
                 state,
                 db.as_ref(),
@@ -1621,16 +1598,17 @@ pub async fn run_watchdog_pass(
                 base_dir,
                 &path_str,
                 db_row_id,
-                dur,
+                transcode_start.elapsed().as_secs_f64(),
                 FailureCode::SourceChangedDuringTranscode,
                 "source_changed_during_transcode",
                 true,
             );
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+            db.remove_queue_item(&path_str);
+            outstanding_paths.remove(path);
             continue;
         }
 
-        // Step 7: Safe replace
         state.set_phase(PipelinePhase::Transferring);
         if check_file_in_use_best_effort(
             config,
@@ -1646,6 +1624,8 @@ pub async fn run_watchdog_pass(
             transcode_start.elapsed().as_secs_f64(),
         ) {
             cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+            db.remove_queue_item(&path_str);
+            outstanding_paths.remove(path);
             continue;
         }
 
@@ -1653,10 +1633,14 @@ pub async fn run_watchdog_pass(
         let replaced = tokio::task::block_in_place(|| {
             let mut result: Option<Result<SafeReplaceOutcome>> = None;
             let (transfer_tx, mut transfer_rx) = mpsc::channel::<TransferProgress>(32);
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    while let Some(p) = transfer_rx.blocking_recv() {
-                        state.set_export_progress(p.percent, p.rate_mib_per_sec, p.eta);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while let Some(progress) = transfer_rx.blocking_recv() {
+                        state.set_export_progress(
+                            progress.percent,
+                            progress.rate_mib_per_sec,
+                            progress.eta,
+                        );
                     }
                 });
                 result = Some(safe_replace(
@@ -1684,56 +1668,29 @@ pub async fn run_watchdog_pass(
             Ok(SafeReplaceOutcome::Replaced { installed_path }) => {
                 state.set_export_progress(100.0, 0.0, String::new());
                 let space_saved = original_size - new_size;
-                stats.files_transcoded += 1;
-                stats.space_saved_bytes += space_saved;
                 let installed_path_str = installed_path.to_string_lossy().to_string();
-
-                // Update DB
                 if let Ok(new_mtime) = deps.fs.file_mtime(&installed_path) {
                     let new_file_size = deps.fs.file_size(&installed_path).unwrap_or(0);
                     db.mark_inspected(&installed_path_str, new_file_size, new_mtime);
                 }
-                let dur = transcode_start.elapsed().as_secs_f64();
                 db.record_transcode_end(
                     db_row_id,
                     TranscodeOutcome::Replaced,
                     new_size,
                     space_saved,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     None,
                 );
                 db.clear_file_failure_state(&path_str);
-
-                // Log space saved to timeseries
-                let cumulative = db.get_total_space_saved() + space_saved;
-                db.log_space_saved(cumulative);
-
-                info!(
-                    "[{}] SUCCESS: Replaced {} -> {} | Saved {}",
-                    share_name,
-                    path_str,
-                    installed_path_str,
-                    format_bytes_signed(space_saved)
-                );
-                tui_log(
-                    state,
-                    "SUCCESS",
-                    &format!(
-                        "Replaced {} -> {} | Saved {}",
-                        display_filename,
-                        final_display_filename,
-                        format_bytes_signed(space_saved)
-                    ),
-                );
-
-                // Update state
+                db.log_space_saved(db.get_total_space_saved() + space_saved);
+                stats.files_transcoded += 1;
+                stats.space_saved_bytes += space_saved;
                 state.update(|s| {
                     s.total_transcoded += 1;
                     s.total_space_saved += space_saved;
                     s.run_transcoded += 1;
                     s.run_space_saved += space_saved;
                 });
-
                 send_webhook(
                     &config.notify,
                     NotifyEvent::ReplacementSummary,
@@ -1748,25 +1705,8 @@ pub async fn run_watchdog_pass(
                 );
             }
             Ok(SafeReplaceOutcome::Failed(failure)) => {
-                error!(
-                    "[{}] Safe replace failed for {}: {} ({})",
-                    share_name,
-                    path_str,
-                    failure.summary(),
-                    failure.failure_code()
-                );
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!(
-                        "Replace failed [{}]: {}",
-                        failure.failure_code(),
-                        display_filename
-                    ),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure_with_code(
                     state,
                     db.as_ref(),
@@ -1774,22 +1714,15 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     failure.failure_code(),
                     failure.failure_code(),
                     true,
                 );
             }
-            Err(e) => {
-                error!("[{}] Replace error: {}", share_name, e);
+            Err(_) => {
                 stats.transcode_failures += 1;
                 state.update(|s| s.run_failures += 1);
-                tui_log(
-                    state,
-                    "ERROR",
-                    &format!("Replace error: {}", display_filename),
-                );
-                let dur = transcode_start.elapsed().as_secs_f64();
                 record_failure(
                     state,
                     db.as_ref(),
@@ -1797,7 +1730,7 @@ pub async fn run_watchdog_pass(
                     base_dir,
                     &path_str,
                     db_row_id,
-                    dur,
+                    transcode_start.elapsed().as_secs_f64(),
                     FailureCode::SafeReplaceError,
                     "safe_replace_error",
                     true,
@@ -1806,46 +1739,12 @@ pub async fn run_watchdog_pass(
         }
 
         cleanup_temp_files(deps.fs.as_ref(), &[&local_source, &local_output]);
+        db.remove_queue_item(&path_str);
+        outstanding_paths.remove(path);
     }
 
+    finalize_runtime_state(state, db);
     state.set_phase(PipelinePhase::Idle);
-    let top_reasons = db.get_top_failure_reasons(3);
-    state.update(|s| {
-        s.top_failure_reasons = top_reasons
-            .iter()
-            .map(|(reason, count)| (reason.clone(), *count as u64))
-            .collect();
-    });
-    state.set_last_pass_time();
-    state.set_current_file(None);
-    state.reset_file_progress();
-    tui_log(
-        state,
-        "INFO",
-        &format!(
-            "Pass complete: {} transcoded, {} failures, {} retries scheduled, {} saved",
-            stats.files_transcoded,
-            stats.transcode_failures,
-            stats.retries_scheduled,
-            format_bytes_signed(stats.space_saved_bytes)
-        ),
-    );
-    emit_event(
-        config,
-        base_dir,
-        "pass_end",
-        json!({
-            "result": "ok",
-            "discovered_files": discovered_count,
-            "inspected_files": stats.files_inspected,
-            "queued_files": stats.files_queued,
-            "transcoded_files": stats.files_transcoded,
-            "failed_files": stats.transcode_failures,
-            "retries_scheduled": stats.retries_scheduled,
-            "space_saved_bytes": stats.space_saved_bytes,
-        }),
-    );
-
     Ok(stats)
 }
 
@@ -2843,6 +2742,146 @@ fn classify_pass_failure_code(err: &WatchdogError) -> &'static str {
     }
 }
 
+async fn wait_for_precision_queue(
+    config: &Config,
+    base_dir: &Path,
+    db: &Arc<WatchdogDb>,
+    state: &StateManager,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> Result<bool> {
+    state.set_phase(PipelinePhase::AwaitingSelection);
+    state.set_current_file(None);
+    state.reset_file_progress();
+    state.set_queue_info(0, db.get_queue_count().max(0) as u32);
+    tui_log(state, "INFO", "Waiting for manual queue selection");
+
+    loop {
+        if shutdown_requested(shutdown_rx) {
+            emit_event(
+                config,
+                base_dir,
+                "shutdown",
+                json!({"phase": "awaiting_selection"}),
+            );
+            return Ok(false);
+        }
+
+        if is_pause_requested(config, base_dir) {
+            state.set_phase(PipelinePhase::Paused);
+            tui_log(state, "WARN", "Pipeline paused");
+            if !wait_while_paused(config, base_dir, state, shutdown_rx).await {
+                emit_event(
+                    config,
+                    base_dir,
+                    "shutdown",
+                    json!({"phase": "precision_pause_wait"}),
+                );
+                return Ok(false);
+            }
+            if db.get_service_state().auto_paused_at.is_some() {
+                db.clear_auto_paused();
+                db.note_pass_success();
+                sync_service_state(state, db.as_ref());
+                emit_event(
+                    config,
+                    base_dir,
+                    "auto_pause_cleared",
+                    json!({"source": "manual_resume"}),
+                );
+            }
+            state.set_phase(PipelinePhase::AwaitingSelection);
+            continue;
+        }
+
+        if db.get_queue_count() > 0 {
+            return Ok(true);
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
+            _ = shutdown_rx.recv() => {
+                emit_event(
+                    config,
+                    base_dir,
+                    "shutdown",
+                    json!({"phase": "awaiting_selection"}),
+                );
+                return Ok(false);
+            }
+        }
+    }
+}
+
+async fn wait_for_watchdog_interval_or_queue(
+    config: &Config,
+    base_dir: &Path,
+    db: &Arc<WatchdogDb>,
+    state: &StateManager,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> Result<bool> {
+    if is_pause_requested(config, base_dir) {
+        state.set_phase(PipelinePhase::Paused);
+        tui_log(state, "WARN", "Pipeline paused");
+        if !wait_while_paused(config, base_dir, state, shutdown_rx).await {
+            emit_event(
+                config,
+                base_dir,
+                "shutdown",
+                json!({"phase": "manual_pause_wait"}),
+            );
+            return Ok(false);
+        }
+        if db.get_service_state().auto_paused_at.is_some() {
+            db.clear_auto_paused();
+            db.note_pass_success();
+            sync_service_state(state, db.as_ref());
+            emit_event(
+                config,
+                base_dir,
+                "auto_pause_cleared",
+                json!({"source": "manual_resume"}),
+            );
+        }
+        return Ok(true);
+    }
+
+    state.set_phase(PipelinePhase::Waiting);
+    state.set_current_file(None);
+    state.reset_file_progress();
+    tui_log(
+        state,
+        "INFO",
+        &format!("Waiting {}s until next scan", config.scan.interval_seconds),
+    );
+
+    let deadline = Instant::now() + tokio::time::Duration::from_secs(config.scan.interval_seconds);
+    loop {
+        if db.get_queue_count() > 0 {
+            tui_log(state, "INFO", "Manual queue update detected; resuming immediately");
+            return Ok(true);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(true);
+        }
+        let sleep_for = std::cmp::min(Duration::from_secs(1), deadline.saturating_duration_since(now));
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {}
+            _ = shutdown_rx.recv() => {
+                info!("Pipeline shutting down during wait");
+                emit_event(
+                    config,
+                    base_dir,
+                    "shutdown",
+                    json!({"phase": "interval_wait"}),
+                );
+                return Ok(false);
+            }
+        }
+    }
+}
+
 /// Run the pipeline in a loop with configurable interval.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline_loop(
@@ -2851,6 +2890,7 @@ pub async fn run_pipeline_loop(
     deps: PipelineDeps,
     db: Arc<WatchdogDb>,
     state: StateManager,
+    run_mode: RunMode,
     dry_run: bool,
     once: bool,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -2859,6 +2899,7 @@ pub async fn run_pipeline_loop(
     let recovery_interval =
         Duration::from_secs(config.safety.recovery_scan_interval_seconds.max(1));
     let mut last_recovery_run: Option<Instant> = None;
+    state.set_run_mode(run_mode);
     sync_service_state(&state, db.as_ref());
 
     loop {
@@ -2897,17 +2938,74 @@ pub async fn run_pipeline_loop(
             last_recovery_run = Some(Instant::now());
         }
 
-        match run_watchdog_pass(
-            &config,
-            &base_dir,
-            &deps,
-            &db,
-            &state,
-            dry_run,
-            shutdown_rx.resubscribe(),
-        )
-        .await
-        {
+        let pass_result = match run_mode {
+            RunMode::Watchdog => {
+                if !dry_run && db.get_queue_count() > 0 {
+                    run_queued_pass(
+                        &config,
+                        &base_dir,
+                        &deps,
+                        &db,
+                        &state,
+                        false,
+                        shutdown_rx.resubscribe(),
+                    )
+                    .await
+                } else {
+                    run_watchdog_pass(
+                        &config,
+                        &base_dir,
+                        &deps,
+                        &db,
+                        &state,
+                        dry_run,
+                        shutdown_rx.resubscribe(),
+                    )
+                    .await
+                }
+            }
+            RunMode::Precision => {
+                if dry_run {
+                    run_watchdog_pass(
+                        &config,
+                        &base_dir,
+                        &deps,
+                        &db,
+                        &state,
+                        dry_run,
+                        shutdown_rx.resubscribe(),
+                    )
+                    .await
+                } else if db.get_queue_count() > 0 {
+                    run_queued_pass(
+                        &config,
+                        &base_dir,
+                        &deps,
+                        &db,
+                        &state,
+                        false,
+                        shutdown_rx.resubscribe(),
+                    )
+                    .await
+                } else if once {
+                    return Ok(());
+                } else if wait_for_precision_queue(
+                    &config,
+                    &base_dir,
+                    &db,
+                    &state,
+                    &mut shutdown_rx,
+                )
+                .await?
+                {
+                    continue;
+                } else {
+                    return Ok(());
+                }
+            }
+        };
+
+        match pass_result {
             Ok(stats) => {
                 info!(
                     "Pass complete: inspected={} queued={} transcoded={} failures={} retries_scheduled={} saved={}",
@@ -2925,6 +3023,10 @@ pub async fn run_pipeline_loop(
                 retry_delay = 30;
                 if once {
                     return Ok(());
+                }
+                if matches!(run_mode, RunMode::Precision) && db.get_queue_count() == 0 {
+                    state.set_phase(PipelinePhase::AwaitingSelection);
+                    state.set_queue_info(0, 0);
                 }
             }
             Err(WatchdogError::Shutdown) => {
@@ -3212,54 +3314,28 @@ pub async fn run_pipeline_loop(
             return Ok(());
         }
 
-        if is_pause_requested(&config, &base_dir) {
-            state.set_phase(PipelinePhase::Paused);
-            tui_log(&state, "WARN", "Pipeline paused");
-            if !wait_while_paused(&config, &base_dir, &state, &mut shutdown_rx).await {
-                emit_event(
+        let should_continue = match run_mode {
+            RunMode::Watchdog => {
+                wait_for_watchdog_interval_or_queue(
                     &config,
                     &base_dir,
-                    "shutdown",
-                    json!({"phase": "manual_pause_wait"}),
-                );
-                return Ok(());
+                    &db,
+                    &state,
+                    &mut shutdown_rx,
+                )
+                .await?
             }
-            if db.get_service_state().auto_paused_at.is_some() {
-                db.clear_auto_paused();
-                db.note_pass_success();
-                sync_service_state(&state, db.as_ref());
-                emit_event(
-                    &config,
-                    &base_dir,
-                    "auto_pause_cleared",
-                    json!({"source": "manual_resume"}),
-                );
-            }
-            continue;
-        }
-
-        // Wait for next scan interval or shutdown
-        state.set_phase(PipelinePhase::Waiting);
-        state.set_current_file(None);
-        state.reset_file_progress();
-        tui_log(
-            &state,
-            "INFO",
-            &format!("Waiting {}s until next scan", config.scan.interval_seconds),
-        );
-
-        tokio::select! {
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(config.scan.interval_seconds)) => {}
-            _ = shutdown_rx.recv() => {
-                info!("Pipeline shutting down during wait");
-                emit_event(
-                    &config,
-                    &base_dir,
-                    "shutdown",
-                    json!({"phase": "interval_wait"}),
-                );
-                return Ok(());
-            }
+            RunMode::Precision => wait_for_precision_queue(
+                &config,
+                &base_dir,
+                &db,
+                &state,
+                &mut shutdown_rx,
+            )
+            .await?,
+        };
+        if !should_continue {
+            return Ok(());
         }
     }
 }

@@ -90,6 +90,26 @@ pub struct ServiceState {
     pub last_pass_failure_code: Option<String>,
     pub auto_paused_at: Option<String>,
     pub auto_pause_reason: Option<String>,
+    pub worker_pid: Option<u32>,
+    pub worker_run_mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueRecord {
+    pub id: i64,
+    pub source_path: String,
+    pub share_name: String,
+    pub enqueue_source: String,
+    pub order_key: i64,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewQueueItem {
+    pub source_path: String,
+    pub share_name: String,
+    pub enqueue_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -152,12 +172,15 @@ impl WatchdogDb {
             last_pass_failure_code: None,
             auto_paused_at: None,
             auto_pause_reason: None,
+            worker_pid: None,
+            worker_run_mode: None,
         }
     }
 
     fn read_service_state(conn: &Connection) -> rusqlite::Result<ServiceState> {
         conn.query_row(
-            "SELECT consecutive_pass_failures, last_pass_failure_code, auto_paused_at, auto_pause_reason
+            "SELECT consecutive_pass_failures, last_pass_failure_code, auto_paused_at, auto_pause_reason,
+                    worker_pid, worker_run_mode
              FROM service_state WHERE id = 1",
             [],
             |row| {
@@ -166,6 +189,10 @@ impl WatchdogDb {
                     last_pass_failure_code: row.get(1)?,
                     auto_paused_at: row.get(2)?,
                     auto_pause_reason: row.get(3)?,
+                    worker_pid: row
+                        .get::<_, Option<i64>>(4)?
+                        .map(|value| value.max(0) as u32),
+                    worker_run_mode: row.get(5)?,
                 })
             },
         )
@@ -232,7 +259,19 @@ impl WatchdogDb {
                 consecutive_pass_failures INTEGER NOT NULL DEFAULT 0,
                 last_pass_failure_code TEXT,
                 auto_paused_at TEXT,
-                auto_pause_reason TEXT
+                auto_pause_reason TEXT,
+                worker_pid INTEGER,
+                worker_run_mode TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS queue_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL UNIQUE,
+                share_name TEXT NOT NULL,
+                enqueue_source TEXT NOT NULL,
+                order_key INTEGER NOT NULL,
+                queued_at TEXT NOT NULL,
+                started_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_inspected_files_file_path
@@ -246,6 +285,9 @@ impl WatchdogDb {
 
             CREATE INDEX IF NOT EXISTS idx_file_quarantine_quarantined_at
                 ON file_quarantine (quarantined_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_queue_items_order_key
+                ON queue_items (order_key);
         ",
         )?;
 
@@ -280,6 +322,27 @@ impl WatchdogDb {
         if failure_state_code_col_exists == 0 {
             conn.execute(
                 "ALTER TABLE file_failure_state ADD COLUMN last_failure_code TEXT",
+                [],
+            )?;
+        }
+
+        let worker_pid_col_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('service_state') WHERE name = 'worker_pid'",
+            [],
+            |row| row.get(0),
+        )?;
+        if worker_pid_col_exists == 0 {
+            conn.execute("ALTER TABLE service_state ADD COLUMN worker_pid INTEGER", [])?;
+        }
+
+        let worker_run_mode_col_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('service_state') WHERE name = 'worker_run_mode'",
+            [],
+            |row| row.get(0),
+        )?;
+        if worker_run_mode_col_exists == 0 {
+            conn.execute(
+                "ALTER TABLE service_state ADD COLUMN worker_run_mode TEXT",
                 [],
             )?;
         }
@@ -670,6 +733,31 @@ impl WatchdogDb {
         }
     }
 
+    pub fn set_worker_state(&self, pid: u32, run_mode: &str) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE service_state
+             SET worker_pid = ?1,
+                 worker_run_mode = ?2
+             WHERE id = 1",
+            params![pid as i64, run_mode],
+        ) {
+            error!("DB error in set_worker_state: {}", e);
+        }
+    }
+
+    pub fn clear_worker_state(&self) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE service_state
+             SET worker_pid = NULL
+             WHERE id = 1",
+            [],
+        ) {
+            error!("DB error in clear_worker_state: {}", e);
+        }
+    }
+
     /// Quarantine a file after repeated hard failures.
     pub fn quarantine_file(&self, path: &str, last_failure_code: &str, reason: &str) {
         let conn = self.lock();
@@ -755,6 +843,226 @@ impl WatchdogDb {
     pub fn clear_all_quarantine_files(&self) -> usize {
         let conn = self.lock();
         conn.execute("DELETE FROM file_quarantine", []).unwrap_or(0)
+    }
+
+    pub fn get_queue_count(&self) -> i64 {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM queue_items", [], |row| row.get(0))
+            .unwrap_or(0)
+    }
+
+    pub fn next_queue_order_key(&self) -> i64 {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COALESCE(MAX(order_key), 0) + 1 FROM queue_items",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(1)
+    }
+
+    pub fn enqueue_queue_items(&self, items: &[NewQueueItem]) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+
+        let mut conn = self.lock();
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!("DB error opening queue transaction: {}", e);
+                return 0;
+            }
+        };
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let mut next_order_key: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(order_key), 0) + 1 FROM queue_items",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+        let mut inserted = 0usize;
+
+        for item in items {
+            match tx.execute(
+                "INSERT OR IGNORE INTO queue_items
+                 (source_path, share_name, enqueue_source, order_key, queued_at, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    item.source_path,
+                    item.share_name,
+                    item.enqueue_source,
+                    next_order_key,
+                    now
+                ],
+            ) {
+                Ok(rows) => {
+                    if rows > 0 {
+                        inserted += 1;
+                        next_order_key += 1;
+                    }
+                }
+                Err(e) => error!("DB error enqueuing '{}': {}", item.source_path, e),
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            error!("DB error committing queue transaction: {}", e);
+            return 0;
+        }
+
+        inserted
+    }
+
+    pub fn list_queue_items(&self, limit: u32) -> Vec<QueueRecord> {
+        let conn = self.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT id, source_path, share_name, enqueue_source, order_key, queued_at, started_at
+             FROM queue_items
+             ORDER BY CASE WHEN started_at IS NOT NULL THEN 0 ELSE 1 END,
+                      order_key ASC
+             LIMIT ?1",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                error!("DB error in list_queue_items: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let rows = match stmt.query_map(params![limit], |row| {
+            Ok(QueueRecord {
+                id: row.get(0)?,
+                source_path: row.get(1)?,
+                share_name: row.get(2)?,
+                enqueue_source: row.get(3)?,
+                order_key: row.get(4)?,
+                queued_at: row.get(5)?,
+                started_at: row.get(6)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("DB error querying queue items: {}", e);
+                return Vec::new();
+            }
+        };
+
+        rows.filter_map(|row| row.ok()).collect()
+    }
+
+    pub fn claim_next_queue_item(&self) -> Option<QueueRecord> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().ok()?;
+        let next = tx
+            .query_row(
+                "SELECT id, source_path, share_name, enqueue_source, order_key, queued_at, started_at
+                 FROM queue_items
+                 WHERE started_at IS NULL
+                 ORDER BY order_key ASC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(QueueRecord {
+                        id: row.get(0)?,
+                        source_path: row.get(1)?,
+                        share_name: row.get(2)?,
+                        enqueue_source: row.get(3)?,
+                        order_key: row.get(4)?,
+                        queued_at: row.get(5)?,
+                        started_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()??;
+
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if tx
+            .execute(
+                "UPDATE queue_items SET started_at = ?1 WHERE id = ?2",
+                params![now, next.id],
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        if tx.commit().is_err() {
+            return None;
+        }
+
+        Some(QueueRecord {
+            started_at: Some(now),
+            ..next
+        })
+    }
+
+    pub fn requeue_queue_item(&self, source_path: &str) {
+        let conn = self.lock();
+        let next_order_key = conn
+            .query_row(
+                "SELECT COALESCE(MAX(order_key), 0) + 1 FROM queue_items",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(1);
+        if let Err(e) = conn.execute(
+            "UPDATE queue_items
+             SET order_key = ?1,
+                 started_at = NULL
+             WHERE source_path = ?2",
+            params![next_order_key, source_path],
+        ) {
+            error!("DB error in requeue_queue_item('{}'): {}", source_path, e);
+        }
+    }
+
+    pub fn mark_queue_item_started(&self, source_path: &str) {
+        let conn = self.lock();
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "UPDATE queue_items SET started_at = ?1 WHERE source_path = ?2",
+            params![now, source_path],
+        ) {
+            error!("DB error in mark_queue_item_started('{}'): {}", source_path, e);
+        }
+    }
+
+    pub fn remove_queue_item(&self, source_path: &str) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "DELETE FROM queue_items WHERE source_path = ?1",
+            params![source_path],
+        ) {
+            error!("DB error in remove_queue_item('{}'): {}", source_path, e);
+        }
+    }
+
+    pub fn clear_queue_items(&self) -> usize {
+        let conn = self.lock();
+        match conn.execute("DELETE FROM queue_items", []) {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("DB error in clear_queue_items: {}", e);
+                0
+            }
+        }
+    }
+
+    pub fn reset_stale_queue_items(&self) -> usize {
+        let conn = self.lock();
+        match conn.execute(
+            "UPDATE queue_items SET started_at = NULL WHERE started_at IS NOT NULL",
+            [],
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("DB error in reset_stale_queue_items: {}", e);
+                0
+            }
+        }
     }
 
     /// Check if a file was previously inspected with the same size and mtime.
@@ -1101,6 +1409,7 @@ impl WatchdogDb {
             "file_failure_state",
             "file_quarantine",
             "service_state",
+            "queue_items",
         ];
         for table in required_tables {
             let exists = conn
@@ -1130,6 +1439,10 @@ impl WatchdogDb {
             ("file_quarantine", "manual_clear_required"),
             ("service_state", "consecutive_pass_failures"),
             ("service_state", "last_pass_failure_code"),
+            ("service_state", "worker_pid"),
+            ("service_state", "worker_run_mode"),
+            ("queue_items", "source_path"),
+            ("queue_items", "order_key"),
         ];
         for (table, column) in required_columns {
             let sql = format!(
@@ -1550,5 +1863,72 @@ mod tests {
             matches!(err, rusqlite::Error::SqliteFailure(_, _)),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_queue_items_deduplicate_and_preserve_order() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        let inserted = db.enqueue_queue_items(&[
+            NewQueueItem {
+                source_path: "/mnt/movies/A.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "scan".to_string(),
+            },
+            NewQueueItem {
+                source_path: "/mnt/movies/B.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+            },
+            NewQueueItem {
+                source_path: "/mnt/movies/A.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+            },
+        ]);
+        assert_eq!(inserted, 2);
+
+        let queue = db.list_queue_items(10);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].source_path, "/mnt/movies/A.mkv");
+        assert_eq!(queue[0].order_key, 1);
+        assert_eq!(queue[1].source_path, "/mnt/movies/B.mkv");
+        assert_eq!(queue[1].order_key, 2);
+        assert_eq!(queue[1].enqueue_source, "manual");
+    }
+
+    #[test]
+    fn test_queue_items_can_reset_stale_started_rows() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        db.enqueue_queue_items(&[NewQueueItem {
+            source_path: "/mnt/movies/A.mkv".to_string(),
+            share_name: "movies".to_string(),
+            enqueue_source: "scan".to_string(),
+        }]);
+        db.mark_queue_item_started("/mnt/movies/A.mkv");
+        assert!(db.list_queue_items(1)[0].started_at.is_some());
+
+        assert_eq!(db.reset_stale_queue_items(), 1);
+        assert!(db.list_queue_items(1)[0].started_at.is_none());
+    }
+
+    #[test]
+    fn test_clear_queue_items_removes_remaining_rows() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        db.enqueue_queue_items(&[
+            NewQueueItem {
+                source_path: "/mnt/movies/A.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "scan".to_string(),
+            },
+            NewQueueItem {
+                source_path: "/mnt/movies/B.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+            },
+        ]);
+
+        assert_eq!(db.get_queue_count(), 2);
+        assert_eq!(db.clear_queue_items(), 2);
+        assert_eq!(db.get_queue_count(), 0);
     }
 }

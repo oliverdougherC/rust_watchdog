@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use watchdog::config::{Config, ShareConfig};
-use watchdog::db::{TranscodeOutcome, WatchdogDb};
+use watchdog::db::{NewQueueItem, TranscodeOutcome, WatchdogDb};
 use watchdog::error::{Result, WatchdogError};
 use watchdog::pipeline::{run_pipeline_loop, run_watchdog_pass, PipelineDeps};
-use watchdog::state::StateManager;
+use watchdog::state::{PipelinePhase, RunMode, StateManager};
 use watchdog::traits::*;
 
 #[derive(Clone)]
@@ -626,6 +626,7 @@ async fn dry_run_success_exits_once() {
         deps,
         db,
         state,
+        RunMode::Watchdog,
         true,
         false,
         tx.subscribe(),
@@ -663,6 +664,7 @@ async fn dry_run_error_returns_immediately() {
         deps,
         db,
         state,
+        RunMode::Watchdog,
         true,
         false,
         tx.subscribe(),
@@ -711,6 +713,7 @@ async fn dry_run_does_not_mutate_db_or_filesystem() {
         deps,
         db.clone(),
         state,
+        RunMode::Watchdog,
         true,
         false,
         tx.subscribe(),
@@ -881,6 +884,7 @@ async fn orphan_recovery_only_touches_watchdog_suffix() {
         deps,
         db,
         state,
+        RunMode::Watchdog,
         false,
         true,
         tx.subscribe(),
@@ -922,6 +926,7 @@ async fn orphan_recovery_runs_on_startup() {
         deps,
         db,
         state,
+        RunMode::Watchdog,
         false,
         true,
         tx.subscribe(),
@@ -962,6 +967,7 @@ async fn orphan_recovery_runs_periodically() {
         deps,
         db,
         state,
+        RunMode::Watchdog,
         false,
         false,
         shutdown_tx.subscribe(),
@@ -974,6 +980,65 @@ async fn orphan_recovery_runs_periodically() {
     assert!(
         fs.recovery_walk_calls() >= 4,
         "expected recovery scan at startup and at least one periodic run"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precision_mode_waits_for_manual_queue_and_processes_it() {
+    let mut cfg = base_config();
+    cfg.scan.interval_seconds = 60;
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Precision.Movie.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (shutdown_tx, _) = broadcast::channel(1);
+
+    let handle = tokio::spawn(run_pipeline_loop(
+        cfg,
+        PathBuf::from("."),
+        deps,
+        db.clone(),
+        state.clone(),
+        RunMode::Precision,
+        false,
+        false,
+        shutdown_tx.subscribe(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(state.snapshot().phase, PipelinePhase::AwaitingSelection);
+    assert!(db.get_recent_transcodes(10).is_empty());
+
+    db.enqueue_queue_items(&[NewQueueItem {
+        source_path: source.to_string_lossy().to_string(),
+        share_name: "movies".to_string(),
+        enqueue_source: "manual".to_string(),
+    }]);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let _ = shutdown_tx.send(());
+    let result = handle.await.unwrap();
+    assert!(result.is_ok());
+
+    let recent = db.get_recent_transcodes(10);
+    assert!(
+        recent.iter().any(|record| record.source_path == source.to_string_lossy()),
+        "expected precision-mode queue item to be processed"
     );
 }
 
@@ -1750,6 +1815,7 @@ async fn pipeline_loop_records_scan_timeout_in_state() {
         deps,
         db,
         state,
+        RunMode::Watchdog,
         false,
         false,
         shutdown_tx.subscribe(),
@@ -1811,6 +1877,7 @@ async fn repeated_scan_timeouts_trigger_auto_pause_tripwire() {
         deps,
         db,
         state,
+        RunMode::Watchdog,
         false,
         false,
         shutdown_tx.subscribe(),
