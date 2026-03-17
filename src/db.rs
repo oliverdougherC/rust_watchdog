@@ -643,6 +643,7 @@ impl WatchdogDb {
             "SELECT source_path, failure_reason, failure_code, completed_at
              FROM transcode_history
              WHERE outcome = 'failed'
+               AND completed_at IS NOT NULL
              ORDER BY id DESC
              LIMIT 1",
             [],
@@ -1295,14 +1296,17 @@ impl WatchdogDb {
         }
     }
 
-    /// Return recent transcode history records.
+    /// Return recent completed transcode history records.
     pub fn get_recent_transcodes(&self, limit: u32) -> Vec<TranscodeRecord> {
         let conn = self.lock();
         let mut stmt = match conn.prepare(
             "SELECT id, source_path, share_name, original_codec, original_bitrate_bps, \
              original_size, output_size, space_saved, duration_seconds, outcome, success, \
              failure_reason, failure_code, started_at, completed_at \
-             FROM transcode_history ORDER BY id DESC LIMIT ?1",
+             FROM transcode_history
+             WHERE completed_at IS NOT NULL
+             ORDER BY id DESC
+             LIMIT ?1",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1537,6 +1541,16 @@ mod tests {
     }
 
     #[test]
+    fn test_incomplete_transcodes_are_hidden_from_recent_history() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+
+        db.record_transcode_start("/test/active.mkv", "movies", Some("h264"), 0, 1000)
+            .unwrap();
+
+        assert!(db.get_recent_transcodes(10).is_empty());
+    }
+
+    #[test]
     fn test_stale_cleanup() {
         let db = WatchdogDb::open_in_memory().unwrap();
         db.record_transcode_start("/test/stale.mkv", "movies", None, 0, 0)
@@ -1658,8 +1672,10 @@ mod tests {
                     started_at TEXT,
                     completed_at TEXT
                 );
-                INSERT INTO transcode_history (source_path, outcome, success, failure_reason, failure_code)
-                VALUES ('/stalled.mkv', 'failed', 0, 'stalled_exhausted', NULL);
+                INSERT INTO transcode_history
+                    (source_path, outcome, success, failure_reason, failure_code, started_at, completed_at)
+                VALUES
+                    ('/stalled.mkv', 'failed', 0, 'stalled_exhausted', NULL, '2026-01-01T00:00:00', '2026-01-01T00:00:05');
 
                 CREATE TABLE file_failure_state (
                     file_path TEXT PRIMARY KEY,
@@ -1770,6 +1786,34 @@ mod tests {
         assert_eq!(rec[0].failure_reason.as_deref(), Some("scan_timeout"));
         assert_eq!(rec[0].failure_code.as_deref(), Some("scan_timeout"));
         assert_eq!(rec[0].outcome, TranscodeOutcome::Failed);
+    }
+
+    #[test]
+    fn test_latest_failure_ignores_incomplete_transcode_rows() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+
+        let completed_failure = db
+            .record_transcode_start("/test/failed.mkv", "movies", Some("h264"), 0, 1000)
+            .unwrap();
+        db.record_transcode_end_with_code(
+            completed_failure,
+            TranscodeOutcome::Failed,
+            0,
+            0,
+            1.0,
+            Some("verification_failed"),
+            Some("verification_failed"),
+        );
+
+        db.record_transcode_start("/test/active.mkv", "movies", Some("h264"), 0, 1000)
+            .unwrap();
+
+        let latest = db
+            .get_latest_failure()
+            .expect("expected completed failure record");
+        assert_eq!(latest.source_path, "/test/failed.mkv");
+        assert_eq!(latest.failure_code.as_deref(), Some("verification_failed"));
+        assert!(latest.completed_at.is_some());
     }
 
     #[test]
