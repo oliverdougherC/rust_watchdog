@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-17T06:31:31.515907+00:00",
+  "timestamp": "2026-03-18T02:41:17.937374+00:00",
   "phase": "Idle",
   "paused": false,
   "nfs_healthy": true,
@@ -26,7 +26,7 @@
   "run": {
     "inspected": 2,
     "transcoded": 0,
-    "failures": 2,
+    "failures": 1,
     "retries_scheduled": 0,
     "space_saved_bytes": 0,
     "skipped_inspected": 0,
@@ -39,7 +39,7 @@
   "reliability": {
     "scan_timeouts": 0,
     "retries_scheduled_total": 0,
-    "last_failure_code": "transcode_failed",
+    "last_failure_code": "verification_container_mismatch",
     "consecutive_pass_failures": 0,
     "auto_paused": false,
     "auto_pause_reason": null,
@@ -50,10 +50,6 @@
   "top_failure_reasons": [
     [
       "verification_container_mismatch",
-      1
-    ],
-    [
-      "transcode_failed",
       1
     ]
   ],
@@ -69,9 +65,9 @@
   ],
   "unhealthy_shares": [],
   "latest_failure": {
-    "source_path": "/Volumes/JellyfinTV/Breaking.Bad/Season 01/Breaking.Bad.S01E10.mp4",
-    "failure_reason": "transcode_failed",
-    "failure_code": "transcode_failed",
-    "completed_at": "2026-03-17T06:31:31"
+    "source_path": "/Volumes/JellyfinTV/Breaking.Bad/Season 04/Breaking.Bad.S04E06.mkv",
+    "failure_reason": "verification_container_mismatch",
+    "failure_code": "verification_container_mismatch",
+    "completed_at": "2026-03-18T02:41:17"
   }
 }

@@ -1453,18 +1453,45 @@ fn handle_mouse_event(
     mouse: MouseEvent,
     area: Rect,
 ) -> anyhow::Result<bool> {
-    if !app.show_quit_modal {
+    if app.show_quit_modal {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(false);
+        }
+
+        let layout = quit_modal_layout(area);
+        for (choice, rect, _) in quit_button_rects(app, layout.buttons) {
+            if rect_contains(rect, mouse.column, mouse.row) {
+                return handle_quit_modal_choice(app, db.as_ref(), event_journal_path, choice);
+            }
+        }
         return Ok(false);
     }
 
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return Ok(false);
+    if let Some(selector) = app.preset_selector.as_mut() {
+        let popup = centered_rect(84, 72, area);
+        if rect_contains(popup, mouse.column, mouse.row) {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => selector.move_down(),
+                MouseEventKind::ScrollUp => selector.move_up(),
+                _ => {}
+            }
+        }
     }
 
-    let layout = quit_modal_layout(area);
-    for (choice, rect, _) in quit_button_rects(app, layout.buttons) {
-        if rect_contains(rect, mouse.column, mouse.row) {
-            return handle_quit_modal_choice(app, db.as_ref(), event_journal_path, choice);
+    if let Some(browser) = app.browser.as_mut() {
+        let layout = browser_modal_layout(area, app.selection_task.is_some());
+        if rect_contains(layout.list, mouse.column, mouse.row) {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    browser.move_down();
+                    browser.ensure_visible(layout.list.height as usize);
+                }
+                MouseEventKind::ScrollUp => {
+                    browser.move_up();
+                    browser.ensure_visible(layout.list.height as usize);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1868,7 +1895,8 @@ fn render_browser_modal(
     selection_progress: Option<&(ManualSelectionProgress, Instant)>,
     selected_preset: &PresetSnapshot,
 ) {
-    let popup = centered_rect(80, 80, area);
+    let modal_layout = browser_modal_layout(area, selection_progress.is_some());
+    let popup = modal_layout.popup;
     f.render_widget(Clear, popup);
 
     let title = if let Some(dir) = browser.current_dir.as_ref() {
@@ -1903,7 +1931,7 @@ fn render_browser_modal(
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner)
     };
-    let list_area = sections[0];
+    let list_area = modal_layout.list;
     let progress_area = if selection_progress.is_some() && sections.len() > 2 {
         Some(sections[1])
     } else {
@@ -2118,24 +2146,26 @@ fn render_quit_modal(f: &mut Frame, area: Rect, app: &TuiApp) {
         };
         let text_style = if selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else if disabled {
-            Style::default().fg(Color::DarkGray)
-        } else {
             Style::default().fg(Color::Gray)
+        } else {
+            Style::default().fg(Color::White)
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {} ", label), text_style)))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(border_style),
-                ),
-            rect,
-        );
+        let button_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style);
+        let button_inner = button_block.inner(rect);
+        f.render_widget(button_block, rect);
+        if button_inner.width > 0 && button_inner.height > 0 {
+            f.render_widget(
+                Paragraph::new(label)
+                    .style(text_style)
+                    .alignment(Alignment::Center),
+                button_inner,
+            );
+        }
     }
 
     f.render_widget(
@@ -2171,6 +2201,11 @@ struct QuitModalLayout {
     footer: Rect,
 }
 
+struct BrowserModalLayout {
+    popup: Rect,
+    list: Rect,
+}
+
 fn quit_modal_layout(area: Rect) -> QuitModalLayout {
     let popup = centered_rect(78, 44, area);
     let inner = Block::default().borders(Borders::ALL).inner(popup);
@@ -2190,6 +2225,31 @@ fn quit_modal_layout(area: Rect) -> QuitModalLayout {
         buttons: chunks[1],
         command: chunks[2],
         footer: chunks[3],
+    }
+}
+
+fn browser_modal_layout(area: Rect, show_progress: bool) -> BrowserModalLayout {
+    let popup = centered_rect(80, 80, area);
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let sections = if show_progress && inner.height > 2 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner)
+    };
+
+    BrowserModalLayout {
+        popup,
+        list: sections[0],
     }
 }
 
@@ -2292,6 +2352,7 @@ fn truncate_left(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::state::RunMode;
+    use ratatui::{backend::TestBackend, Terminal};
     use std::process::Command;
 
     #[test]
@@ -2372,6 +2433,102 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(precision_text.contains(":codec"));
+    }
+
+    #[test]
+    fn quit_modal_renders_button_labels() {
+        let backend = TestBackend::new(160, 48);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = TuiApp::new(
+            &Config::default_config(),
+            PathBuf::from("/tmp/watchdog"),
+            "watchdog --attach --config watchdog.toml".to_string(),
+        );
+        app.show_quit_modal = true;
+        app.worker_pid = Some(88529);
+        app.quit_choice = QuitChoice::Kill;
+        app.quit_kill_state = Some(QuitKillState {
+            pid: 88529,
+            started_at: Instant::now(),
+            followup_signal_sent: false,
+        });
+
+        terminal
+            .draw(|f| render_quit_modal(f, f.area(), &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("Stopping"));
+        assert!(rendered.contains("Copy Cmd"));
+        assert!(rendered.contains("Cancel"));
+    }
+
+    #[test]
+    fn mouse_scroll_moves_browser_selection() {
+        let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+        let mut app = TuiApp::new(
+            &Config::default_config(),
+            PathBuf::from("/tmp/watchdog"),
+            String::new(),
+        );
+        app.browser = Some(BrowserState {
+            current_dir: None,
+            entries: (0..8)
+                .map(|idx| BrowserEntry {
+                    path: PathBuf::from(format!("/tmp/{}", idx)),
+                    label: format!("Item {}", idx),
+                    is_dir: true,
+                    available: true,
+                })
+                .collect(),
+            selected_index: 0,
+            scroll_offset: 0,
+            selected_targets: BTreeSet::new(),
+        });
+
+        let area = Rect::new(0, 0, 120, 40);
+        let list = browser_modal_layout(area, false).list;
+        let pointer_x = list.x.saturating_add(1);
+        let pointer_y = list.y.saturating_add(1);
+
+        handle_mouse_event(
+            &mut app,
+            &db,
+            Path::new("/tmp/watchdog.events.ndjson"),
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: pointer_x,
+                row: pointer_y,
+                modifiers: event::KeyModifiers::NONE,
+            },
+            area,
+        )
+        .unwrap();
+
+        assert_eq!(app.browser.as_ref().unwrap().selected_index, 1);
+
+        handle_mouse_event(
+            &mut app,
+            &db,
+            Path::new("/tmp/watchdog.events.ndjson"),
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: pointer_x,
+                row: pointer_y,
+                modifiers: event::KeyModifiers::NONE,
+            },
+            area,
+        )
+        .unwrap();
+
+        assert_eq!(app.browser.as_ref().unwrap().selected_index, 0);
     }
 
     #[test]
