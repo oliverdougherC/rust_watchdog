@@ -699,6 +699,7 @@ fn state_from_runtime(
     event_journal_path: &Path,
     worker_pid: Option<u32>,
 ) -> AppState {
+    let live_queue_total = db.get_queue_count().max(0) as u32;
     let mut state = AppState {
         run_mode: if worker_pid.is_some()
             && service_state.worker_run_mode.as_deref() == Some("precision")
@@ -707,7 +708,7 @@ fn state_from_runtime(
         } else {
             RunMode::Watchdog
         },
-        queue_total: db.get_queue_count().max(0) as u32,
+        queue_total: live_queue_total,
         consecutive_pass_failures: service_state.consecutive_pass_failures,
         auto_paused: service_state.auto_paused_at.is_some(),
         auto_pause_reason: service_state.auto_pause_reason.clone(),
@@ -741,10 +742,7 @@ fn state_from_runtime(
             .get("queue_position")
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32;
-        state.queue_total = snapshot
-            .get("queue_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(state.queue_total as u64) as u32;
+        state.queue_total = live_queue_total.max(state.queue_position);
         state.current_file = snapshot
             .get("current_file")
             .and_then(Value::as_str)
@@ -1113,11 +1111,21 @@ fn handle_key_event(
                             );
                             app.status_message = Some(format!("Removed {}", source_path));
                             app.queue_state.refresh(db.as_ref());
+                            app.current_state.queue_total = db.get_queue_count().max(0) as u32;
+                            app.current_state.queue_total = app
+                                .current_state
+                                .queue_total
+                                .max(app.current_state.queue_position);
                             app.last_db_refresh = Instant::now();
                         } else {
                             app.status_message =
                                 Some("Selected queue row is no longer pending.".to_string());
                             app.queue_state.refresh(db.as_ref());
+                            app.current_state.queue_total = db.get_queue_count().max(0) as u32;
+                            app.current_state.queue_total = app
+                                .current_state
+                                .queue_total
+                                .max(app.current_state.queue_position);
                             app.last_db_refresh = Instant::now();
                         }
                     }
@@ -2351,6 +2359,7 @@ fn truncate_left(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::NewQueueItem;
     use crate::state::RunMode;
     use ratatui::{backend::TestBackend, Terminal};
     use std::process::Command;
@@ -2558,5 +2567,53 @@ mod tests {
             .status_message
             .as_deref()
             .is_some_and(|message| message.contains("exited")));
+    }
+
+    #[test]
+    fn state_from_runtime_prefers_live_queue_total_after_queue_edits() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        db.enqueue_queue_items(&[
+            NewQueueItem {
+                source_path: "/mnt/movies/A.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
+                preset_payload_json: "{}".to_string(),
+            },
+            NewQueueItem {
+                source_path: "/mnt/movies/B.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
+                preset_payload_json: "{}".to_string(),
+            },
+            NewQueueItem {
+                source_path: "/mnt/movies/C.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
+                preset_payload_json: "{}".to_string(),
+            },
+        ]);
+
+        let state = state_from_runtime(
+            Some(json!({
+                "queue_position": 4,
+                "queue_total": 10,
+            })),
+            &db.get_service_state(),
+            &db,
+            Path::new("/tmp/watchdog.events.ndjson"),
+            Some(12345),
+        );
+
+        assert_eq!(state.queue_position, 4);
+        assert_eq!(state.queue_total, 4);
     }
 }

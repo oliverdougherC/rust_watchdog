@@ -1151,7 +1151,7 @@ async fn queued_item_uses_frozen_preset_payload_after_source_file_changes() {
 
     let original_payload = bundled_preset_payload_json();
     let mutated_payload =
-        original_payload.replace(r#""VideoPreset" : "8""#, r#""VideoPreset" : "0""#);
+        original_payload.replace(r#""VideoPreset" : "6""#, r#""VideoPreset" : "0""#);
     assert_ne!(original_payload, mutated_payload);
 
     let preset_path = presets_dir.join("Custom.json");

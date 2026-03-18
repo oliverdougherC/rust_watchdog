@@ -1,0 +1,73 @@
+{
+  "timestamp": "2026-03-18T17:43:26.678325+00:00",
+  "phase": "Idle",
+  "paused": false,
+  "nfs_healthy": true,
+  "simulate_mode": true,
+  "run_mode": "watchdog",
+  "queue_position": 0,
+  "queue_total": 0,
+  "current_file": null,
+  "progress_stage": "Idle",
+  "import_percent": 0.0,
+  "transcode_percent": 0.0,
+  "export_percent": 0.0,
+  "composite_percent": 0.0,
+  "transfer_rate_mib_per_sec": 0.0,
+  "transfer_eta": "",
+  "transcode_fps": 0.0,
+  "transcode_avg_fps": 0.0,
+  "transcode_eta": "",
+  "totals": {
+    "transcoded": 0,
+    "inspected": 2,
+    "space_saved_bytes": 0
+  },
+  "run": {
+    "inspected": 2,
+    "transcoded": 0,
+    "failures": 2,
+    "retries_scheduled": 0,
+    "space_saved_bytes": 0,
+    "skipped_inspected": 0,
+    "skipped_young": 0,
+    "skipped_cooldown": 0,
+    "skipped_filtered": 0,
+    "skipped_in_use": 0,
+    "skipped_quarantined": 0
+  },
+  "reliability": {
+    "scan_timeouts": 0,
+    "retries_scheduled_total": 0,
+    "last_failure_code": "verification_container_mismatch",
+    "consecutive_pass_failures": 0,
+    "auto_paused": false,
+    "auto_pause_reason": null,
+    "auto_paused_at": null,
+    "quarantined_files": 0
+  },
+  "cooldown_files": 0,
+  "top_failure_reasons": [
+    [
+      "verification_container_mismatch",
+      2
+    ]
+  ],
+  "share_health": [
+    {
+      "name": "movies",
+      "healthy": true
+    },
+    {
+      "name": "tv",
+      "healthy": true
+    }
+  ],
+  "unhealthy_shares": [],
+  "latest_failure": {
+    "source_path": "/Volumes/JellyfinTV/Breaking.Bad/Season 03/Breaking.Bad.S03E04.mkv",
+    "failure_reason": "verification_container_mismatch",
+    "failure_code": "verification_container_mismatch",
+    "completed_at": "2026-03-18T17:43:26"
+  }
+}
