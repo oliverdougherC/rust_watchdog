@@ -8,7 +8,9 @@ use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval, Ver
 use crate::state::{PipelinePhase, ProgressStage, RunMode, StateManager};
 use crate::stats::RunStats;
 use crate::traits::*;
-use crate::transcode::{PresetContract, PresetSnapshot};
+use crate::transcode::{
+    load_preset_payload_text, write_preset_payload_snapshot, PresetContract, PresetSnapshot,
+};
 use crate::transfer::{
     safe_replace, SafeReplaceOutcome, SafeReplacePlan, SourceFingerprint, WATCHDOG_OLD_SUFFIX,
     WATCHDOG_TMP_SUFFIX,
@@ -121,6 +123,7 @@ struct QueuedTranscodeItem {
     entry: FileEntry,
     eval: TranscodeEval,
     preset: PresetSnapshot,
+    preset_payload_json: String,
 }
 
 #[derive(Debug)]
@@ -150,14 +153,22 @@ impl Ord for QueueCandidate {
     }
 }
 
-fn stable_path_hash(path: &Path) -> u64 {
+fn stable_bytes_hash(bytes: &[u8]) -> u64 {
     // Deterministic FNV-1a hash for stable temp naming across runs.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in path.to_string_lossy().as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0001_0000_01b3);
     }
     hash
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    stable_bytes_hash(path.to_string_lossy().as_bytes())
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    stable_bytes_hash(text.as_bytes())
 }
 
 fn configured_default_preset(config: &Config, base_dir: &Path) -> PresetSnapshot {
@@ -191,11 +202,15 @@ fn effective_queue_preset(
     )
 }
 
-fn preset_contract_cache_key(preset: &PresetSnapshot) -> (String, String, String) {
+fn preset_contract_cache_key(
+    preset: &PresetSnapshot,
+    preset_payload_json: &str,
+) -> (String, String, String, u64) {
     (
         preset.preset_file.clone(),
         preset.preset_name.clone(),
         preset.target_codec.clone(),
+        stable_text_hash(preset_payload_json),
     )
 }
 
@@ -223,6 +238,24 @@ fn build_local_temp_paths(
         share_name, hash, name_no_ext, output_extension
     ));
     (local_source, local_output)
+}
+
+fn preset_snapshot_cache_dir(config: &Config, base_dir: &Path) -> PathBuf {
+    let database_path = config.resolve_path(base_dir, &config.paths.database);
+    let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = database_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("watchdog");
+    parent.join(format!("{}.preset-cache", stem))
+}
+
+fn materialized_preset_snapshot_path(snapshot_dir: &Path, preset_payload_json: &str) -> PathBuf {
+    snapshot_dir.join(format!(
+        "watchdog_preset_{:016x}.json",
+        stable_text_hash(preset_payload_json)
+    ))
 }
 
 fn scaled_timeout_for_attempt(
@@ -366,6 +399,30 @@ fn queue_row_to_candidate(
         &configured_default_preset(config, base_dir),
         base_dir,
     );
+    let preset_payload_json = match record.preset_payload_json.clone() {
+        Some(payload) => payload,
+        None => {
+            let preset_path = preset.resolve_path(base_dir);
+            match load_preset_payload_text(&preset_path) {
+                Ok(payload) => {
+                    db.update_queue_item_preset_payload(&record.source_path, &payload);
+                    payload
+                }
+                Err(err) => {
+                    tui_log(
+                        state,
+                        "WARN",
+                        &format!(
+                            "Preset payload missing and could not be restored for queued item {}; dropping: {}",
+                            record.source_path, err
+                        ),
+                    );
+                    db.remove_queue_item(&record.source_path);
+                    return None;
+                }
+            }
+        }
+    };
     let mut eval_config = config.transcode.clone();
     eval_config.target_codec = preset.target_codec.clone();
     let mut eval = evaluate_transcode_need(&probe, &eval_config);
@@ -405,6 +462,7 @@ fn queue_row_to_candidate(
         },
         eval,
         preset,
+        preset_payload_json,
     })
 }
 
@@ -459,6 +517,7 @@ fn enqueue_queue_candidates(
             preset_file: item.preset.preset_file.clone(),
             preset_name: item.preset.preset_name.clone(),
             target_codec: item.preset.target_codec.clone(),
+            preset_payload_json: item.preset_payload_json.clone(),
         })
         .collect::<Vec<_>>();
     db.enqueue_queue_items(&items)
@@ -770,6 +829,8 @@ pub async fn run_watchdog_pass(
 
     // Filter out already-inspected files and build transcode queue
     let default_preset = configured_default_preset(config, base_dir);
+    let default_preset_payload_json =
+        load_preset_payload_text(&default_preset.resolve_path(base_dir))?;
     let mut transcode_queue: Vec<QueuedTranscodeItem> = Vec::new();
     let mut capped_queue: Option<BinaryHeap<Reverse<QueueCandidate>>> =
         queue_cap.map(|_| BinaryHeap::new());
@@ -892,6 +953,7 @@ pub async fn run_watchdog_pass(
                     &mut pending_inspected,
                     queue_cap,
                     &default_preset,
+                    &default_preset_payload_json,
                 )?;
             }
         }
@@ -913,6 +975,7 @@ pub async fn run_watchdog_pass(
             &mut pending_inspected,
             queue_cap,
             &default_preset,
+            &default_preset_payload_json,
         )?;
     }
 
@@ -1026,6 +1089,8 @@ pub async fn run_watchdog_pass(
     }
 
     enqueue_queue_candidates(db, &transcode_queue, "scan");
+    let transcode_queue = load_queue_candidates(config, base_dir, deps, db, state);
+    state.set_queue_info(0, transcode_queue.len() as u32);
     let mut process_stats = process_transcode_queue(
         config,
         base_dir,
@@ -1082,8 +1147,10 @@ async fn process_transcode_queue(
         ..RunStats::default()
     };
     let mut attempt_counts: HashMap<PathBuf, u32> = HashMap::new();
-    let mut preset_contract_cache: HashMap<(String, String, String), PresetContract> =
-        HashMap::new();
+    let mut preset_contract_cache: HashMap<
+        (String, String, String, u64),
+        (PresetContract, PathBuf),
+    > = HashMap::new();
     let mut outstanding_paths = transcode_queue
         .iter()
         .map(|item| item.entry.path.clone())
@@ -1092,6 +1159,7 @@ async fn process_transcode_queue(
     let mut idx = 0usize;
 
     let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
+    let preset_snapshot_dir = preset_snapshot_cache_dir(config, base_dir);
     deps.fs.create_dir_all(&temp_dir)?;
     let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
     state.set_queue_info(0, db.get_queue_count().max(0) as u32);
@@ -1130,6 +1198,7 @@ async fn process_transcode_queue(
         let entry = &item.entry;
         let eval = &item.eval;
         let preset = &item.preset;
+        let preset_payload_json = &item.preset_payload_json;
         let path = &entry.path;
         let share_name = &entry.share_name;
         let path_str = path.to_string_lossy().to_string();
@@ -1181,40 +1250,51 @@ async fn process_transcode_queue(
                 return Err(WatchdogError::Database(e));
             }
         };
-        let preset_path = preset.resolve_path(base_dir);
-        let cache_key = preset_contract_cache_key(preset);
-        let preset_contract = if let Some(contract) = preset_contract_cache.get(&cache_key) {
-            contract.clone()
-        } else {
-            match PresetContract::resolve(&preset_path, &preset.preset_name).and_then(|contract| {
-                contract.ensure_target_codec(&preset.target_codec)?;
-                Ok(contract)
-            }) {
-                Ok(contract) => {
-                    preset_contract_cache.insert(cache_key, contract.clone());
-                    contract
+        let materialized_preset_path =
+            materialized_preset_snapshot_path(&preset_snapshot_dir, preset_payload_json);
+        let cache_key = preset_contract_cache_key(preset, preset_payload_json);
+        let (preset_contract, preset_path) =
+            if let Some((contract, materialized_path)) = preset_contract_cache.get(&cache_key) {
+                (contract.clone(), materialized_path.clone())
+            } else {
+                match PresetContract::from_payload_text(
+                    preset_payload_json,
+                    &preset.preset_name,
+                    &preset.preset_file,
+                )
+                .and_then(|contract| {
+                    contract.ensure_target_codec(&preset.target_codec)?;
+                    write_preset_payload_snapshot(&materialized_preset_path, preset_payload_json)?;
+                    Ok(contract)
+                }) {
+                    Ok(contract) => {
+                        preset_contract_cache.insert(
+                            cache_key,
+                            (contract.clone(), materialized_preset_path.clone()),
+                        );
+                        (contract, materialized_preset_path.clone())
+                    }
+                    Err(err) => {
+                        stats.transcode_failures += 1;
+                        state.update(|s| s.run_failures += 1);
+                        record_failure(
+                            state,
+                            db.as_ref(),
+                            config,
+                            base_dir,
+                            &path_str,
+                            db_row_id,
+                            transcode_start.elapsed().as_secs_f64(),
+                            FailureCode::TranscodeError,
+                            &format!("preset_config_error: {}", err),
+                            true,
+                        );
+                        db.remove_queue_item(&path_str);
+                        outstanding_paths.remove(path);
+                        continue;
+                    }
                 }
-                Err(err) => {
-                    stats.transcode_failures += 1;
-                    state.update(|s| s.run_failures += 1);
-                    record_failure(
-                        state,
-                        db.as_ref(),
-                        config,
-                        base_dir,
-                        &path_str,
-                        db_row_id,
-                        transcode_start.elapsed().as_secs_f64(),
-                        FailureCode::TranscodeError,
-                        &format!("preset_config_error: {}", err),
-                        true,
-                    );
-                    db.remove_queue_item(&path_str);
-                    outstanding_paths.remove(path);
-                    continue;
-                }
-            }
-        };
+            };
         let final_path = preset_contract.output_path_for(path);
 
         if check_file_in_use_best_effort(
@@ -1905,6 +1985,7 @@ fn process_probe_batch(
     pending_inspected: &mut Vec<(String, u64, f64)>,
     queue_cap: Option<usize>,
     default_preset: &PresetSnapshot,
+    default_preset_payload_json: &str,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -1941,6 +2022,7 @@ fn process_probe_batch(
                         entry,
                         eval,
                         preset: default_preset.clone(),
+                        preset_payload_json: default_preset_payload_json.to_string(),
                     };
                     if let Some(cap) = queue_cap {
                         let candidate = QueueCandidate {
@@ -3579,10 +3661,11 @@ mod tests {
             PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "av1");
         let h264 =
             PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "h264");
+        let payload = r#"{"PresetList":[]}"#;
 
         assert_ne!(
-            preset_contract_cache_key(&av1),
-            preset_contract_cache_key(&h264)
+            preset_contract_cache_key(&av1, payload),
+            preset_contract_cache_key(&h264, payload)
         );
     }
 }

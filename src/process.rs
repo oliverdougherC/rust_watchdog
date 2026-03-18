@@ -442,6 +442,11 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
 
+        if !exited {
+            terminate_subprocess(&mut child, Duration::from_millis(25));
+        }
+        let _ = child.wait();
+
         assert!(
             exited,
             "tracked subprocess should exit after force termination"

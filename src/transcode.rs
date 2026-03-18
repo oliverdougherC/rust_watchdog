@@ -149,6 +149,20 @@ impl PresetContract {
         })
     }
 
+    pub fn from_payload_text(
+        preset_payload_text: &str,
+        preset_name: &str,
+        source_label: &str,
+    ) -> Result<Self> {
+        let metadata =
+            load_preset_metadata_from_text(preset_payload_text, preset_name, source_label)?;
+        Ok(Self {
+            target_codec: metadata.target_codec,
+            container_extension: metadata.container_extension,
+            accepted_format_names: metadata.accepted_format_names,
+        })
+    }
+
     pub fn ensure_target_codec(&self, configured_target_codec: &str) -> Result<()> {
         let configured_codec = configured_target_codec.trim().to_ascii_lowercase();
         if self.target_codec != configured_codec {
@@ -315,25 +329,71 @@ fn path_for_storage(base_dir: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn load_preset_payload(preset_file: &Path) -> Result<Value> {
-    let payload_text = fs::read_to_string(preset_file).map_err(|e| {
+pub fn load_preset_payload_text(preset_file: &Path) -> Result<String> {
+    fs::read_to_string(preset_file).map_err(|e| {
         WatchdogError::Config(format!(
             "failed to read preset file {}: {}",
-            preset_file.display(),
-            e
-        ))
-    })?;
-    serde_json::from_str(&payload_text).map_err(|e| {
-        WatchdogError::Config(format!(
-            "failed to parse preset file {} as JSON: {}",
             preset_file.display(),
             e
         ))
     })
 }
 
+pub fn write_preset_payload_snapshot(
+    snapshot_path: &Path,
+    preset_payload_text: &str,
+) -> Result<()> {
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            WatchdogError::Config(format!(
+                "failed to create preset snapshot directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+    fs::write(snapshot_path, preset_payload_text).map_err(|e| {
+        WatchdogError::Config(format!(
+            "failed to write preset snapshot {}: {}",
+            snapshot_path.display(),
+            e
+        ))
+    })
+}
+
+fn parse_preset_payload_text(preset_payload_text: &str, source_label: &str) -> Result<Value> {
+    serde_json::from_str(preset_payload_text).map_err(|e| {
+        WatchdogError::Config(format!(
+            "failed to parse preset file {} as JSON: {}",
+            source_label, e
+        ))
+    })
+}
+
+fn load_preset_payload(preset_file: &Path) -> Result<Value> {
+    let payload_text = load_preset_payload_text(preset_file)?;
+    parse_preset_payload_text(&payload_text, &preset_file.display().to_string())
+}
+
 fn load_preset_metadata(preset_file: &Path, preset_name: &str) -> Result<PresetMetadata> {
     let payload = load_preset_payload(preset_file)?;
+    load_preset_metadata_from_payload(&payload, preset_name, &preset_file.display().to_string())
+}
+
+fn load_preset_metadata_from_text(
+    preset_payload_text: &str,
+    preset_name: &str,
+    source_label: &str,
+) -> Result<PresetMetadata> {
+    let payload = parse_preset_payload_text(preset_payload_text, source_label)?;
+    load_preset_metadata_from_payload(&payload, preset_name, source_label)
+}
+
+fn load_preset_metadata_from_payload(
+    payload: &Value,
+    preset_name: &str,
+    source_label: &str,
+) -> Result<PresetMetadata> {
     let preset = payload
         .get("PresetList")
         .and_then(Value::as_array)
@@ -345,11 +405,10 @@ fn load_preset_metadata(preset_file: &Path, preset_name: &str) -> Result<PresetM
         .ok_or_else(|| {
             WatchdogError::Config(format!(
                 "preset '{}' was not found in {}",
-                preset_name,
-                preset_file.display()
+                preset_name, source_label
             ))
         })?;
-    parse_preset_metadata(preset, preset_file, preset_name)
+    parse_preset_metadata(preset, Path::new(source_label), preset_name)
 }
 
 fn parse_preset_metadata(

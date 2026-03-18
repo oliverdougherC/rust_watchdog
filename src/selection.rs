@@ -1,6 +1,6 @@
 use crate::config::{Config, ShareConfig};
 use crate::db::{NewQueueItem, WatchdogDb};
-use crate::traits::{FileEntry, FileSystem, Prober};
+use crate::traits::{FileEntry, FileSystem};
 use crate::transcode::PresetSnapshot;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -68,21 +68,21 @@ fn manual_file_entry(fs: &dyn FileSystem, share: &ShareConfig, path: &Path) -> O
 pub fn enqueue_manual_paths(
     config: &Config,
     fs: &dyn FileSystem,
-    prober: &dyn Prober,
     db: &WatchdogDb,
     paths: &[PathBuf],
     preset: &PresetSnapshot,
+    preset_payload_json: &str,
 ) -> ManualSelectionSummary {
-    enqueue_manual_paths_with_progress(config, fs, prober, db, paths, preset, |_| {})
+    enqueue_manual_paths_with_progress(config, fs, db, paths, preset, preset_payload_json, |_| {})
 }
 
 pub fn enqueue_manual_paths_with_progress<F>(
     config: &Config,
     fs: &dyn FileSystem,
-    _prober: &dyn Prober,
     db: &WatchdogDb,
     paths: &[PathBuf],
     preset: &PresetSnapshot,
+    preset_payload_json: &str,
     mut on_progress: F,
 ) -> ManualSelectionSummary
 where
@@ -161,6 +161,7 @@ where
                         preset_file: preset.preset_file.clone(),
                         preset_name: preset.preset_name.clone(),
                         target_codec: preset.target_codec.clone(),
+                        preset_payload_json: preset_payload_json.to_string(),
                     });
                 }
             }
@@ -202,7 +203,6 @@ mod tests {
     use crate::db::WatchdogDb;
     use crate::error::{Result, WatchdogError};
     use crate::traits::FileSystem;
-    use crate::traits::{ProbeResult, Prober};
     use crate::transcode::PresetSnapshot;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -307,38 +307,6 @@ mod tests {
         }
     }
 
-    struct TestProber;
-
-    impl Prober for TestProber {
-        fn probe(&self, path: &Path) -> Result<Option<ProbeResult>> {
-            let codec = if path.to_string_lossy().contains("needs") {
-                "h264"
-            } else {
-                "av1"
-            };
-            let bitrate = if codec == "h264" {
-                50_000_000
-            } else {
-                5_000_000
-            };
-            Ok(Some(ProbeResult {
-                video_codec: Some(codec.to_string()),
-                stream_bitrate_bps: 0,
-                format_bitrate_bps: bitrate,
-                size_bytes: 10_000_000,
-                duration_seconds: 100.0,
-                video_stream_count: 1,
-                audio_stream_count: 1,
-                subtitle_stream_count: 0,
-                raw_json: serde_json::json!({}),
-            }))
-        }
-
-        fn health_check(&self, _path: &Path) -> Result<bool> {
-            Ok(true)
-        }
-    }
-
     fn config() -> Config {
         let mut cfg = Config::default_config();
         cfg.shares = vec![ShareConfig {
@@ -359,6 +327,10 @@ mod tests {
         )
     }
 
+    fn preset_payload_json() -> &'static str {
+        r#"{"PresetList":[]}"#
+    }
+
     #[test]
     fn manual_selection_expands_folders_and_queues_already_compliant_files() {
         let cfg = config();
@@ -370,10 +342,10 @@ mod tests {
         let summary = enqueue_manual_paths(
             &cfg,
             &fs,
-            &TestProber,
             &db,
             &[PathBuf::from("/mnt/movies")],
             &preset(),
+            preset_payload_json(),
         );
 
         assert_eq!(summary.discovered_files, 2);
@@ -393,18 +365,18 @@ mod tests {
         let first = enqueue_manual_paths(
             &cfg,
             &fs,
-            &TestProber,
             &db,
             &[PathBuf::from("/mnt/movies/needs-a.mkv")],
             &preset(),
+            preset_payload_json(),
         );
         let second = enqueue_manual_paths(
             &cfg,
             &fs,
-            &TestProber,
             &db,
             &[PathBuf::from("/mnt/movies/needs-a.mkv")],
             &preset(),
+            preset_payload_json(),
         );
 
         assert_eq!(first.enqueued_files, 1);
@@ -424,10 +396,10 @@ mod tests {
         let summary = enqueue_manual_paths_with_progress(
             &cfg,
             &fs,
-            &TestProber,
             &db,
             &[PathBuf::from("/mnt/movies")],
             &preset(),
+            preset_payload_json(),
             |update| progress.push(update),
         );
 

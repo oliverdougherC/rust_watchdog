@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -17,7 +17,8 @@ use watchdog::pipeline::{run_pipeline_loop, set_tui_log_event_path, PipelineDeps
 use watchdog::probe::FfprobeProber;
 use watchdog::process::terminate_registered_subprocesses;
 use watchdog::process::{
-    describe_exit_status, format_command_for_log, run_command, summarize_output_tail, RunOptions,
+    describe_exit_status, format_command_for_log, run_command, summarize_output_tail,
+    terminate_subprocess, RunOptions,
 };
 use watchdog::runtime::resolve_runtime_paths;
 use watchdog::scanner::RealFileSystem;
@@ -854,6 +855,7 @@ async fn run() -> anyhow::Result<()> {
             _ => RunMode::Watchdog,
         };
 
+        let mut owned_worker = None;
         let attach_run_mode = if cli.attach {
             if live_worker_pid.is_none() {
                 anyhow::bail!(
@@ -880,8 +882,9 @@ async fn run() -> anyhow::Result<()> {
                     );
                 }
             } else {
-                let worker_pid = spawn_worker_process(&cli, requested_run_mode)?;
-                wait_for_worker_ready(&db, worker_pid, Duration::from_secs(5))?;
+                let mut worker = spawn_worker_process(&cli, requested_run_mode)?;
+                wait_for_worker_ready(&db, &mut worker, Duration::from_secs(5))?;
+                owned_worker = Some(worker);
             }
             requested_run_mode
         };
@@ -894,6 +897,7 @@ async fn run() -> anyhow::Result<()> {
             runtime_paths.status_snapshot.clone(),
             runtime_paths.event_journal.clone(),
             attach_hint,
+            owned_worker,
         )
         .await
         {
@@ -972,55 +976,7 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cli_with_config(config: PathBuf) -> Cli {
-        Cli {
-            simulate: false,
-            dry_run: false,
-            once: false,
-            headless: false,
-            precision: false,
-            attach: false,
-            config,
-            log_level: None,
-            healthcheck: false,
-            healthcheck_json: false,
-            pause: false,
-            resume: false,
-            doctor: false,
-            status: false,
-            status_json: false,
-            quarantine_list: false,
-            quarantine_clear: None,
-            quarantine_clear_all: false,
-            clear_scan_cache: false,
-        }
-    }
-
-    #[test]
-    fn display_attach_config_path_keeps_relative_paths() {
-        let cli = cli_with_config(PathBuf::from("configs/watchdog.toml"));
-        assert_eq!(display_attach_config_path(&cli), "configs/watchdog.toml");
-    }
-
-    #[test]
-    fn display_attach_config_path_keeps_absolute_paths_outside_cwd_absolute() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let config_path = temp_dir.path().join("watchdog.toml");
-        std::fs::write(&config_path, b"").unwrap();
-        let cli = cli_with_config(config_path.clone());
-
-        assert_eq!(
-            display_attach_config_path(&cli),
-            config_path.canonicalize().unwrap().to_string_lossy()
-        );
-    }
-}
-
-fn spawn_worker_process(cli: &Cli, run_mode: RunMode) -> anyhow::Result<u32> {
+fn spawn_worker_process(cli: &Cli, run_mode: RunMode) -> anyhow::Result<Child> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let mut cmd = Command::new(exe);
     cmd.arg("--headless");
@@ -1040,13 +996,21 @@ fn spawn_worker_process(cli: &Cli, run_mode: RunMode) -> anyhow::Result<u32> {
 
 fn wait_for_worker_ready(
     db: &WatchdogDb,
-    spawned_pid: u32,
+    child: &mut Child,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    let spawned_pid = child.id();
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if !util::pid_is_running(spawned_pid) {
-            anyhow::bail!("Worker process {} exited during startup", spawned_pid);
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("Failed to poll worker process {}", spawned_pid))?
+        {
+            anyhow::bail!(
+                "Worker process {} exited during startup with {}",
+                spawned_pid,
+                describe_exit_status(&status)
+            );
         }
         if db
             .get_service_state()
@@ -1057,10 +1021,31 @@ fn wait_for_worker_ready(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    terminate_subprocess(child, Duration::from_millis(100));
+    let _ = child.wait();
     anyhow::bail!(
         "Timed out waiting for worker {} to register itself",
         spawned_pid
     )
+}
+
+fn live_worker_run_mode(service_state: &watchdog::db::ServiceState) -> Option<String> {
+    service_state
+        .worker_pid
+        .filter(|pid| util::pid_is_running(*pid))
+        .and(service_state.worker_run_mode.clone())
+}
+
+fn fresh_snapshot_run_mode(snapshot_diag: &SnapshotDiagnostics) -> Option<String> {
+    if snapshot_diag.freshness != "fresh" {
+        return None;
+    }
+    snapshot_diag
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("run_mode"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn run_healthcheck(
@@ -1152,13 +1137,8 @@ fn evaluate_healthcheck(
     let service_state = db.get_service_state();
     let quarantine_count = db.quarantine_count();
     let snapshot_diag = collect_snapshot_diagnostics(config, base_dir);
-    let run_mode = snapshot_diag
-        .snapshot
-        .as_ref()
-        .and_then(|s| s.get("run_mode"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or(service_state.worker_run_mode.clone())
+    let run_mode = fresh_snapshot_run_mode(&snapshot_diag)
+        .or_else(|| live_worker_run_mode(&service_state))
         .unwrap_or_else(|| "watchdog".to_string());
 
     let dep_names = ["ffprobe", "HandBrakeCLI", "rsync"];
@@ -1458,11 +1438,8 @@ fn run_status(
     let nfs_healthy = snapshot
         .and_then(|s| s.get("nfs_healthy"))
         .and_then(Value::as_bool);
-    let run_mode = snapshot
-        .and_then(|s| s.get("run_mode"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or(service_state.worker_run_mode.clone())
+    let run_mode = fresh_snapshot_run_mode(&snapshot_diag)
+        .or_else(|| live_worker_run_mode(&service_state))
         .unwrap_or_else(|| "watchdog".to_string());
     let unhealthy_shares = snapshot
         .and_then(|s| s.get("unhealthy_shares"))
@@ -1727,4 +1704,52 @@ fn run_doctor(
     println!("  status: {}", if failed { "failed" } else { "ok" });
 
     Ok(if failed { 1 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli_with_config(config: PathBuf) -> Cli {
+        Cli {
+            simulate: false,
+            dry_run: false,
+            once: false,
+            headless: false,
+            precision: false,
+            attach: false,
+            config,
+            log_level: None,
+            healthcheck: false,
+            healthcheck_json: false,
+            pause: false,
+            resume: false,
+            doctor: false,
+            status: false,
+            status_json: false,
+            quarantine_list: false,
+            quarantine_clear: None,
+            quarantine_clear_all: false,
+            clear_scan_cache: false,
+        }
+    }
+
+    #[test]
+    fn display_attach_config_path_keeps_relative_paths() {
+        let cli = cli_with_config(PathBuf::from("configs/watchdog.toml"));
+        assert_eq!(display_attach_config_path(&cli), "configs/watchdog.toml");
+    }
+
+    #[test]
+    fn display_attach_config_path_keeps_absolute_paths_outside_cwd_absolute() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("watchdog.toml");
+        std::fs::write(&config_path, b"").unwrap();
+        let cli = cli_with_config(config_path.clone());
+
+        assert_eq!(
+            display_attach_config_path(&cli),
+            config_path.canonicalize().unwrap().to_string_lossy()
+        );
+    }
 }

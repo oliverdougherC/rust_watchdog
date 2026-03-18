@@ -10,7 +10,7 @@ use crate::db::{ServiceState, WatchdogDb};
 use crate::event_journal::{
     append_event, append_log_event, read_recent_log_lines_for_current_session,
 };
-use crate::probe::FfprobeProber;
+use crate::process::describe_exit_status;
 use crate::scanner::RealFileSystem;
 use crate::selection::{
     enqueue_manual_paths_with_progress, ManualSelectionPhase, ManualSelectionProgress,
@@ -19,7 +19,9 @@ use crate::selection::{
 use crate::state::{AppState, PipelinePhase, ProgressStage, RunMode};
 use crate::status_snapshot::read_snapshot_file;
 use crate::traits::FileSystem;
-use crate::transcode::{load_preset_catalog, PresetCatalogEntry, PresetSnapshot};
+use crate::transcode::{
+    load_preset_catalog, load_preset_payload_text, PresetCatalogEntry, PresetSnapshot,
+};
 use crate::util::{copy_to_clipboard, pid_is_running};
 use crossterm::{
     event::{
@@ -43,6 +45,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, VecDeque};
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -418,6 +421,7 @@ struct TuiApp {
     show_quit_modal: bool,
     quit_kill_state: Option<QuitKillState>,
     worker_pid: Option<u32>,
+    owned_worker: Option<Child>,
     auto_opened_browser: bool,
     status_message: Option<String>,
     attach_hint: String,
@@ -450,6 +454,7 @@ impl TuiApp {
             show_quit_modal: false,
             quit_kill_state: None,
             worker_pid: None,
+            owned_worker: None,
             auto_opened_browser: false,
             status_message: None,
             attach_hint,
@@ -467,6 +472,7 @@ pub async fn run_tui(
     snapshot_path: PathBuf,
     event_journal_path: PathBuf,
     attach_hint: String,
+    owned_worker: Option<Child>,
 ) -> anyhow::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -483,6 +489,7 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = TuiApp::new(&config, base_dir, attach_hint);
+    app.owned_worker = owned_worker;
     let tick_rate = Duration::from_millis(100);
 
     let result = run_tui_loop(
@@ -575,8 +582,10 @@ fn refresh_runtime_state(
     app.last_snapshot_refresh = Instant::now();
 
     let service_state = db.get_service_state();
-    let worker_pid = service_state.worker_pid.filter(|pid| pid_is_running(*pid));
-    if worker_pid.is_none() && service_state.worker_pid.is_some() {
+    let owned_worker_pid = poll_owned_worker(app, db, &service_state);
+    let worker_pid =
+        owned_worker_pid.or_else(|| service_state.worker_pid.filter(|pid| pid_is_running(*pid)));
+    if owned_worker_pid.is_none() && worker_pid.is_none() && service_state.worker_pid.is_some() {
         db.clear_worker_state();
     }
     app.worker_pid = worker_pid;
@@ -588,6 +597,42 @@ fn refresh_runtime_state(
         event_journal_path,
         worker_pid,
     );
+}
+
+fn poll_owned_worker(
+    app: &mut TuiApp,
+    db: &WatchdogDb,
+    service_state: &ServiceState,
+) -> Option<u32> {
+    let mut child = app.owned_worker.take()?;
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            if service_state
+                .worker_pid
+                .is_some_and(|worker_pid| worker_pid == pid)
+            {
+                db.clear_worker_state();
+            }
+            if app.quit_kill_state.is_none() {
+                app.status_message = Some(format!(
+                    "Worker {} exited ({})",
+                    pid,
+                    describe_exit_status(&status)
+                ));
+            }
+            None
+        }
+        Ok(None) => {
+            app.owned_worker = Some(child);
+            Some(pid)
+        }
+        Err(error) => {
+            app.status_message = Some(format!("Failed to poll worker {}: {}", pid, error));
+            app.owned_worker = Some(child);
+            Some(pid)
+        }
+    }
 }
 
 fn poll_selection_task(app: &mut TuiApp, db: &WatchdogDb, event_journal_path: &Path) {
@@ -654,17 +699,22 @@ fn state_from_runtime(
     event_journal_path: &Path,
     worker_pid: Option<u32>,
 ) -> AppState {
-    let mut state = AppState::default();
-    state.run_mode = match service_state.worker_run_mode.as_deref() {
-        Some("precision") => RunMode::Precision,
-        _ => RunMode::Watchdog,
+    let mut state = AppState {
+        run_mode: if worker_pid.is_some()
+            && service_state.worker_run_mode.as_deref() == Some("precision")
+        {
+            RunMode::Precision
+        } else {
+            RunMode::Watchdog
+        },
+        queue_total: db.get_queue_count().max(0) as u32,
+        consecutive_pass_failures: service_state.consecutive_pass_failures,
+        auto_paused: service_state.auto_paused_at.is_some(),
+        auto_pause_reason: service_state.auto_pause_reason.clone(),
+        auto_paused_at: service_state.auto_paused_at.clone(),
+        quarantined_files: db.quarantine_count().max(0) as u64,
+        ..AppState::default()
     };
-    state.queue_total = db.get_queue_count().max(0) as u32;
-    state.consecutive_pass_failures = service_state.consecutive_pass_failures;
-    state.auto_paused = service_state.auto_paused_at.is_some();
-    state.auto_pause_reason = service_state.auto_pause_reason.clone();
-    state.auto_paused_at = service_state.auto_paused_at.clone();
-    state.quarantined_files = db.quarantine_count().max(0) as u64;
 
     if let Some(snapshot) = snapshot.as_ref() {
         if let Some(phase) = snapshot.get("phase").and_then(Value::as_str) {
@@ -678,12 +728,14 @@ fn state_from_runtime(
             .get("simulate_mode")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if let Some(run_mode) = snapshot.get("run_mode").and_then(Value::as_str) {
-            state.run_mode = if run_mode.eq_ignore_ascii_case("precision") {
-                RunMode::Precision
-            } else {
-                RunMode::Watchdog
-            };
+        if worker_pid.is_some() {
+            if let Some(run_mode) = snapshot.get("run_mode").and_then(Value::as_str) {
+                state.run_mode = if run_mode.eq_ignore_ascii_case("precision") {
+                    RunMode::Precision
+                } else {
+                    RunMode::Watchdog
+                };
+            }
         }
         state.queue_position = snapshot
             .get("queue_position")
@@ -928,10 +980,17 @@ fn start_manual_selection_task(
     db: &Arc<WatchdogDb>,
     selected: Vec<PathBuf>,
 ) {
+    let preset = app.selected_precision_preset.clone();
+    let preset_payload_json = match load_preset_payload_text(&preset.resolve_path(&app.base_dir)) {
+        Ok(payload) => payload,
+        Err(error) => {
+            app.status_message = Some(format!("Failed to load selected preset: {}", error));
+            return;
+        }
+    };
     let (tx, rx) = mpsc::channel();
     let config = config.clone();
     let db = db.clone();
-    let preset = app.selected_precision_preset.clone();
     let initial_progress = ManualSelectionProgress {
         phase: ManualSelectionPhase::Discovering,
         selected_roots: selected.len(),
@@ -948,10 +1007,10 @@ fn start_manual_selection_task(
         let summary = enqueue_manual_paths_with_progress(
             &config,
             &RealFileSystem,
-            &FfprobeProber,
             db.as_ref(),
             &selected,
             &preset,
+            &preset_payload_json,
             |progress| {
                 let _ = tx_progress.send(SelectionTaskUpdate::Progress(progress));
             },
@@ -2233,6 +2292,7 @@ fn truncate_left(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::state::RunMode;
+    use std::process::Command;
 
     #[test]
     fn browser_state_scrolls_to_keep_selection_visible() {
@@ -2312,5 +2372,34 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(precision_text.contains(":codec"));
+    }
+
+    #[test]
+    fn poll_owned_worker_reaps_exited_child_and_clears_worker_state() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        let mut app = TuiApp::new(
+            &Config::default_config(),
+            PathBuf::from("/tmp/watchdog"),
+            String::new(),
+        );
+        db.set_worker_state(pid, "precision");
+        app.owned_worker = Some(child);
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let service_state = db.get_service_state();
+        let worker_pid = poll_owned_worker(&mut app, &db, &service_state);
+        let cleared_state = db.get_service_state();
+
+        assert!(worker_pid.is_none());
+        assert!(app.owned_worker.is_none());
+        assert!(cleared_state.worker_pid.is_none());
+        assert!(cleared_state.worker_run_mode.is_none());
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("exited")));
     }
 }

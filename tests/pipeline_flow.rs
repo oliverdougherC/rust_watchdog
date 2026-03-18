@@ -388,8 +388,15 @@ enum TranscodeMode {
     TimeoutAlways,
     StalledAlways,
     SuccessWithOutputSize(u64),
+    RecordPresetPayload {
+        output_size: u64,
+        recorded_payloads: Arc<Mutex<Vec<String>>>,
+    },
     WaitForCancel,
-    MutateSourceDuringTranscode { output_size: u64, mtime_delta: f64 },
+    MutateSourceDuringTranscode {
+        output_size: u64,
+        mtime_delta: f64,
+    },
 }
 
 struct TestTranscoder {
@@ -432,6 +439,19 @@ impl Transcoder for TestTranscoder {
             }),
             TranscodeMode::SuccessWithOutputSize(size) => {
                 self.fs.insert_transcoded(output, size, 1000.0);
+                Ok(TranscodeResult {
+                    success: true,
+                    timed_out: false,
+                    output_exists: true,
+                })
+            }
+            TranscodeMode::RecordPresetPayload {
+                output_size,
+                ref recorded_payloads,
+            } => {
+                let payload = std::fs::read_to_string(_preset_file).unwrap();
+                recorded_payloads.lock().unwrap().push(payload);
+                self.fs.insert_transcoded(output, output_size, 1000.0);
                 Ok(TranscodeResult {
                     success: true,
                     timed_out: false,
@@ -597,6 +617,15 @@ fn base_config() -> Config {
     cfg.transcode.timeout_seconds = 1;
     cfg.normalize();
     cfg
+}
+
+fn bundled_preset_payload_json() -> String {
+    std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("presets")
+            .join("AV1_MKV.json"),
+    )
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1032,6 +1061,7 @@ async fn precision_mode_waits_for_manual_queue_and_processes_it() {
         preset_file: "presets/AV1_MKV.json".to_string(),
         preset_name: "AV1_MKV".to_string(),
         target_codec: "av1".to_string(),
+        preset_payload_json: bundled_preset_payload_json(),
     }]);
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1093,6 +1123,7 @@ async fn precision_mode_processes_manual_override_for_already_compliant_file() {
         preset_file: "presets/AV1_MKV.json".to_string(),
         preset_name: "AV1_MKV".to_string(),
         target_codec: "av1".to_string(),
+        preset_payload_json: bundled_preset_payload_json(),
     }]);
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1107,6 +1138,71 @@ async fn precision_mode_processes_manual_override_for_already_compliant_file() {
             .any(|record| record.source_path == source.to_string_lossy()),
         "expected already-compliant manual queue item to be processed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_item_uses_frozen_preset_payload_after_source_file_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let base_dir = temp.path().to_path_buf();
+    let presets_dir = base_dir.join("presets");
+    std::fs::create_dir_all(&presets_dir).unwrap();
+
+    let original_payload = bundled_preset_payload_json();
+    let mutated_payload =
+        original_payload.replace(r#""VideoPreset" : "8""#, r#""VideoPreset" : "0""#);
+    assert_ne!(original_payload, mutated_payload);
+
+    let preset_path = presets_dir.join("Custom.json");
+    std::fs::write(&preset_path, &original_payload).unwrap();
+
+    let mut cfg = base_config();
+    cfg.transcode.preset_file = "presets/Custom.json".to_string();
+    cfg.paths.transcode_temp = base_dir.join("temp").display().to_string();
+    cfg.normalize();
+
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/FrozenPreset.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    db.enqueue_queue_items(&[NewQueueItem {
+        source_path: source.to_string_lossy().to_string(),
+        share_name: "movies".to_string(),
+        enqueue_source: "manual".to_string(),
+        preset_file: "presets/Custom.json".to_string(),
+        preset_name: "AV1_MKV".to_string(),
+        target_codec: "av1".to_string(),
+        preset_payload_json: original_payload.clone(),
+    }]);
+    std::fs::write(&preset_path, &mutated_payload).unwrap();
+
+    let recorded_payloads = Arc::new(Mutex::new(Vec::new()));
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::RecordPresetPayload {
+                output_size: 10_000_000,
+                recorded_payloads: recorded_payloads.clone(),
+            },
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+    let result = run_watchdog_pass(&cfg, &base_dir, &deps, &db, &state, false, shutdown_rx).await;
+    assert!(result.is_ok());
+
+    let recorded = recorded_payloads.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0], original_payload);
+    assert_ne!(recorded[0], mutated_payload);
 }
 
 #[tokio::test(flavor = "multi_thread")]

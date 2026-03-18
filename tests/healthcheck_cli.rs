@@ -202,6 +202,33 @@ status_snapshot = "{}"
     }
 }
 
+fn seed_stale_worker_run_mode(config_path: &std::path::Path, run_mode: &str) {
+    let db_path = config_path.parent().unwrap().join("watchdog.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS service_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            consecutive_pass_failures INTEGER NOT NULL DEFAULT 0,
+            last_pass_failure_code TEXT,
+            auto_paused_at TEXT,
+            auto_pause_reason TEXT,
+            worker_pid INTEGER,
+            worker_run_mode TEXT
+        );
+        INSERT INTO service_state (id, consecutive_pass_failures, worker_pid, worker_run_mode)
+        VALUES (1, 0, NULL, 'watchdog')
+        ON CONFLICT(id) DO NOTHING;
+        ",
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE service_state SET worker_pid = NULL, worker_run_mode = ?1 WHERE id = 1",
+        [run_mode],
+    )
+    .unwrap();
+}
+
 #[test]
 fn healthcheck_healthy_simulate_returns_zero() {
     let output = Command::new(bin_path())
@@ -323,6 +350,44 @@ fn status_json_missing_snapshot_returns_degraded() {
     let json = parse_json_output(&output);
     assert_eq!(json["status"], "degraded");
     assert_eq!(json["status_freshness"], "missing");
+}
+
+#[test]
+fn status_json_ignores_stale_worker_run_mode_without_fresh_snapshot() {
+    let cfg = write_status_config(false);
+    seed_stale_worker_run_mode(&cfg.path, "precision");
+
+    let output = Command::new(bin_path())
+        .args([
+            "--simulate",
+            "--status-json",
+            "--config",
+            cfg.path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let json = parse_json_output(&output);
+    assert_eq!(json["run_mode"], "watchdog");
+}
+
+#[test]
+fn healthcheck_json_ignores_stale_worker_run_mode_without_fresh_snapshot() {
+    let cfg = write_basic_config();
+    seed_stale_worker_run_mode(&cfg.path, "precision");
+
+    let output = Command::new(bin_path())
+        .args([
+            "--simulate",
+            "--healthcheck-json",
+            "--config",
+            cfg.path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let json = parse_json_output(&output);
+    assert_eq!(json["run_mode"], "watchdog");
 }
 
 #[test]

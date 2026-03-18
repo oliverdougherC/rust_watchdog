@@ -2,13 +2,13 @@ use std::fmt::Write;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 /// An exclusive file lock that prevents concurrent instances.
 /// Uses `flock(LOCK_EX | LOCK_NB)` which is automatically released when the
 /// process exits (even on SIGKILL or crash). No stale lock files to clean up.
 pub struct InstanceLock {
-    _lock: nix::fcntl::Flock<File>,
+    lock: Option<nix::fcntl::Flock<File>>,
     path: PathBuf,
 }
 
@@ -33,7 +33,7 @@ impl InstanceLock {
 
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
             Ok(lock) => Ok(Self {
-                _lock: lock,
+                lock: Some(lock),
                 path: lock_path.to_path_buf(),
             }),
             Err((_, nix::Error::EWOULDBLOCK)) => Err(io::Error::new(
@@ -59,8 +59,9 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        // flock is released automatically when the Flock is dropped,
-        // but remove the lock file for cleanliness.
+        // Release the flock before removing the path so a new process cannot
+        // race in via a freshly-created lock file while we still hold the old lock.
+        let _ = self.lock.take();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -94,12 +95,12 @@ pub fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return copy_with_command("pbcopy", &[], text);
+        copy_with_command("pbcopy", &[], text)
     }
 
     #[cfg(target_os = "windows")]
     {
-        return copy_with_command("clip", &[], text);
+        copy_with_command("clip", &[], text)
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -171,10 +172,9 @@ fn configure_detached_command(cmd: &mut Command) {
         .stderr(Stdio::null());
 }
 
-pub fn spawn_detached_command(mut cmd: Command) -> io::Result<u32> {
+pub fn spawn_detached_command(mut cmd: Command) -> io::Result<Child> {
     configure_detached_command(&mut cmd);
-    let child = cmd.spawn()?;
-    Ok(child.id())
+    cmd.spawn()
 }
 
 /// Format a byte count into human-friendly binary units (KiB, MiB, GiB, TiB).
@@ -242,6 +242,7 @@ pub fn verify_dependencies() -> std::result::Result<(), Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     #[test]
     fn test_format_bytes() {
@@ -260,5 +261,23 @@ mod tests {
         assert_eq!(format_duration(60.0), "1m 0s");
         assert_eq!(format_duration(3661.0), "1h 1m 1s");
         assert_eq!(format_duration(7200.0), "2h 0m 0s");
+    }
+
+    #[test]
+    fn instance_lock_blocks_reentry_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("watchdog.lock");
+
+        let first = InstanceLock::acquire(&lock_path).unwrap();
+        let err = match InstanceLock::acquire(&lock_path) {
+            Ok(_) => panic!("second lock acquisition unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+
+        drop(first);
+
+        let second = InstanceLock::acquire(&lock_path).unwrap();
+        assert_eq!(second.path(), lock_path.as_path());
     }
 }

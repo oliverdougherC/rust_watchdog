@@ -103,6 +103,7 @@ pub struct QueueRecord {
     pub preset_file: Option<String>,
     pub preset_name: Option<String>,
     pub target_codec: Option<String>,
+    pub preset_payload_json: Option<String>,
     pub order_key: i64,
     pub queued_at: String,
     pub started_at: Option<String>,
@@ -116,6 +117,7 @@ pub struct NewQueueItem {
     pub preset_file: String,
     pub preset_name: String,
     pub target_codec: String,
+    pub preset_payload_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +280,7 @@ impl WatchdogDb {
                 preset_file TEXT,
                 preset_name TEXT,
                 target_codec TEXT,
+                preset_payload_json TEXT,
                 order_key INTEGER NOT NULL,
                 queued_at TEXT NOT NULL,
                 started_at TEXT
@@ -384,6 +387,18 @@ impl WatchdogDb {
         )?;
         if queue_target_codec_col_exists == 0 {
             conn.execute("ALTER TABLE queue_items ADD COLUMN target_codec TEXT", [])?;
+        }
+
+        let queue_preset_payload_col_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('queue_items') WHERE name = 'preset_payload_json'",
+            [],
+            |row| row.get(0),
+        )?;
+        if queue_preset_payload_col_exists == 0 {
+            conn.execute(
+                "ALTER TABLE queue_items ADD COLUMN preset_payload_json TEXT",
+                [],
+            )?;
         }
 
         conn.execute(
@@ -790,7 +805,8 @@ impl WatchdogDb {
         let conn = self.lock();
         if let Err(e) = conn.execute(
             "UPDATE service_state
-             SET worker_pid = NULL
+             SET worker_pid = NULL,
+                 worker_run_mode = NULL
              WHERE id = 1",
             [],
         ) {
@@ -927,8 +943,8 @@ impl WatchdogDb {
         for item in items {
             match tx.execute(
                 "INSERT OR IGNORE INTO queue_items
-                 (source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, order_key, queued_at, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                 (source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, preset_payload_json, order_key, queued_at, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
                 params![
                     item.source_path,
                     item.share_name,
@@ -936,6 +952,7 @@ impl WatchdogDb {
                     item.preset_file,
                     item.preset_name,
                     item.target_codec,
+                    item.preset_payload_json,
                     next_order_key,
                     now,
                 ],
@@ -961,7 +978,7 @@ impl WatchdogDb {
     pub fn list_queue_items(&self, limit: u32) -> Vec<QueueRecord> {
         let conn = self.lock();
         let mut stmt = match conn.prepare(
-            "SELECT id, source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, order_key, queued_at, started_at
+            "SELECT id, source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, preset_payload_json, order_key, queued_at, started_at
              FROM queue_items
              ORDER BY CASE WHEN started_at IS NOT NULL THEN 0 ELSE 1 END,
                       order_key ASC
@@ -983,9 +1000,10 @@ impl WatchdogDb {
                 preset_file: row.get(4)?,
                 preset_name: row.get(5)?,
                 target_codec: row.get(6)?,
-                order_key: row.get(7)?,
-                queued_at: row.get(8)?,
-                started_at: row.get(9)?,
+                preset_payload_json: row.get(7)?,
+                order_key: row.get(8)?,
+                queued_at: row.get(9)?,
+                started_at: row.get(10)?,
             })
         }) {
             Ok(rows) => rows,
@@ -1003,7 +1021,7 @@ impl WatchdogDb {
         let tx = conn.transaction().ok()?;
         let next = tx
             .query_row(
-                "SELECT id, source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, order_key, queued_at, started_at
+                "SELECT id, source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, preset_payload_json, order_key, queued_at, started_at
                  FROM queue_items
                  WHERE started_at IS NULL
                  ORDER BY order_key ASC
@@ -1018,9 +1036,10 @@ impl WatchdogDb {
                         preset_file: row.get(4)?,
                         preset_name: row.get(5)?,
                         target_codec: row.get(6)?,
-                        order_key: row.get(7)?,
-                        queued_at: row.get(8)?,
-                        started_at: row.get(9)?,
+                        preset_payload_json: row.get(7)?,
+                        order_key: row.get(8)?,
+                        queued_at: row.get(9)?,
+                        started_at: row.get(10)?,
                     })
                 },
             )
@@ -1111,6 +1130,21 @@ impl WatchdogDb {
         )
         .map(|count| count > 0)
         .unwrap_or(false)
+    }
+
+    pub fn update_queue_item_preset_payload(&self, source_path: &str, preset_payload_json: &str) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE queue_items
+             SET preset_payload_json = ?1
+             WHERE source_path = ?2",
+            params![preset_payload_json, source_path],
+        ) {
+            error!(
+                "DB error in update_queue_item_preset_payload('{}'): {}",
+                source_path, e
+            );
+        }
     }
 
     pub fn clear_queue_items(&self) -> usize {
@@ -1519,6 +1553,7 @@ impl WatchdogDb {
             ("service_state", "worker_run_mode"),
             ("queue_items", "source_path"),
             ("queue_items", "order_key"),
+            ("queue_items", "preset_payload_json"),
         ];
         for (table, column) in required_columns {
             let sql = format!(
@@ -1546,6 +1581,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::NamedTempFile;
+
+    const TEST_PRESET_PAYLOAD_JSON: &str = r#"{"PresetList":[]}"#;
 
     #[test]
     fn test_schema_creation() {
@@ -1910,6 +1947,18 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_worker_state_clears_run_mode() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        db.set_worker_state(4242, "precision");
+
+        db.clear_worker_state();
+
+        let state = db.get_service_state();
+        assert!(state.worker_pid.is_none());
+        assert!(state.worker_run_mode.is_none());
+    }
+
+    #[test]
     fn test_note_pass_failure_returns_when_service_state_missing() {
         let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
         {
@@ -1992,6 +2041,7 @@ mod tests {
                 preset_file: "presets/AV1_MKV.json".to_string(),
                 preset_name: "AV1_MKV".to_string(),
                 target_codec: "av1".to_string(),
+                preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
             },
             NewQueueItem {
                 source_path: "/mnt/movies/B.mkv".to_string(),
@@ -2000,6 +2050,7 @@ mod tests {
                 preset_file: "presets/AV1_MKV.json".to_string(),
                 preset_name: "AV1_MKV".to_string(),
                 target_codec: "av1".to_string(),
+                preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
             },
             NewQueueItem {
                 source_path: "/mnt/movies/A.mkv".to_string(),
@@ -2008,6 +2059,7 @@ mod tests {
                 preset_file: "presets/H264.json".to_string(),
                 preset_name: "H264".to_string(),
                 target_codec: "h264".to_string(),
+                preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
             },
         ]);
         assert_eq!(inserted, 2);
@@ -2022,6 +2074,10 @@ mod tests {
         );
         assert_eq!(queue[0].preset_name.as_deref(), Some("AV1_MKV"));
         assert_eq!(queue[0].target_codec.as_deref(), Some("av1"));
+        assert_eq!(
+            queue[0].preset_payload_json.as_deref(),
+            Some(TEST_PRESET_PAYLOAD_JSON)
+        );
         assert_eq!(queue[1].source_path, "/mnt/movies/B.mkv");
         assert_eq!(queue[1].order_key, 2);
         assert_eq!(queue[1].enqueue_source, "manual");
@@ -2037,6 +2093,7 @@ mod tests {
             preset_file: "presets/AV1_MKV.json".to_string(),
             preset_name: "AV1_MKV".to_string(),
             target_codec: "av1".to_string(),
+            preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
         }]);
         db.mark_queue_item_started("/mnt/movies/A.mkv");
         assert!(db.list_queue_items(1)[0].started_at.is_some());
@@ -2056,6 +2113,7 @@ mod tests {
                 preset_file: "presets/AV1_MKV.json".to_string(),
                 preset_name: "AV1_MKV".to_string(),
                 target_codec: "av1".to_string(),
+                preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
             },
             NewQueueItem {
                 source_path: "/mnt/movies/B.mkv".to_string(),
@@ -2064,6 +2122,7 @@ mod tests {
                 preset_file: "presets/AV1_MKV.json".to_string(),
                 preset_name: "AV1_MKV".to_string(),
                 target_codec: "av1".to_string(),
+                preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
             },
         ]);
 
@@ -2083,6 +2142,7 @@ mod tests {
                 preset_file: "presets/AV1_MKV.json".to_string(),
                 preset_name: "AV1_MKV".to_string(),
                 target_codec: "av1".to_string(),
+                preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
             },
             NewQueueItem {
                 source_path: "/mnt/movies/B.mkv".to_string(),
@@ -2091,6 +2151,7 @@ mod tests {
                 preset_file: "presets/AV1_MKV.json".to_string(),
                 preset_name: "AV1_MKV".to_string(),
                 target_codec: "av1".to_string(),
+                preset_payload_json: TEST_PRESET_PAYLOAD_JSON.to_string(),
             },
         ]);
         db.mark_queue_item_started("/mnt/movies/B.mkv");
