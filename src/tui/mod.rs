@@ -5,7 +5,7 @@ pub mod logs_tab;
 pub mod queue_tab;
 pub mod widgets;
 
-use crate::config::Config;
+use crate::config::{bundled_preset_dir, Config};
 use crate::db::{ServiceState, WatchdogDb};
 use crate::event_journal::{
     append_event, append_log_event, read_recent_log_lines_for_current_session,
@@ -1036,7 +1036,7 @@ fn open_preset_selector(app: &mut TuiApp) {
     if selector.entries.is_empty() {
         app.status_message = Some(format!(
             "No preset files found in {}",
-            app.base_dir.join("presets").display()
+            bundled_preset_dir(&app.base_dir).display()
         ));
     } else {
         app.preset_selector = Some(selector);
@@ -2442,7 +2442,7 @@ mod tests {
         let mut app = TuiApp::new(
             &Config::default_config(),
             PathBuf::from("/tmp/watchdog"),
-            "watchdog --attach --config watchdog.toml".to_string(),
+            "watchdog --attach --config .watchdog/watchdog.toml".to_string(),
         );
         app.show_quit_modal = true;
         app.worker_pid = Some(88529);

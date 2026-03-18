@@ -2,6 +2,30 @@ use crate::error::{Result, WatchdogError};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+pub const APP_DIR_NAME: &str = ".watchdog";
+pub const DEFAULT_CONFIG_PATH: &str = ".watchdog/watchdog.toml";
+pub const LEGACY_DEFAULT_CONFIG_PATH: &str = "watchdog.toml";
+pub const SAMPLE_CONFIG_PATH: &str = ".watchdog/watchdog.toml.example";
+pub const BUNDLED_PRESET_DIR_NAME: &str = "presets";
+pub const HIDDEN_BUNDLED_PRESET_DIR_PATH: &str = ".watchdog/presets";
+
+pub fn app_dir(base_dir: &Path) -> PathBuf {
+    if base_dir.file_name().and_then(|name| name.to_str()) == Some(APP_DIR_NAME) {
+        base_dir.to_path_buf()
+    } else {
+        base_dir.join(APP_DIR_NAME)
+    }
+}
+
+pub fn bundled_preset_dir(base_dir: &Path) -> PathBuf {
+    let direct = base_dir.join(BUNDLED_PRESET_DIR_NAME);
+    if direct.exists() {
+        direct
+    } else {
+        app_dir(base_dir).join(BUNDLED_PRESET_DIR_NAME)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -799,5 +823,17 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| e.contains("retry_stall_timeout_cap_seconds")));
+    }
+
+    #[test]
+    fn app_dir_keeps_hidden_config_base_dir_stable() {
+        assert_eq!(
+            app_dir(Path::new("/tmp/project/.watchdog")),
+            Path::new("/tmp/project/.watchdog")
+        );
+        assert_eq!(
+            app_dir(Path::new("/tmp/project")),
+            Path::new("/tmp/project/.watchdog")
+        );
     }
 }

@@ -1,3 +1,4 @@
+use crate::config::{bundled_preset_dir, BUNDLED_PRESET_DIR_NAME, HIDDEN_BUNDLED_PRESET_DIR_PATH};
 use crate::error::{Result, WatchdogError};
 use crate::process::{
     configure_subprocess_group, describe_exit_status, format_command_for_log, infer_failure_hint,
@@ -208,13 +209,31 @@ pub fn resolve_preset_path(base_dir: &Path, preset_file: &str) -> PathBuf {
     } else {
         base_dir.join(configured_path)
     };
+    if direct_path.exists() {
+        return direct_path;
+    }
+
+    if !configured_path.is_absolute() {
+        if let Ok(suffix) = configured_path.strip_prefix(BUNDLED_PRESET_DIR_NAME) {
+            let alternate = bundled_preset_dir(base_dir).join(suffix);
+            if alternate.exists() {
+                return alternate;
+            }
+        }
+        if let Ok(suffix) = configured_path.strip_prefix(HIDDEN_BUNDLED_PRESET_DIR_PATH) {
+            let alternate = bundled_preset_dir(base_dir).join(suffix);
+            if alternate.exists() {
+                return alternate;
+            }
+        }
+    }
 
     let is_bare_filename = !configured_path.is_absolute()
         && configured_path
             .parent()
             .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."));
-    if !direct_path.exists() && is_bare_filename {
-        let fallback = base_dir.join("presets").join(
+    if is_bare_filename {
+        let fallback = bundled_preset_dir(base_dir).join(
             configured_path
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new(preset_file)),
@@ -228,7 +247,7 @@ pub fn resolve_preset_path(base_dir: &Path, preset_file: &str) -> PathBuf {
 }
 
 pub fn load_preset_catalog(base_dir: &Path) -> Vec<PresetCatalogEntry> {
-    let presets_dir = base_dir.join("presets");
+    let presets_dir = bundled_preset_dir(base_dir);
     let mut files = match fs::read_dir(&presets_dir) {
         Ok(entries) => entries
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -1328,6 +1347,7 @@ mod tests {
 
     fn bundled_preset_file() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".watchdog")
             .join("presets")
             .join("AV1_MKV.json")
     }
@@ -1411,6 +1431,20 @@ mod tests {
 
         let resolved = resolve_preset_path(dir.path(), "AV1_MKV.json");
         assert_eq!(resolved, dir.path().join("presets/AV1_MKV.json"));
+    }
+
+    #[test]
+    fn preset_path_falls_back_to_hidden_preset_dir_for_legacy_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".watchdog/presets")).unwrap();
+        fs::copy(
+            bundled_preset_file(),
+            dir.path().join(".watchdog/presets/AV1_MKV.json"),
+        )
+        .unwrap();
+
+        let resolved = resolve_preset_path(dir.path(), "presets/AV1_MKV.json");
+        assert_eq!(resolved, dir.path().join(".watchdog/presets/AV1_MKV.json"));
     }
 
     #[test]

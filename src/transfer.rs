@@ -921,6 +921,7 @@ mod tests {
     fn bundled_contract() -> PresetContract {
         PresetContract::resolve(
             &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(".watchdog")
                 .join("presets")
                 .join("AV1_MKV.json"),
             "AV1_MKV",

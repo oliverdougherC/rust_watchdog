@@ -43,9 +43,9 @@ cargo build --release
 ./target/release/watchdog --simulate
 
 # Copy and edit the example config
-cp watchdog.toml.example watchdog.toml
-# Edit watchdog.toml with your NFS server, share paths, and preferences
-# Bundled HandBrake presets live in ./presets/
+cp .watchdog/watchdog.toml.example .watchdog/watchdog.toml
+# Edit .watchdog/watchdog.toml with your NFS server, share paths, and preferences
+# Bundled presets and default runtime state also live under ./.watchdog/
 
 # Dry run — scan and report what would be transcoded
 ./target/release/watchdog --dry-run
@@ -59,10 +59,10 @@ cp watchdog.toml.example watchdog.toml
 
 ## Local Real-Video Test
 
-Use `local_test.sh` to run a full local validation pass before deploying:
+Use `./.dev/local_test.sh` to run a full local validation pass before deploying:
 
 ```bash
-./local_test.sh
+./.dev/local_test.sh
 ```
 
 What it does:
@@ -70,30 +70,30 @@ What it does:
 - Builds release artifacts
 - Runs the Rust test suite
 - Runs a quick simulated healthcheck
-- Runs real transcoding smoke tests for every file in `test_videos/`
+- Runs real transcoding smoke tests for every file in `.test_videos/`
 
 Optional:
 
 ```bash
 # Use a different input directory
-./local_test.sh /path/to/videos
+./.dev/local_test.sh /path/to/videos
 
 # Forward args to `cargo test` (for focused runs)
-./local_test.sh --test healthcheck_cli
+./.dev/local_test.sh --test healthcheck_cli
 
 # Override preset values used by the real-tools smoke test
-WATCHDOG_REAL_PRESET_FILE=/abs/path/preset.json WATCHDOG_REAL_PRESET_NAME=MyPreset ./local_test.sh
+WATCHDOG_REAL_PRESET_FILE=/abs/path/preset.json WATCHDOG_REAL_PRESET_NAME=MyPreset ./.dev/local_test.sh
 
 # Optional: run a full (slower) simulated once pass
-WATCHDOG_RUN_SIM_ONCE=1 ./local_test.sh
+WATCHDOG_RUN_SIM_ONCE=1 ./.dev/local_test.sh
 ```
 
-## Local TUI Test (test_videos as the only share)
+## Local TUI Test (.test_videos as the only share)
 
-Use `local_tui.sh` to run the real TUI pipeline with `test_videos` as the only scanned share:
+Use `./.dev/local_tui.sh` to run the real TUI pipeline with `.test_videos` as the only scanned share:
 
 ```bash
-./local_tui.sh
+./.dev/local_tui.sh
 ```
 
 What it does:
@@ -108,16 +108,16 @@ Optional:
 
 ```bash
 # Use another source video directory
-./local_tui.sh /path/to/videos
+./.dev/local_tui.sh /path/to/videos
 
 # Run one full pass in headless mode with detailed logs + outcome summary
-./local_tui.sh --headless-once
+./.dev/local_tui.sh --headless-once
 
 # Optional: adjust headless log level (default: info)
-WATCHDOG_LOCAL_TUI_HEADLESS_LOG_LEVEL=debug ./local_tui.sh --headless-once
+WATCHDOG_LOCAL_TUI_HEADLESS_LOG_LEVEL=debug ./.dev/local_tui.sh --headless-once
 
 # Prepare sandbox/config only (no watchdog run)
-./local_tui.sh --prepare-only
+./.dev/local_tui.sh --prepare-only
 ```
 
 ## Debugging and Logging
@@ -139,13 +139,13 @@ Useful operator commands:
 
 ```bash
 # Fast environment + dependency + mount diagnostics
-./target/release/watchdog --doctor --config watchdog.toml
+./target/release/watchdog --doctor --config .watchdog/watchdog.toml
 
 # Snapshot-driven service status for remote debugging
-./target/release/watchdog --status-json --config watchdog.toml
+./target/release/watchdog --status-json --config .watchdog/watchdog.toml
 
 # Health-oriented checks suitable for supervisors
-./target/release/watchdog --healthcheck-json --config watchdog.toml
+./target/release/watchdog --healthcheck-json --config .watchdog/watchdog.toml
 ```
 
 ## CLI Flags
@@ -168,17 +168,19 @@ Useful operator commands:
 | `--quarantine-clear <path>` | Clear one quarantined file |
 | `--quarantine-clear-all` | Clear all quarantined files |
 | `--clear-scan-cache` | Clear `inspected_files` cache on startup (full rescan) |
-| `--config <path>` | Config file path (default: `watchdog.toml`) |
+| `--config <path>` | Config file path (default: `.watchdog/watchdog.toml`) |
 | `--version` | Print version and exit |
 
 ## Configuration
 
-See [`watchdog.toml.example`](watchdog.toml.example) for a complete example. Key settings:
+See [`.watchdog/watchdog.toml.example`](.watchdog/watchdog.toml.example) for a complete example. Key settings:
+
+The CLI defaults to `.watchdog/watchdog.toml`. If that hidden config is absent, the binary still falls back to a legacy root-level `watchdog.toml`.
 
 - **`[nfs]`** — NFS server IP
 - **`[[shares]]`** — media share definitions (name, remote path, local mount point)
 - **`[transcode]`** — codec target, bitrate threshold, HandBrake preset, timeout, stall timeout, retries, and retry-time timeout scaling/caps
-- HandBrake preset JSON files are loaded from the repo root `presets/` directory
+- HandBrake preset JSON files are loaded from the hidden `./.watchdog/presets/` directory
 - **`[scan]`** — video extensions, optional include/exclude globs (path-aware or basename-only patterns), scan interval, per-pass queue cap, optional `probe_workers`
 - **`[safety]`** — min file age, pause file path, failure cooldown policy, pass-failure tripwire thresholds, quarantine thresholds/codes, optional in-use guard command, periodic recovery scan interval, bounded share scan timeout, status snapshot freshness threshold
 - **`[paths]`** — temp directory for transcoding, database location, optional status snapshot output path, optional NDJSON event journal path

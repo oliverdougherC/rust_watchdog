@@ -1,0 +1,71 @@
+[nfs]
+server = "192.168.1.244"
+
+[[shares]]
+name = "movies"
+remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/Movies"
+local_mount = "/Volumes/JellyfinMovies"
+
+[[shares]]
+name = "tv"
+remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/TV"
+local_mount = "/Volumes/JellyfinTV"
+
+[transcode]
+max_average_bitrate_mbps = 25.0
+target_codec = "av1"
+preset_file = "presets/AV1_MKV.json"
+preset_name = "AV1_MKV"
+timeout_seconds = 18000
+stall_timeout_seconds = 600
+max_retries = 1
+retry_timeout_multiplier = 2.0
+retry_timeout_cap_seconds = 86400
+retry_stall_timeout_cap_seconds = 7200
+min_free_space_multiplier = 2.0
+
+[scan]
+video_extensions = [".mkv", ".mp4", ".avi", ".mov", ".webm"]
+interval_seconds = 300
+include_globs = []
+exclude_globs = []
+max_files_per_pass = 0
+probe_workers = 0
+
+[safety]
+min_file_age_seconds = 0
+pause_file = "watchdog.pause"
+max_failures_before_cooldown = 3
+cooldown_base_seconds = 300
+cooldown_max_seconds = 86400
+in_use_guard_enabled = false
+in_use_guard_command = "lsof"
+recovery_scan_interval_seconds = 43200
+share_scan_timeout_seconds = 180
+max_consecutive_pass_failures = 3
+auto_pause_on_pass_failures = true
+quarantine_after_failures = 8
+quarantine_failure_codes = [
+  "timeout_exhausted",
+  "stalled_exhausted",
+  "transcode_failed",
+  "transcode_error",
+  "verification_failed",
+  "verification_error",
+  "safe_replace_failed",
+  "safe_replace_error",
+  "source_changed_during_transcode",
+]
+status_snapshot_stale_seconds = 30
+
+[notify]
+webhook_url = ""
+events = ["pass_failure_summary", "replacement_summary", "cooldown_alert"]
+timeout_seconds = 5
+
+[paths]
+transcode_temp = "/Volumes/External/tmp/"
+database = "watchdog.db"
+log_dir = "logs"
+status_snapshot = ""
+event_journal = ""

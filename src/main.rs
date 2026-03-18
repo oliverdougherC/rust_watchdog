@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use watchdog::config::Config;
+use watchdog::config::{Config, DEFAULT_CONFIG_PATH, LEGACY_DEFAULT_CONFIG_PATH};
 use watchdog::db::WatchdogDb;
 use watchdog::diagnostics::{log_anyhow_error, print_anyhow_error_report};
 use watchdog::event_journal::{append_event, resolve_event_journal_path};
@@ -165,7 +165,7 @@ struct Cli {
     attach: bool,
 
     /// Custom config file path
-    #[arg(long, default_value = "watchdog.toml")]
+    #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
     config: PathBuf,
 
     /// Override log verbosity (error|warn|info|debug|trace)
@@ -227,7 +227,18 @@ async fn main() {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let cwd = std::env::current_dir().context("Failed to determine current working directory")?;
+    if !cli.simulate {
+        let resolved_config = resolve_config_path(&cli.config, &cwd);
+        if resolved_config != cli.config {
+            info!(
+                "Default hidden config missing; falling back to legacy config path {}",
+                resolved_config.display()
+            );
+            cli.config = resolved_config;
+        }
+    }
     let requested_run_mode = if cli.precision {
         RunMode::Precision
     } else {
@@ -387,7 +398,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Determine base directory (config file's parent, or cwd)
     let base_dir = if cli.simulate {
-        std::env::current_dir().context("Failed to determine current working directory")?
+        cwd
     } else {
         cli.config
             .canonicalize()
@@ -963,6 +974,19 @@ fn display_attach_config_path(cli: &Cli) -> String {
         }
     }
     canonical.to_string_lossy().to_string()
+}
+
+fn resolve_config_path(requested: &Path, cwd: &Path) -> PathBuf {
+    if requested.is_absolute() || cwd.join(requested).exists() {
+        return requested.to_path_buf();
+    }
+    if requested == Path::new(DEFAULT_CONFIG_PATH) {
+        let legacy = PathBuf::from(LEGACY_DEFAULT_CONFIG_PATH);
+        if cwd.join(&legacy).exists() {
+            return legacy;
+        }
+    }
+    requested.to_path_buf()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1750,6 +1774,18 @@ mod tests {
         assert_eq!(
             display_attach_config_path(&cli),
             config_path.canonicalize().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_legacy_root_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let legacy = temp_dir.path().join("watchdog.toml");
+        std::fs::write(&legacy, b"").unwrap();
+
+        assert_eq!(
+            resolve_config_path(Path::new(DEFAULT_CONFIG_PATH), temp_dir.path()),
+            PathBuf::from(LEGACY_DEFAULT_CONFIG_PATH)
         );
     }
 }

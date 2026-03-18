@@ -33,6 +33,14 @@ status.json
 status_snapshot*.json
 events.ndjson
 *.lock
+.watchdog/watchdog.toml
+.watchdog/watchdog.pause
+.watchdog/*.db
+.watchdog/*.db-wal
+.watchdog/*.db-shm
+.watchdog/*.lock
+.watchdog/*.status.json
+.watchdog/*.events.ndjson
+.watchdog/*.preset-cache/
 
-test_videos/*
 .local_tui_run/

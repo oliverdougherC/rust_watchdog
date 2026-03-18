@@ -8,6 +8,26 @@ description = "Jellyfin AV1 Transcoding Watchdog"
 name = "watchdog"
 path = "src/main.rs"
 
+[[test]]
+name = "healthcheck_cli"
+path = ".tests/healthcheck_cli.rs"
+
+[[test]]
+name = "perf_harness"
+path = ".tests/perf_harness.rs"
+
+[[test]]
+name = "pipeline_flow"
+path = ".tests/pipeline_flow.rs"
+
+[[test]]
+name = "real_tools"
+path = ".tests/real_tools.rs"
+
+[[test]]
+name = "simulation_contract"
+path = ".tests/simulation_contract.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
