@@ -920,9 +920,10 @@ mod tests {
 
     fn bundled_contract() -> PresetContract {
         PresetContract::resolve(
-            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("AV1_MKV.json"),
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("presets")
+                .join("AV1_MKV.json"),
             "AV1_MKV",
-            "av1",
         )
         .unwrap()
     }

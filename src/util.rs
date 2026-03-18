@@ -91,6 +91,60 @@ pub fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
     !pid_is_running(pid)
 }
 
+pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return copy_with_command("pbcopy", &[], text);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return copy_with_command("clip", &[], text);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let candidates: [(&str, &[&str]); 3] = [
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        for (program, args) in candidates {
+            if which::which(program).is_ok() {
+                return copy_with_command(program, args, text);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No supported clipboard command found (tried wl-copy, xclip, xsel)",
+        ))
+    }
+}
+
+fn copy_with_command(program: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "Clipboard command '{}' exited with {}",
+            program, status
+        )))
+    }
+}
+
 #[cfg(unix)]
 fn configure_detached_command(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;

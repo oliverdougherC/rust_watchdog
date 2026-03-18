@@ -45,6 +45,7 @@ cargo build --release
 # Copy and edit the example config
 cp watchdog.toml.example watchdog.toml
 # Edit watchdog.toml with your NFS server, share paths, and preferences
+# Bundled HandBrake presets live in ./presets/
 
 # Dry run — scan and report what would be transcoded
 ./target/release/watchdog --dry-run
@@ -177,6 +178,7 @@ See [`watchdog.toml.example`](watchdog.toml.example) for a complete example. Key
 - **`[nfs]`** — NFS server IP
 - **`[[shares]]`** — media share definitions (name, remote path, local mount point)
 - **`[transcode]`** — codec target, bitrate threshold, HandBrake preset, timeout, stall timeout, retries, and retry-time timeout scaling/caps
+- HandBrake preset JSON files are loaded from the repo root `presets/` directory
 - **`[scan]`** — video extensions, optional include/exclude globs (path-aware or basename-only patterns), scan interval, per-pass queue cap, optional `probe_workers`
 - **`[safety]`** — min file age, pause file path, failure cooldown policy, pass-failure tripwire thresholds, quarantine thresholds/codes, optional in-use guard command, periodic recovery scan interval, bounded share scan timeout, status snapshot freshness threshold
 - **`[paths]`** — temp directory for transcoding, database location, optional status snapshot output path, optional NDJSON event journal path
@@ -187,10 +189,13 @@ See [`watchdog.toml.example`](watchdog.toml.example) for a complete example. Key
 | Key | Action |
 |-----|--------|
 | `q` / `Esc` | Quit |
-| `1` `2` `3` `4` | Switch tab (Dashboard, Logs, History, Cooldown) |
+| `1` `2` `3` `4` `5` | Switch tab (Dashboard, Queue, Logs, History, Cooldown) |
 | `Tab` | Next tab |
 | `j` / `k` | Scroll down / up |
 | `f` | Cycle Logs tab filter (all / warn+error / error) |
+| `b` | Open precision-mode file browser |
+| `c` | Open precision-mode codec selector |
+| `d` | Delete selected pending queue row in precision mode |
 | `Home` / `End` | Jump to top / bottom |
 
 ## Architecture
@@ -201,12 +206,13 @@ All external tools (ffprobe, HandBrakeCLI, rsync, mount_nfs) and filesystem oper
 
 ## Database
 
-Uses SQLite (WAL mode) with six primary tables:
+Uses SQLite (WAL mode) with seven primary tables:
 
 - `inspected_files` — tracks which files have been checked (by path + size + mtime)
 - `transcode_history` — full record of every transcode attempt (human `failure_reason` + machine `failure_code`)
 - `space_saved_log` — timeseries of cumulative space savings
 - `file_failure_state` — per-file retry/cooldown and last failure code tracking
+- `queue_items` — durable pending/active queue rows with preset snapshots
 - `file_quarantine` / `service_state` — quarantine set and pass-level safety tripwire state
 
 The schema is compatible with the legacy Python version's database for seamless migration.

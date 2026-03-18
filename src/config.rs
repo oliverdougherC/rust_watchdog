@@ -112,7 +112,7 @@ fn default_target_codec() -> String {
     "av1".to_string()
 }
 fn default_preset_file() -> String {
-    "AV1_MKV.json".to_string()
+    "presets/AV1_MKV.json".to_string()
 }
 fn default_preset_name() -> String {
     "AV1_MKV".to_string()

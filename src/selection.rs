@@ -1,6 +1,7 @@
 use crate::config::{Config, ShareConfig};
 use crate::db::{NewQueueItem, WatchdogDb};
 use crate::traits::{FileEntry, FileSystem, Prober};
+use crate::transcode::PresetSnapshot;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -70,8 +71,9 @@ pub fn enqueue_manual_paths(
     prober: &dyn Prober,
     db: &WatchdogDb,
     paths: &[PathBuf],
+    preset: &PresetSnapshot,
 ) -> ManualSelectionSummary {
-    enqueue_manual_paths_with_progress(config, fs, prober, db, paths, |_| {})
+    enqueue_manual_paths_with_progress(config, fs, prober, db, paths, preset, |_| {})
 }
 
 pub fn enqueue_manual_paths_with_progress<F>(
@@ -80,6 +82,7 @@ pub fn enqueue_manual_paths_with_progress<F>(
     _prober: &dyn Prober,
     db: &WatchdogDb,
     paths: &[PathBuf],
+    preset: &PresetSnapshot,
     mut on_progress: F,
 ) -> ManualSelectionSummary
 where
@@ -155,6 +158,9 @@ where
                         source_path: path_string,
                         share_name: entry.share_name.clone(),
                         enqueue_source: "manual".to_string(),
+                        preset_file: preset.preset_file.clone(),
+                        preset_name: preset.preset_name.clone(),
+                        target_codec: preset.target_codec.clone(),
                     });
                 }
             }
@@ -197,6 +203,7 @@ mod tests {
     use crate::error::{Result, WatchdogError};
     use crate::traits::FileSystem;
     use crate::traits::{ProbeResult, Prober};
+    use crate::transcode::PresetSnapshot;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -343,6 +350,15 @@ mod tests {
         cfg
     }
 
+    fn preset() -> PresetSnapshot {
+        PresetSnapshot::normalized(
+            std::path::Path::new("/"),
+            "presets/AV1_MKV.json",
+            "AV1_MKV",
+            "av1",
+        )
+    }
+
     #[test]
     fn manual_selection_expands_folders_and_queues_already_compliant_files() {
         let cfg = config();
@@ -351,8 +367,14 @@ mod tests {
         fs.insert("/mnt/movies/already-av1.mkv", 10, 1.0);
         let db = WatchdogDb::open_in_memory().unwrap();
 
-        let summary =
-            enqueue_manual_paths(&cfg, &fs, &TestProber, &db, &[PathBuf::from("/mnt/movies")]);
+        let summary = enqueue_manual_paths(
+            &cfg,
+            &fs,
+            &TestProber,
+            &db,
+            &[PathBuf::from("/mnt/movies")],
+            &preset(),
+        );
 
         assert_eq!(summary.discovered_files, 2);
         assert_eq!(summary.enqueued_files, 2);
@@ -374,6 +396,7 @@ mod tests {
             &TestProber,
             &db,
             &[PathBuf::from("/mnt/movies/needs-a.mkv")],
+            &preset(),
         );
         let second = enqueue_manual_paths(
             &cfg,
@@ -381,6 +404,7 @@ mod tests {
             &TestProber,
             &db,
             &[PathBuf::from("/mnt/movies/needs-a.mkv")],
+            &preset(),
         );
 
         assert_eq!(first.enqueued_files, 1);
@@ -403,6 +427,7 @@ mod tests {
             &TestProber,
             &db,
             &[PathBuf::from("/mnt/movies")],
+            &preset(),
             |update| progress.push(update),
         );
 

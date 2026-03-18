@@ -582,6 +582,7 @@ impl InUseDetector for TestInUseDetector {
 fn base_config() -> Config {
     let mut cfg = Config::default_config();
     cfg.transcode.preset_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("presets")
         .join("AV1_MKV.json")
         .display()
         .to_string();
@@ -1028,6 +1029,9 @@ async fn precision_mode_waits_for_manual_queue_and_processes_it() {
         source_path: source.to_string_lossy().to_string(),
         share_name: "movies".to_string(),
         enqueue_source: "manual".to_string(),
+        preset_file: "presets/AV1_MKV.json".to_string(),
+        preset_name: "AV1_MKV".to_string(),
+        target_codec: "av1".to_string(),
     }]);
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1086,6 +1090,9 @@ async fn precision_mode_processes_manual_override_for_already_compliant_file() {
         source_path: source.to_string_lossy().to_string(),
         share_name: "movies".to_string(),
         enqueue_source: "manual".to_string(),
+        preset_file: "presets/AV1_MKV.json".to_string(),
+        preset_name: "AV1_MKV".to_string(),
+        target_codec: "av1".to_string(),
     }]);
 
     tokio::time::sleep(Duration::from_millis(1200)).await;

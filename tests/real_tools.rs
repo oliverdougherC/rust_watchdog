@@ -21,13 +21,13 @@ fn run_real_tools_smoke(input_env: &str) {
 
     let preset_file = std::env::var("WATCHDOG_REAL_PRESET_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("AV1_MKV.json"));
+        .unwrap_or_else(|_| PathBuf::from("presets/AV1_MKV.json"));
     let preset_name =
         std::env::var("WATCHDOG_REAL_PRESET_NAME").unwrap_or_else(|_| "AV1_MKV".to_string());
     if !preset_file.exists() {
         return;
     }
-    let contract = PresetContract::resolve(&preset_file, &preset_name, "av1").unwrap();
+    let contract = PresetContract::resolve(&preset_file, &preset_name).unwrap();
 
     let temp_dir = tempfile::tempdir().unwrap();
     let output = temp_dir.path().join(format!(

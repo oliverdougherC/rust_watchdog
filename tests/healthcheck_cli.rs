@@ -65,7 +65,7 @@ local_mount = "/tmp/nonexistent-mount"
 [transcode]
 max_average_bitrate_mbps = 25.0
 target_codec = "av1"
-preset_file = "AV1_MKV.json"
+preset_file = "presets/AV1_MKV.json"
 preset_name = "AV1_MKV"
 timeout_seconds = 100
 max_retries = 1

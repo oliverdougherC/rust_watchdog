@@ -100,6 +100,9 @@ pub struct QueueRecord {
     pub source_path: String,
     pub share_name: String,
     pub enqueue_source: String,
+    pub preset_file: Option<String>,
+    pub preset_name: Option<String>,
+    pub target_codec: Option<String>,
     pub order_key: i64,
     pub queued_at: String,
     pub started_at: Option<String>,
@@ -110,6 +113,9 @@ pub struct NewQueueItem {
     pub source_path: String,
     pub share_name: String,
     pub enqueue_source: String,
+    pub preset_file: String,
+    pub preset_name: String,
+    pub target_codec: String,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +275,9 @@ impl WatchdogDb {
                 source_path TEXT NOT NULL UNIQUE,
                 share_name TEXT NOT NULL,
                 enqueue_source TEXT NOT NULL,
+                preset_file TEXT,
+                preset_name TEXT,
+                target_codec TEXT,
                 order_key INTEGER NOT NULL,
                 queued_at TEXT NOT NULL,
                 started_at TEXT
@@ -348,6 +357,33 @@ impl WatchdogDb {
                 "ALTER TABLE service_state ADD COLUMN worker_run_mode TEXT",
                 [],
             )?;
+        }
+
+        let queue_preset_file_col_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('queue_items') WHERE name = 'preset_file'",
+            [],
+            |row| row.get(0),
+        )?;
+        if queue_preset_file_col_exists == 0 {
+            conn.execute("ALTER TABLE queue_items ADD COLUMN preset_file TEXT", [])?;
+        }
+
+        let queue_preset_name_col_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('queue_items') WHERE name = 'preset_name'",
+            [],
+            |row| row.get(0),
+        )?;
+        if queue_preset_name_col_exists == 0 {
+            conn.execute("ALTER TABLE queue_items ADD COLUMN preset_name TEXT", [])?;
+        }
+
+        let queue_target_codec_col_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('queue_items') WHERE name = 'target_codec'",
+            [],
+            |row| row.get(0),
+        )?;
+        if queue_target_codec_col_exists == 0 {
+            conn.execute("ALTER TABLE queue_items ADD COLUMN target_codec TEXT", [])?;
         }
 
         conn.execute(
@@ -891,14 +927,17 @@ impl WatchdogDb {
         for item in items {
             match tx.execute(
                 "INSERT OR IGNORE INTO queue_items
-                 (source_path, share_name, enqueue_source, order_key, queued_at, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                 (source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, order_key, queued_at, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
                 params![
                     item.source_path,
                     item.share_name,
                     item.enqueue_source,
+                    item.preset_file,
+                    item.preset_name,
+                    item.target_codec,
                     next_order_key,
-                    now
+                    now,
                 ],
             ) {
                 Ok(rows) => {
@@ -922,7 +961,7 @@ impl WatchdogDb {
     pub fn list_queue_items(&self, limit: u32) -> Vec<QueueRecord> {
         let conn = self.lock();
         let mut stmt = match conn.prepare(
-            "SELECT id, source_path, share_name, enqueue_source, order_key, queued_at, started_at
+            "SELECT id, source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, order_key, queued_at, started_at
              FROM queue_items
              ORDER BY CASE WHEN started_at IS NOT NULL THEN 0 ELSE 1 END,
                       order_key ASC
@@ -941,9 +980,12 @@ impl WatchdogDb {
                 source_path: row.get(1)?,
                 share_name: row.get(2)?,
                 enqueue_source: row.get(3)?,
-                order_key: row.get(4)?,
-                queued_at: row.get(5)?,
-                started_at: row.get(6)?,
+                preset_file: row.get(4)?,
+                preset_name: row.get(5)?,
+                target_codec: row.get(6)?,
+                order_key: row.get(7)?,
+                queued_at: row.get(8)?,
+                started_at: row.get(9)?,
             })
         }) {
             Ok(rows) => rows,
@@ -961,7 +1003,7 @@ impl WatchdogDb {
         let tx = conn.transaction().ok()?;
         let next = tx
             .query_row(
-                "SELECT id, source_path, share_name, enqueue_source, order_key, queued_at, started_at
+                "SELECT id, source_path, share_name, enqueue_source, preset_file, preset_name, target_codec, order_key, queued_at, started_at
                  FROM queue_items
                  WHERE started_at IS NULL
                  ORDER BY order_key ASC
@@ -973,9 +1015,12 @@ impl WatchdogDb {
                         source_path: row.get(1)?,
                         share_name: row.get(2)?,
                         enqueue_source: row.get(3)?,
-                        order_key: row.get(4)?,
-                        queued_at: row.get(5)?,
-                        started_at: row.get(6)?,
+                        preset_file: row.get(4)?,
+                        preset_name: row.get(5)?,
+                        target_codec: row.get(6)?,
+                        order_key: row.get(7)?,
+                        queued_at: row.get(8)?,
+                        started_at: row.get(9)?,
                     })
                 },
             )
@@ -1045,6 +1090,27 @@ impl WatchdogDb {
         ) {
             error!("DB error in remove_queue_item('{}'): {}", source_path, e);
         }
+    }
+
+    pub fn remove_pending_queue_item(&self, source_path: &str) -> bool {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM queue_items WHERE source_path = ?1 AND started_at IS NULL",
+            params![source_path],
+        )
+        .map(|rows| rows > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn queue_item_exists(&self, source_path: &str) -> bool {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM queue_items WHERE source_path = ?1",
+            params![source_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false)
     }
 
     pub fn clear_queue_items(&self) -> usize {
@@ -1923,16 +1989,25 @@ mod tests {
                 source_path: "/mnt/movies/A.mkv".to_string(),
                 share_name: "movies".to_string(),
                 enqueue_source: "scan".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
             },
             NewQueueItem {
                 source_path: "/mnt/movies/B.mkv".to_string(),
                 share_name: "movies".to_string(),
                 enqueue_source: "manual".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
             },
             NewQueueItem {
                 source_path: "/mnt/movies/A.mkv".to_string(),
                 share_name: "movies".to_string(),
                 enqueue_source: "manual".to_string(),
+                preset_file: "presets/H264.json".to_string(),
+                preset_name: "H264".to_string(),
+                target_codec: "h264".to_string(),
             },
         ]);
         assert_eq!(inserted, 2);
@@ -1941,6 +2016,12 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].source_path, "/mnt/movies/A.mkv");
         assert_eq!(queue[0].order_key, 1);
+        assert_eq!(
+            queue[0].preset_file.as_deref(),
+            Some("presets/AV1_MKV.json")
+        );
+        assert_eq!(queue[0].preset_name.as_deref(), Some("AV1_MKV"));
+        assert_eq!(queue[0].target_codec.as_deref(), Some("av1"));
         assert_eq!(queue[1].source_path, "/mnt/movies/B.mkv");
         assert_eq!(queue[1].order_key, 2);
         assert_eq!(queue[1].enqueue_source, "manual");
@@ -1953,6 +2034,9 @@ mod tests {
             source_path: "/mnt/movies/A.mkv".to_string(),
             share_name: "movies".to_string(),
             enqueue_source: "scan".to_string(),
+            preset_file: "presets/AV1_MKV.json".to_string(),
+            preset_name: "AV1_MKV".to_string(),
+            target_codec: "av1".to_string(),
         }]);
         db.mark_queue_item_started("/mnt/movies/A.mkv");
         assert!(db.list_queue_items(1)[0].started_at.is_some());
@@ -1969,16 +2053,51 @@ mod tests {
                 source_path: "/mnt/movies/A.mkv".to_string(),
                 share_name: "movies".to_string(),
                 enqueue_source: "scan".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
             },
             NewQueueItem {
                 source_path: "/mnt/movies/B.mkv".to_string(),
                 share_name: "movies".to_string(),
                 enqueue_source: "manual".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
             },
         ]);
 
         assert_eq!(db.get_queue_count(), 2);
         assert_eq!(db.clear_queue_items(), 2);
         assert_eq!(db.get_queue_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_pending_queue_item_leaves_active_rows() {
+        let db = WatchdogDb::open_in_memory().unwrap();
+        db.enqueue_queue_items(&[
+            NewQueueItem {
+                source_path: "/mnt/movies/A.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
+            },
+            NewQueueItem {
+                source_path: "/mnt/movies/B.mkv".to_string(),
+                share_name: "movies".to_string(),
+                enqueue_source: "manual".to_string(),
+                preset_file: "presets/AV1_MKV.json".to_string(),
+                preset_name: "AV1_MKV".to_string(),
+                target_codec: "av1".to_string(),
+            },
+        ]);
+        db.mark_queue_item_started("/mnt/movies/B.mkv");
+
+        assert!(db.remove_pending_queue_item("/mnt/movies/A.mkv"));
+        assert!(!db.remove_pending_queue_item("/mnt/movies/B.mkv"));
+        assert!(db.queue_item_exists("/mnt/movies/B.mkv"));
+        assert!(!db.queue_item_exists("/mnt/movies/A.mkv"));
     }
 }

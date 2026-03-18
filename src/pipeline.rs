@@ -8,7 +8,7 @@ use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval, Ver
 use crate::state::{PipelinePhase, ProgressStage, RunMode, StateManager};
 use crate::stats::RunStats;
 use crate::traits::*;
-use crate::transcode::PresetContract;
+use crate::transcode::{PresetContract, PresetSnapshot};
 use crate::transfer::{
     safe_replace, SafeReplaceOutcome, SafeReplacePlan, SourceFingerprint, WATCHDOG_OLD_SUFFIX,
     WATCHDOG_TMP_SUFFIX,
@@ -18,7 +18,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -116,12 +116,18 @@ struct GlobMatcher {
     basename_set: Option<GlobSet>,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedTranscodeItem {
+    entry: FileEntry,
+    eval: TranscodeEval,
+    preset: PresetSnapshot,
+}
+
 #[derive(Debug)]
 struct QueueCandidate {
     size: u64,
     seq: u64,
-    entry: FileEntry,
-    eval: TranscodeEval,
+    item: QueuedTranscodeItem,
 }
 
 impl PartialEq for QueueCandidate {
@@ -152,6 +158,45 @@ fn stable_path_hash(path: &Path) -> u64 {
         hash = hash.wrapping_mul(0x0000_0001_0000_01b3);
     }
     hash
+}
+
+fn configured_default_preset(config: &Config, base_dir: &Path) -> PresetSnapshot {
+    PresetSnapshot::normalized(
+        base_dir,
+        &config.transcode.preset_file,
+        &config.transcode.preset_name,
+        &config.transcode.target_codec,
+    )
+}
+
+fn effective_queue_preset(
+    record: &QueueRecord,
+    default_preset: &PresetSnapshot,
+    base_dir: &Path,
+) -> PresetSnapshot {
+    PresetSnapshot::normalized(
+        base_dir,
+        record
+            .preset_file
+            .as_deref()
+            .unwrap_or(&default_preset.preset_file),
+        record
+            .preset_name
+            .as_deref()
+            .unwrap_or(&default_preset.preset_name),
+        record
+            .target_codec
+            .as_deref()
+            .unwrap_or(&default_preset.target_codec),
+    )
+}
+
+fn preset_contract_cache_key(preset: &PresetSnapshot) -> (String, String, String) {
+    (
+        preset.preset_file.clone(),
+        preset.preset_name.clone(),
+        preset.target_codec.clone(),
+    )
 }
 
 fn build_local_temp_paths(
@@ -247,11 +292,12 @@ fn finalize_runtime_state(state: &StateManager, db: &Arc<WatchdogDb>) {
 
 fn queue_row_to_candidate(
     config: &Config,
+    base_dir: &Path,
     deps: &PipelineDeps,
     db: &Arc<WatchdogDb>,
     state: &StateManager,
     record: &QueueRecord,
-) -> Option<(FileEntry, TranscodeEval)> {
+) -> Option<QueuedTranscodeItem> {
     let path = PathBuf::from(&record.source_path);
     if !deps.fs.exists(&path) {
         tui_log(
@@ -315,7 +361,14 @@ fn queue_row_to_candidate(
             return None;
         }
     };
-    let mut eval = evaluate_transcode_need(&probe, &config.transcode);
+    let preset = effective_queue_preset(
+        record,
+        &configured_default_preset(config, base_dir),
+        base_dir,
+    );
+    let mut eval_config = config.transcode.clone();
+    eval_config.target_codec = preset.target_codec.clone();
+    let mut eval = evaluate_transcode_need(&probe, &eval_config);
     if !eval.needs_transcode {
         if record.enqueue_source == "manual" {
             eval.needs_transcode = true;
@@ -343,35 +396,38 @@ fn queue_row_to_candidate(
         }
     }
 
-    Some((
-        FileEntry {
+    Some(QueuedTranscodeItem {
+        entry: FileEntry {
             path,
             size,
             mtime,
             share_name: record.share_name.clone(),
         },
         eval,
-    ))
+        preset,
+    })
 }
 
 fn load_queue_candidates(
     config: &Config,
+    base_dir: &Path,
     deps: &PipelineDeps,
     db: &Arc<WatchdogDb>,
     state: &StateManager,
-) -> Vec<(FileEntry, TranscodeEval)> {
+) -> Vec<QueuedTranscodeItem> {
     db.list_queue_items(10_000)
         .into_iter()
-        .filter_map(|record| queue_row_to_candidate(config, deps, db, state, &record))
+        .filter_map(|record| queue_row_to_candidate(config, base_dir, deps, db, state, &record))
         .collect()
 }
 
 fn append_new_db_queue_items(
     config: &Config,
+    base_dir: &Path,
     deps: &PipelineDeps,
     db: &Arc<WatchdogDb>,
     state: &StateManager,
-    transcode_queue: &mut Vec<(FileEntry, TranscodeEval)>,
+    transcode_queue: &mut Vec<QueuedTranscodeItem>,
     outstanding_paths: &HashSet<PathBuf>,
 ) -> usize {
     let mut appended = 0usize;
@@ -380,7 +436,8 @@ fn append_new_db_queue_items(
         if outstanding_paths.contains(&path) {
             continue;
         }
-        if let Some(candidate) = queue_row_to_candidate(config, deps, db, state, &record) {
+        if let Some(candidate) = queue_row_to_candidate(config, base_dir, deps, db, state, &record)
+        {
             transcode_queue.push(candidate);
             appended += 1;
         }
@@ -390,15 +447,18 @@ fn append_new_db_queue_items(
 
 fn enqueue_queue_candidates(
     db: &Arc<WatchdogDb>,
-    transcode_queue: &[(FileEntry, TranscodeEval)],
+    transcode_queue: &[QueuedTranscodeItem],
     enqueue_source: &str,
 ) -> usize {
     let items = transcode_queue
         .iter()
-        .map(|(entry, _)| NewQueueItem {
-            source_path: entry.path.to_string_lossy().to_string(),
-            share_name: entry.share_name.clone(),
+        .map(|item| NewQueueItem {
+            source_path: item.entry.path.to_string_lossy().to_string(),
+            share_name: item.entry.share_name.clone(),
             enqueue_source: enqueue_source.to_string(),
+            preset_file: item.preset.preset_file.clone(),
+            preset_name: item.preset.preset_name.clone(),
+            target_codec: item.preset.target_codec.clone(),
         })
         .collect::<Vec<_>>();
     db.enqueue_queue_items(&items)
@@ -513,7 +573,7 @@ async fn run_queued_pass(
     }
 
     verify_mounts_and_update_state(config, deps, state, dry_run)?;
-    let transcode_queue = load_queue_candidates(config, deps, db, state);
+    let transcode_queue = load_queue_candidates(config, base_dir, deps, db, state);
     if transcode_queue.is_empty() {
         tui_log(state, "INFO", "Durable queue is empty after refresh");
         finalize_runtime_state(state, db);
@@ -709,7 +769,8 @@ pub async fn run_watchdog_pass(
     };
 
     // Filter out already-inspected files and build transcode queue
-    let mut transcode_queue: Vec<(FileEntry, TranscodeEval)> = Vec::new();
+    let default_preset = configured_default_preset(config, base_dir);
+    let mut transcode_queue: Vec<QueuedTranscodeItem> = Vec::new();
     let mut capped_queue: Option<BinaryHeap<Reverse<QueueCandidate>>> =
         queue_cap.map(|_| BinaryHeap::new());
     let mut queue_seq: u64 = 0;
@@ -830,6 +891,7 @@ pub async fn run_watchdog_pass(
                     &mut total_transcode_candidates,
                     &mut pending_inspected,
                     queue_cap,
+                    &default_preset,
                 )?;
             }
         }
@@ -850,6 +912,7 @@ pub async fn run_watchdog_pass(
             &mut total_transcode_candidates,
             &mut pending_inspected,
             queue_cap,
+            &default_preset,
         )?;
     }
 
@@ -903,7 +966,7 @@ pub async fn run_watchdog_pass(
     if let Some(heap) = capped_queue.take() {
         transcode_queue = heap
             .into_iter()
-            .map(|Reverse(candidate)| (candidate.entry, candidate.eval))
+            .map(|Reverse(candidate)| candidate.item)
             .collect();
     }
 
@@ -912,7 +975,7 @@ pub async fn run_watchdog_pass(
     }
 
     // Sort queue: largest files first
-    transcode_queue.sort_by(|a, b| b.0.size.cmp(&a.0.size));
+    transcode_queue.sort_by(|a, b| b.entry.size.cmp(&a.entry.size));
     stats.files_queued = transcode_queue.len() as u64;
 
     if queue_cap.is_some() && total_transcode_candidates > transcode_queue.len() as u64 {
@@ -946,16 +1009,17 @@ pub async fn run_watchdog_pass(
     // Dry-run: just report the queue
     if dry_run {
         info!("=== DRY RUN MODE ===");
-        for (idx, (entry, eval)) in transcode_queue.iter().enumerate() {
+        for (idx, item) in transcode_queue.iter().enumerate() {
             info!(
-                "[DRY-RUN {}/{}] {} | share={} codec={} bitrate={:.2} Mbps size={}",
+                "[DRY-RUN {}/{}] {} | share={} codec={} bitrate={:.2} Mbps size={} preset={}",
                 idx + 1,
                 transcode_queue.len(),
-                entry.path.display(),
-                entry.share_name,
-                eval.video_codec.as_deref().unwrap_or("unknown"),
-                eval.bitrate_mbps,
-                format_bytes(entry.size)
+                item.entry.path.display(),
+                item.entry.share_name,
+                item.eval.video_codec.as_deref().unwrap_or("unknown"),
+                item.eval.bitrate_mbps,
+                format_bytes(item.entry.size),
+                item.preset.short_label(),
             );
         }
         return Ok(stats);
@@ -1010,28 +1074,23 @@ async fn process_transcode_queue(
     deps: &PipelineDeps,
     db: &Arc<WatchdogDb>,
     state: &StateManager,
-    mut transcode_queue: Vec<(FileEntry, TranscodeEval)>,
+    mut transcode_queue: Vec<QueuedTranscodeItem>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<RunStats> {
     let mut stats = RunStats {
         files_queued: transcode_queue.len() as u64,
         ..RunStats::default()
     };
-    let mut attempt_counts: std::collections::HashMap<PathBuf, u32> =
-        std::collections::HashMap::new();
+    let mut attempt_counts: HashMap<PathBuf, u32> = HashMap::new();
+    let mut preset_contract_cache: HashMap<(String, String, String), PresetContract> =
+        HashMap::new();
     let mut outstanding_paths = transcode_queue
         .iter()
-        .map(|(entry, _)| entry.path.clone())
+        .map(|item| item.entry.path.clone())
         .collect::<HashSet<_>>();
     let mut processed = 0u32;
     let mut idx = 0usize;
 
-    let preset_path = config.resolve_path(base_dir, &config.transcode.preset_file);
-    let preset_contract = PresetContract::resolve(
-        &preset_path,
-        &config.transcode.preset_name,
-        &config.transcode.target_codec,
-    )?;
     let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
     deps.fs.create_dir_all(&temp_dir)?;
     let pause_path = config.resolve_path(base_dir, &config.safety.pause_file);
@@ -1041,6 +1100,7 @@ async fn process_transcode_queue(
         let previous_len = transcode_queue.len();
         let appended = append_new_db_queue_items(
             config,
+            base_dir,
             deps,
             db,
             state,
@@ -1049,8 +1109,8 @@ async fn process_transcode_queue(
         );
         if appended > 0 {
             stats.files_queued += appended as u64;
-            for (entry, _) in &transcode_queue[previous_len..] {
-                outstanding_paths.insert(entry.path.clone());
+            for item in &transcode_queue[previous_len..] {
+                outstanding_paths.insert(item.entry.path.clone());
             }
         }
 
@@ -1064,14 +1124,20 @@ async fn process_transcode_queue(
             return Err(WatchdogError::Paused);
         }
 
-        let (entry, eval) = &transcode_queue[idx];
+        let item = transcode_queue[idx].clone();
         idx += 1;
 
+        let entry = &item.entry;
+        let eval = &item.eval;
+        let preset = &item.preset;
         let path = &entry.path;
         let share_name = &entry.share_name;
         let path_str = path.to_string_lossy().to_string();
+        if !db.queue_item_exists(&path_str) {
+            outstanding_paths.remove(path);
+            continue;
+        }
         db.mark_queue_item_started(&path_str);
-        let final_path = preset_contract.output_path_for(path);
         let attempt_num = {
             let count = attempt_counts.entry(path.clone()).or_insert(0);
             *count += 1;
@@ -1115,6 +1181,41 @@ async fn process_transcode_queue(
                 return Err(WatchdogError::Database(e));
             }
         };
+        let preset_path = preset.resolve_path(base_dir);
+        let cache_key = preset_contract_cache_key(preset);
+        let preset_contract = if let Some(contract) = preset_contract_cache.get(&cache_key) {
+            contract.clone()
+        } else {
+            match PresetContract::resolve(&preset_path, &preset.preset_name).and_then(|contract| {
+                contract.ensure_target_codec(&preset.target_codec)?;
+                Ok(contract)
+            }) {
+                Ok(contract) => {
+                    preset_contract_cache.insert(cache_key, contract.clone());
+                    contract
+                }
+                Err(err) => {
+                    stats.transcode_failures += 1;
+                    state.update(|s| s.run_failures += 1);
+                    record_failure(
+                        state,
+                        db.as_ref(),
+                        config,
+                        base_dir,
+                        &path_str,
+                        db_row_id,
+                        transcode_start.elapsed().as_secs_f64(),
+                        FailureCode::TranscodeError,
+                        &format!("preset_config_error: {}", err),
+                        true,
+                    );
+                    db.remove_queue_item(&path_str);
+                    outstanding_paths.remove(path);
+                    continue;
+                }
+            }
+        };
+        let final_path = preset_contract.output_path_for(path);
 
         if check_file_in_use_best_effort(
             config,
@@ -1244,7 +1345,7 @@ async fn process_transcode_queue(
                         Some(failure_code.as_str()),
                     );
                     db.requeue_queue_item(&path_str);
-                    transcode_queue.push((entry.clone(), eval.clone()));
+                    transcode_queue.push(item.clone());
                 } else {
                     stats.transcode_failures += 1;
                     state.update(|s| s.run_failures += 1);
@@ -1326,7 +1427,7 @@ async fn process_transcode_queue(
                     &local_source,
                     &local_output,
                     &preset_path,
-                    &config.transcode.preset_name,
+                    &preset.preset_name,
                     effective_timeout_secs,
                     effective_stall_timeout_secs,
                     progress_tx,
@@ -1373,7 +1474,7 @@ async fn process_transcode_queue(
                         s.total_retries_scheduled += 1;
                     });
                     db.requeue_queue_item(&path_str);
-                    transcode_queue.push((entry.clone(), eval.clone()));
+                    transcode_queue.push(item.clone());
                 } else {
                     let failure_code = if is_timeout {
                         FailureCode::TimeoutExhausted
@@ -1797,12 +1898,13 @@ fn process_probe_batch(
     shutdown_rx: &mut broadcast::Receiver<()>,
     worker_count: usize,
     stats: &mut RunStats,
-    transcode_queue: &mut Vec<(FileEntry, TranscodeEval)>,
+    transcode_queue: &mut Vec<QueuedTranscodeItem>,
     capped_queue: &mut Option<BinaryHeap<Reverse<QueueCandidate>>>,
     queue_seq: &mut u64,
     total_transcode_candidates: &mut u64,
     pending_inspected: &mut Vec<(String, u64, f64)>,
     queue_cap: Option<usize>,
+    default_preset: &PresetSnapshot,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -1835,12 +1937,16 @@ fn process_probe_batch(
                 if eval.needs_transcode {
                     info!("QUEUE: {} (reasons: {})", path_str, eval.reasons.join(", "));
                     *total_transcode_candidates += 1;
+                    let queued_item = QueuedTranscodeItem {
+                        entry,
+                        eval,
+                        preset: default_preset.clone(),
+                    };
                     if let Some(cap) = queue_cap {
                         let candidate = QueueCandidate {
-                            size: entry.size,
+                            size: queued_item.entry.size,
                             seq: *queue_seq,
-                            entry,
-                            eval,
+                            item: queued_item,
                         };
                         *queue_seq = queue_seq.saturating_add(1);
                         let heap = capped_queue
@@ -1855,7 +1961,7 @@ fn process_probe_batch(
                             }
                         }
                     } else {
-                        transcode_queue.push((entry, eval));
+                        transcode_queue.push(queued_item);
                     }
                 } else {
                     let bitrate_text = if eval.bitrate_mbps > 0.0 {
@@ -3465,5 +3571,18 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<()>(1);
         drop(tx);
         assert!(shutdown_requested(&mut rx));
+    }
+
+    #[test]
+    fn preset_contract_cache_key_distinguishes_target_codec_snapshots() {
+        let av1 =
+            PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "av1");
+        let h264 =
+            PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "h264");
+
+        assert_ne!(
+            preset_contract_cache_key(&av1),
+            preset_contract_cache_key(&h264)
+        );
     }
 }

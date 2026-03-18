@@ -25,7 +25,7 @@ use watchdog::simulate::create_simulated_deps;
 use watchdog::state::{RunMode, StateManager};
 use watchdog::status_snapshot::{resolve_status_snapshot_path, run_status_snapshot_task};
 use watchdog::traits::MountManager;
-use watchdog::transcode::{HandBrakeTranscoder, PresetContract};
+use watchdog::transcode::{resolve_preset_path, HandBrakeTranscoder, PresetContract};
 use watchdog::transfer::RsyncTransfer;
 use watchdog::{tui, util};
 
@@ -413,12 +413,9 @@ async fn run() -> anyhow::Result<()> {
         && !cli.quarantine_clear_all
         && !cli.doctor;
     if needs_preset_contract {
-        let preset_path = config.resolve_path(&base_dir, &config.transcode.preset_file);
-        let preset_contract = PresetContract::resolve(
-            &preset_path,
-            &config.transcode.preset_name,
-            &config.transcode.target_codec,
-        )?;
+        let preset_path = resolve_preset_path(&base_dir, &config.transcode.preset_file);
+        let preset_contract = PresetContract::resolve(&preset_path, &config.transcode.preset_name)?;
+        preset_contract.ensure_target_codec(&config.transcode.target_codec)?;
         info!(
             "Resolved preset contract: codec={} container=.{} preset={} file={}",
             preset_contract.target_codec,
@@ -878,7 +875,7 @@ async fn run() -> anyhow::Result<()> {
                     anyhow::bail!(
                         "A {} worker is already running. Reattach with `{}` or stop it before starting {} mode.",
                         active_run_mode,
-                        build_attach_hint(&cli, &base_dir, active_run_mode),
+                        build_attach_hint(&cli, active_run_mode),
                         requested_run_mode
                     );
                 }
@@ -889,9 +886,10 @@ async fn run() -> anyhow::Result<()> {
             requested_run_mode
         };
 
-        let attach_hint = build_attach_hint(&cli, &base_dir, attach_run_mode);
+        let attach_hint = build_attach_hint(&cli, attach_run_mode);
         if let Err(e) = tui::run_tui(
             config,
+            base_dir.clone(),
             db.clone(),
             runtime_paths.status_snapshot.clone(),
             runtime_paths.event_journal.clone(),
@@ -932,7 +930,7 @@ fn seed_state_from_db(state: &StateManager, db: &WatchdogDb, simulate: bool) {
     });
 }
 
-fn build_attach_hint(cli: &Cli, base_dir: &Path, run_mode: RunMode) -> String {
+fn build_attach_hint(cli: &Cli, run_mode: RunMode) -> String {
     let mut parts = vec!["watchdog".to_string(), "--attach".to_string()];
     if matches!(run_mode, RunMode::Precision) {
         parts.push("--precision".to_string());
@@ -940,14 +938,27 @@ fn build_attach_hint(cli: &Cli, base_dir: &Path, run_mode: RunMode) -> String {
     if cli.simulate {
         parts.push("--simulate".to_string());
     } else {
-        let config_path = cli
-            .config
-            .canonicalize()
-            .unwrap_or_else(|_| base_dir.join(&cli.config));
         parts.push("--config".to_string());
-        parts.push(shell_quote(&config_path.to_string_lossy()));
+        parts.push(shell_quote(&display_attach_config_path(cli)));
     }
     parts.join(" ")
+}
+
+fn display_attach_config_path(cli: &Cli) -> String {
+    if !cli.config.is_absolute() {
+        return cli.config.to_string_lossy().to_string();
+    }
+
+    let canonical = cli
+        .config
+        .canonicalize()
+        .unwrap_or_else(|_| cli.config.clone());
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(relative) = canonical.strip_prefix(&cwd) {
+            return relative.to_string_lossy().to_string();
+        }
+    }
+    canonical.to_string_lossy().to_string()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -958,6 +969,54 @@ fn shell_quote(value: &str) -> String {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli_with_config(config: PathBuf) -> Cli {
+        Cli {
+            simulate: false,
+            dry_run: false,
+            once: false,
+            headless: false,
+            precision: false,
+            attach: false,
+            config,
+            log_level: None,
+            healthcheck: false,
+            healthcheck_json: false,
+            pause: false,
+            resume: false,
+            doctor: false,
+            status: false,
+            status_json: false,
+            quarantine_list: false,
+            quarantine_clear: None,
+            quarantine_clear_all: false,
+            clear_scan_cache: false,
+        }
+    }
+
+    #[test]
+    fn display_attach_config_path_keeps_relative_paths() {
+        let cli = cli_with_config(PathBuf::from("configs/watchdog.toml"));
+        assert_eq!(display_attach_config_path(&cli), "configs/watchdog.toml");
+    }
+
+    #[test]
+    fn display_attach_config_path_keeps_absolute_paths_outside_cwd_absolute() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("watchdog.toml");
+        std::fs::write(&config_path, b"").unwrap();
+        let cli = cli_with_config(config_path.clone());
+
+        assert_eq!(
+            display_attach_config_path(&cli),
+            config_path.canonicalize().unwrap().to_string_lossy()
+        );
     }
 }
 

@@ -6,6 +6,7 @@ use crate::process::{
 use crate::traits::{TranscodeProgress, TranscodeResult, Transcoder};
 use regex::Regex;
 use serde_json::Value;
+use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,6 +55,84 @@ static HB_JSON_SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresetSnapshot {
+    pub preset_file: String,
+    pub preset_name: String,
+    pub target_codec: String,
+}
+
+impl PresetSnapshot {
+    pub fn normalized(
+        base_dir: &Path,
+        preset_file: &str,
+        preset_name: &str,
+        target_codec: &str,
+    ) -> Self {
+        Self {
+            preset_file: path_for_storage(base_dir, &resolve_preset_path(base_dir, preset_file)),
+            preset_name: preset_name.to_string(),
+            target_codec: target_codec.trim().to_ascii_lowercase(),
+        }
+    }
+
+    pub fn resolve_path(&self, base_dir: &Path) -> PathBuf {
+        resolve_preset_path(base_dir, &self.preset_file)
+    }
+
+    pub fn short_label(&self) -> String {
+        let file_name = Path::new(&self.preset_file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&self.preset_file);
+        format!("{} :: {}", file_name, self.preset_name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresetCatalogEntry {
+    pub preset_file: String,
+    pub preset_name: String,
+    pub selectable: bool,
+    pub target_codec: Option<String>,
+    pub encoder: String,
+    pub quality_summary: String,
+    pub speed_preset: String,
+    pub subtitle_summary: String,
+    pub audio_summary: String,
+    pub error_summary: Option<String>,
+}
+
+impl PresetCatalogEntry {
+    pub fn label(&self) -> String {
+        let file_name = Path::new(&self.preset_file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&self.preset_file);
+        format!("{} :: {}", file_name, self.preset_name)
+    }
+
+    pub fn snapshot(&self) -> Option<PresetSnapshot> {
+        Some(PresetSnapshot {
+            preset_file: self.preset_file.clone(),
+            preset_name: self.preset_name.clone(),
+            target_codec: self.target_codec.clone()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresetMetadata {
+    target_codec: String,
+    container_extension: String,
+    accepted_format_names: Vec<String>,
+    encoder: String,
+    quality_summary: String,
+    speed_preset: String,
+    subtitle_summary: String,
+    audio_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetContract {
     pub target_codec: String,
     pub container_extension: String,
@@ -61,97 +140,24 @@ pub struct PresetContract {
 }
 
 impl PresetContract {
-    pub fn resolve(
-        preset_file: &Path,
-        preset_name: &str,
-        configured_target_codec: &str,
-    ) -> Result<Self> {
-        let payload_text = std::fs::read_to_string(preset_file).map_err(|e| {
-            WatchdogError::Config(format!(
-                "failed to read preset file {}: {}",
-                preset_file.display(),
-                e
-            ))
-        })?;
-        let payload: Value = serde_json::from_str(&payload_text).map_err(|e| {
-            WatchdogError::Config(format!(
-                "failed to parse preset file {} as JSON: {}",
-                preset_file.display(),
-                e
-            ))
-        })?;
+    pub fn resolve(preset_file: &Path, preset_name: &str) -> Result<Self> {
+        let metadata = load_preset_metadata(preset_file, preset_name)?;
+        Ok(Self {
+            target_codec: metadata.target_codec,
+            container_extension: metadata.container_extension,
+            accepted_format_names: metadata.accepted_format_names,
+        })
+    }
 
-        let preset = payload
-            .get("PresetList")
-            .and_then(Value::as_array)
-            .and_then(|presets| {
-                presets.iter().find(|preset| {
-                    preset.get("PresetName").and_then(Value::as_str) == Some(preset_name)
-                })
-            })
-            .ok_or_else(|| {
-                WatchdogError::Config(format!(
-                    "preset '{}' was not found in {}",
-                    preset_name,
-                    preset_file.display()
-                ))
-            })?;
-
-        let video_encoder = preset
-            .get("VideoEncoder")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                WatchdogError::Config(format!(
-                    "preset '{}' in {} is missing VideoEncoder",
-                    preset_name,
-                    preset_file.display()
-                ))
-            })?;
-        let file_format = preset
-            .get("FileFormat")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                WatchdogError::Config(format!(
-                    "preset '{}' in {} is missing FileFormat",
-                    preset_name,
-                    preset_file.display()
-                ))
-            })?;
-
-        let resolved_codec = map_video_encoder_to_codec(video_encoder).ok_or_else(|| {
-            WatchdogError::Config(format!(
-                "preset '{}' in {} uses unsupported VideoEncoder '{}'",
-                preset_name,
-                preset_file.display(),
-                video_encoder
-            ))
-        })?;
+    pub fn ensure_target_codec(&self, configured_target_codec: &str) -> Result<()> {
         let configured_codec = configured_target_codec.trim().to_ascii_lowercase();
-        if resolved_codec != configured_codec {
+        if self.target_codec != configured_codec {
             return Err(WatchdogError::Config(format!(
-                "preset '{}' outputs codec '{}' but transcode.target_codec is '{}'",
-                preset_name, resolved_codec, configured_codec
+                "preset outputs codec '{}' but transcode.target_codec is '{}'",
+                self.target_codec, configured_codec
             )));
         }
-
-        let (container_extension, accepted_format_names) =
-            map_file_format_to_container(file_format).ok_or_else(|| {
-                WatchdogError::Config(format!(
-                    "preset '{}' in {} uses unsupported FileFormat '{}'",
-                    preset_name,
-                    preset_file.display(),
-                    file_format
-                ))
-            })?;
-
-        Ok(Self {
-            target_codec: resolved_codec.to_string(),
-            container_extension: container_extension.to_string(),
-            accepted_format_names: accepted_format_names
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-        })
+        Ok(())
     }
 
     pub fn output_path_for(&self, source_path: &Path) -> PathBuf {
@@ -178,6 +184,377 @@ impl PresetContract {
                 .iter()
                 .any(|expected| name.eq_ignore_ascii_case(expected))
         })
+    }
+}
+
+pub fn resolve_preset_path(base_dir: &Path, preset_file: &str) -> PathBuf {
+    let configured_path = Path::new(preset_file);
+    let direct_path = if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        base_dir.join(configured_path)
+    };
+
+    let is_bare_filename = !configured_path.is_absolute()
+        && configured_path
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."));
+    if !direct_path.exists() && is_bare_filename {
+        let fallback = base_dir.join("presets").join(
+            configured_path
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new(preset_file)),
+        );
+        if fallback.exists() {
+            return fallback;
+        }
+    }
+
+    direct_path
+}
+
+pub fn load_preset_catalog(base_dir: &Path) -> Vec<PresetCatalogEntry> {
+    let presets_dir = base_dir.join("presets");
+    let mut files = match fs::read_dir(&presets_dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => return Vec::new(),
+    };
+    files.sort();
+
+    let mut catalog = Vec::new();
+    for file_path in files {
+        let stored_path = path_for_storage(base_dir, &file_path);
+        match load_preset_payload(&file_path) {
+            Ok(payload) => {
+                let Some(presets) = payload.get("PresetList").and_then(Value::as_array) else {
+                    catalog.push(invalid_catalog_entry(
+                        &stored_path,
+                        "(invalid file)",
+                        "PresetList is missing or invalid".to_string(),
+                    ));
+                    continue;
+                };
+
+                if presets.is_empty() {
+                    catalog.push(invalid_catalog_entry(
+                        &stored_path,
+                        "(empty file)",
+                        "PresetList is empty".to_string(),
+                    ));
+                    continue;
+                }
+
+                for (idx, preset) in presets.iter().enumerate() {
+                    let preset_name = preset
+                        .get("PresetName")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("(unnamed preset #{})", idx + 1));
+                    match parse_preset_metadata(preset, &file_path, &preset_name) {
+                        Ok(metadata) => catalog.push(PresetCatalogEntry {
+                            preset_file: stored_path.clone(),
+                            preset_name,
+                            selectable: true,
+                            target_codec: Some(metadata.target_codec),
+                            encoder: metadata.encoder,
+                            quality_summary: metadata.quality_summary,
+                            speed_preset: metadata.speed_preset,
+                            subtitle_summary: metadata.subtitle_summary,
+                            audio_summary: metadata.audio_summary,
+                            error_summary: None,
+                        }),
+                        Err(err) => catalog.push(invalid_catalog_entry(
+                            &stored_path,
+                            &preset_name,
+                            config_error_message(&err),
+                        )),
+                    }
+                }
+            }
+            Err(err) => catalog.push(invalid_catalog_entry(
+                &stored_path,
+                "(invalid file)",
+                config_error_message(&err),
+            )),
+        }
+    }
+
+    catalog
+}
+
+fn invalid_catalog_entry(
+    preset_file: &str,
+    preset_name: &str,
+    error_summary: String,
+) -> PresetCatalogEntry {
+    PresetCatalogEntry {
+        preset_file: preset_file.to_string(),
+        preset_name: preset_name.to_string(),
+        selectable: false,
+        target_codec: None,
+        encoder: "-".to_string(),
+        quality_summary: "-".to_string(),
+        speed_preset: "-".to_string(),
+        subtitle_summary: "-".to_string(),
+        audio_summary: "-".to_string(),
+        error_summary: Some(error_summary),
+    }
+}
+
+fn path_for_storage(base_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(base_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn load_preset_payload(preset_file: &Path) -> Result<Value> {
+    let payload_text = fs::read_to_string(preset_file).map_err(|e| {
+        WatchdogError::Config(format!(
+            "failed to read preset file {}: {}",
+            preset_file.display(),
+            e
+        ))
+    })?;
+    serde_json::from_str(&payload_text).map_err(|e| {
+        WatchdogError::Config(format!(
+            "failed to parse preset file {} as JSON: {}",
+            preset_file.display(),
+            e
+        ))
+    })
+}
+
+fn load_preset_metadata(preset_file: &Path, preset_name: &str) -> Result<PresetMetadata> {
+    let payload = load_preset_payload(preset_file)?;
+    let preset = payload
+        .get("PresetList")
+        .and_then(Value::as_array)
+        .and_then(|presets| {
+            presets.iter().find(|preset| {
+                preset.get("PresetName").and_then(Value::as_str) == Some(preset_name)
+            })
+        })
+        .ok_or_else(|| {
+            WatchdogError::Config(format!(
+                "preset '{}' was not found in {}",
+                preset_name,
+                preset_file.display()
+            ))
+        })?;
+    parse_preset_metadata(preset, preset_file, preset_name)
+}
+
+fn parse_preset_metadata(
+    preset: &Value,
+    preset_file: &Path,
+    preset_name: &str,
+) -> Result<PresetMetadata> {
+    let video_encoder = preset
+        .get("VideoEncoder")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WatchdogError::Config(format!(
+                "preset '{}' in {} is missing VideoEncoder",
+                preset_name,
+                preset_file.display()
+            ))
+        })?;
+    let file_format = preset
+        .get("FileFormat")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WatchdogError::Config(format!(
+                "preset '{}' in {} is missing FileFormat",
+                preset_name,
+                preset_file.display()
+            ))
+        })?;
+
+    let resolved_codec = map_video_encoder_to_codec(video_encoder).ok_or_else(|| {
+        WatchdogError::Config(format!(
+            "preset '{}' in {} uses unsupported VideoEncoder '{}'",
+            preset_name,
+            preset_file.display(),
+            video_encoder
+        ))
+    })?;
+    let (container_extension, accepted_format_names) = map_file_format_to_container(file_format)
+        .ok_or_else(|| {
+            WatchdogError::Config(format!(
+                "preset '{}' in {} uses unsupported FileFormat '{}'",
+                preset_name,
+                preset_file.display(),
+                file_format
+            ))
+        })?;
+
+    Ok(PresetMetadata {
+        target_codec: resolved_codec.to_string(),
+        container_extension: container_extension.to_string(),
+        accepted_format_names: accepted_format_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        encoder: video_encoder.to_string(),
+        quality_summary: build_quality_summary(preset),
+        speed_preset: preset
+            .get("VideoPreset")
+            .and_then(Value::as_str)
+            .unwrap_or("auto")
+            .to_string(),
+        subtitle_summary: build_subtitle_summary(preset),
+        audio_summary: build_audio_summary(preset),
+    })
+}
+
+fn build_quality_summary(preset: &Value) -> String {
+    let quality_type = preset
+        .get("VideoQualityType")
+        .and_then(Value::as_i64)
+        .unwrap_or(2);
+    if quality_type == 2 {
+        preset
+            .get("VideoQualitySlider")
+            .and_then(value_as_f64)
+            .map(|value| format!("CQ {}", format_decimal(value)))
+            .unwrap_or_else(|| "CQ auto".to_string())
+    } else {
+        preset
+            .get("VideoAvgBitrate")
+            .and_then(Value::as_i64)
+            .map(|bitrate| format!("ABR {} kbps", bitrate))
+            .unwrap_or_else(|| "ABR auto".to_string())
+    }
+}
+
+fn build_subtitle_summary(preset: &Value) -> String {
+    let behavior = preset
+        .get("SubtitleTrackSelectionBehavior")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let languages = value_as_string_list(preset.get("SubtitleLanguageList"));
+    let burn = preset
+        .get("SubtitleBurnBehavior")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let foreign_search = yes_no(
+        preset
+            .get("SubtitleAddForeignAudioSearch")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let foreign_subtitle = yes_no(
+        preset
+            .get("SubtitleAddForeignAudioSubtitle")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    format!(
+        "{} [{}], burn={}, foreign-search={}, foreign-sub={}",
+        behavior,
+        join_or_any(&languages),
+        burn,
+        foreign_search,
+        foreign_subtitle
+    )
+}
+
+fn build_audio_summary(preset: &Value) -> String {
+    let selection = preset
+        .get("AudioTrackSelectionBehavior")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let fallback = preset
+        .get("AudioEncoderFallback")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let copy_mask = value_as_string_list(preset.get("AudioCopyMask"));
+    let primary = preset
+        .get("AudioList")
+        .and_then(Value::as_array)
+        .and_then(|audio_list| audio_list.first())
+        .map(|track| {
+            let encoder = track
+                .get("AudioEncoder")
+                .and_then(Value::as_str)
+                .unwrap_or("auto");
+            let bitrate = track
+                .get("AudioBitrate")
+                .and_then(Value::as_i64)
+                .map(|bitrate| format!("{} kbps", bitrate))
+                .unwrap_or_else(|| "auto".to_string());
+            let mixdown = track
+                .get("AudioMixdown")
+                .and_then(Value::as_str)
+                .unwrap_or("auto");
+            format!("{}/{}/{}", encoder, bitrate, mixdown)
+        })
+        .unwrap_or_else(|| "auto".to_string());
+    format!(
+        "{} [{}], primary={}, fallback={}",
+        selection,
+        join_or_any(&copy_mask),
+        primary,
+        fallback
+    )
+}
+
+fn value_as_string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|value| value as f64))
+        .or_else(|| value.as_u64().map(|value| value as f64))
+}
+
+fn format_decimal(value: f64) -> String {
+    if (value.fract() - 0.0).abs() < f64::EPSILON {
+        format!("{}", value as i64)
+    } else {
+        format!("{:.1}", value)
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn join_or_any(values: &[String]) -> String {
+    if values.is_empty() {
+        "any".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn config_error_message(err: &WatchdogError) -> String {
+    match err {
+        WatchdogError::Config(message) => message.clone(),
+        _ => err.to_string(),
     }
 }
 
@@ -883,11 +1260,18 @@ fn should_mark_transcode_stalled(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_handbrake_progress_json_block, parse_handbrake_progress_text,
-        should_mark_transcode_stalled, PresetContract,
+        load_preset_catalog, parse_handbrake_progress_json_block, parse_handbrake_progress_text,
+        resolve_preset_path, should_mark_transcode_stalled, PresetContract,
     };
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+
+    fn bundled_preset_file() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("presets")
+            .join("AV1_MKV.json")
+    }
 
     #[test]
     fn parse_progress_line_with_stats() {
@@ -942,11 +1326,50 @@ mod tests {
 
     #[test]
     fn resolve_bundled_preset_contract() {
-        let preset_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("AV1_MKV.json");
-        let contract = PresetContract::resolve(&preset_file, "AV1_MKV", "av1").unwrap();
+        let preset_file = bundled_preset_file();
+        let contract = PresetContract::resolve(&preset_file, "AV1_MKV").unwrap();
         assert_eq!(contract.target_codec, "av1");
         assert_eq!(contract.container_extension, "mkv");
         assert!(contract.container_matches(&["matroska".to_string()]));
+    }
+
+    #[test]
+    fn bundled_preset_target_codec_validation_is_separate() {
+        let contract = PresetContract::resolve(&bundled_preset_file(), "AV1_MKV").unwrap();
+        assert!(contract.ensure_target_codec("av1").is_ok());
+        assert!(contract.ensure_target_codec("h264").is_err());
+    }
+
+    #[test]
+    fn preset_path_falls_back_to_presets_dir_for_legacy_bare_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("presets")).unwrap();
+        fs::copy(
+            bundled_preset_file(),
+            dir.path().join("presets/AV1_MKV.json"),
+        )
+        .unwrap();
+
+        let resolved = resolve_preset_path(dir.path(), "AV1_MKV.json");
+        assert_eq!(resolved, dir.path().join("presets/AV1_MKV.json"));
+    }
+
+    #[test]
+    fn preset_catalog_surfaces_invalid_json_without_hiding_valid_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        let presets_dir = dir.path().join("presets");
+        fs::create_dir_all(&presets_dir).unwrap();
+        fs::copy(bundled_preset_file(), presets_dir.join("valid.json")).unwrap();
+        fs::write(presets_dir.join("broken.json"), b"{not-json").unwrap();
+
+        let catalog = load_preset_catalog(dir.path());
+        assert!(catalog.iter().any(|entry| entry.selectable
+            && entry.preset_file == "presets/valid.json"
+            && entry.preset_name == "AV1_MKV"
+            && entry.target_codec.as_deref() == Some("av1")));
+        assert!(catalog.iter().any(|entry| !entry.selectable
+            && entry.preset_file == "presets/broken.json"
+            && entry.error_summary.is_some()));
     }
 
     #[test]

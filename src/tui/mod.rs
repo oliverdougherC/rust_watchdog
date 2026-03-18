@@ -19,12 +19,17 @@ use crate::selection::{
 use crate::state::{AppState, PipelinePhase, ProgressStage, RunMode};
 use crate::status_snapshot::read_snapshot_file;
 use crate::traits::FileSystem;
-use crate::util::{pid_is_running, wait_for_pid_exit};
+use crate::transcode::{load_preset_catalog, PresetCatalogEntry, PresetSnapshot};
+use crate::util::{copy_to_clipboard, pid_is_running};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEvent, MouseEventKind,
+    },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use ratatui::{
@@ -279,10 +284,84 @@ impl BrowserState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PresetSelectorState {
+    entries: Vec<PresetCatalogEntry>,
+    selected_index: usize,
+    scroll_offset: usize,
+}
+
+impl PresetSelectorState {
+    fn new(base_dir: &Path, current: &PresetSnapshot) -> Self {
+        let entries = load_preset_catalog(base_dir);
+        let selected_index = entries
+            .iter()
+            .position(|entry| entry.snapshot().as_ref() == Some(current))
+            .unwrap_or(0);
+        Self {
+            entries,
+            selected_index,
+            scroll_offset: selected_index,
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.selected_index + 1 < self.entries.len() {
+            self.selected_index += 1;
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+        }
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.selected_index = 0;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        if !self.entries.is_empty() {
+            self.selected_index = self.entries.len() - 1;
+        }
+    }
+
+    fn current_entry(&self) -> Option<&PresetCatalogEntry> {
+        self.entries.get(self.selected_index)
+    }
+
+    fn ensure_visible(&mut self, viewport_rows: usize) {
+        if viewport_rows == 0 {
+            self.scroll_offset = self.selected_index;
+            return;
+        }
+
+        if self.selected_index < self.scroll_offset {
+            self.scroll_offset = self.selected_index;
+        } else {
+            let visible_end = self.scroll_offset.saturating_add(viewport_rows);
+            if self.selected_index >= visible_end {
+                self.scroll_offset = self.selected_index + 1 - viewport_rows;
+            }
+        }
+    }
+
+    fn visible_entries(&self, viewport_rows: usize) -> &[PresetCatalogEntry] {
+        if viewport_rows == 0 || self.entries.is_empty() {
+            return &[];
+        }
+        let start = self.scroll_offset.min(self.entries.len().saturating_sub(1));
+        let end = start.saturating_add(viewport_rows).min(self.entries.len());
+        &self.entries[start..end]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuitChoice {
     Background,
     Kill,
+    Copy,
     Cancel,
 }
 
@@ -290,7 +369,8 @@ impl QuitChoice {
     fn next(self) -> Self {
         match self {
             Self::Background => Self::Kill,
-            Self::Kill => Self::Cancel,
+            Self::Kill => Self::Copy,
+            Self::Copy => Self::Cancel,
             Self::Cancel => Self::Background,
         }
     }
@@ -299,9 +379,16 @@ impl QuitChoice {
         match self {
             Self::Background => Self::Cancel,
             Self::Kill => Self::Background,
-            Self::Cancel => Self::Kill,
+            Self::Copy => Self::Kill,
+            Self::Cancel => Self::Copy,
         }
     }
+}
+
+struct QuitKillState {
+    pid: u32,
+    started_at: Instant,
+    followup_signal_sent: bool,
 }
 
 enum SelectionTaskUpdate {
@@ -321,44 +408,61 @@ struct TuiApp {
     history_state: history_tab::HistoryTabState,
     cooldown_state: cooldown_tab::CooldownTabState,
     queue_state: queue_tab::QueueTabState,
+    base_dir: PathBuf,
     last_db_refresh: Instant,
     last_snapshot_refresh: Instant,
     current_state: AppState,
     browser: Option<BrowserState>,
+    preset_selector: Option<PresetSelectorState>,
     quit_choice: QuitChoice,
     show_quit_modal: bool,
+    quit_kill_state: Option<QuitKillState>,
     worker_pid: Option<u32>,
     auto_opened_browser: bool,
     status_message: Option<String>,
     attach_hint: String,
     selection_task: Option<SelectionTaskState>,
+    default_preset: PresetSnapshot,
+    selected_precision_preset: PresetSnapshot,
 }
 
 impl TuiApp {
-    fn new(attach_hint: String) -> Self {
+    fn new(config: &Config, base_dir: PathBuf, attach_hint: String) -> Self {
+        let default_preset = PresetSnapshot::normalized(
+            &base_dir,
+            &config.transcode.preset_file,
+            &config.transcode.preset_name,
+            &config.transcode.target_codec,
+        );
         Self {
             current_tab: Tab::Dashboard,
             logs_state: logs_tab::LogsTabState::default(),
             history_state: history_tab::HistoryTabState::default(),
             cooldown_state: cooldown_tab::CooldownTabState::default(),
             queue_state: queue_tab::QueueTabState::default(),
+            base_dir,
             last_db_refresh: Instant::now() - Duration::from_secs(10),
             last_snapshot_refresh: Instant::now() - Duration::from_secs(10),
             current_state: AppState::default(),
             browser: None,
+            preset_selector: None,
             quit_choice: QuitChoice::Background,
             show_quit_modal: false,
+            quit_kill_state: None,
             worker_pid: None,
             auto_opened_browser: false,
             status_message: None,
             attach_hint,
             selection_task: None,
+            default_preset: default_preset.clone(),
+            selected_precision_preset: default_preset,
         }
     }
 }
 
 pub async fn run_tui(
     config: Config,
+    base_dir: PathBuf,
     db: Arc<WatchdogDb>,
     snapshot_path: PathBuf,
     event_journal_path: PathBuf,
@@ -367,16 +471,18 @@ pub async fn run_tui(
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        let _ = stdout().execute(DisableMouseCapture);
         let _ = stdout().execute(LeaveAlternateScreen);
         original_hook(info);
     }));
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    stdout().execute(EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = TuiApp::new(attach_hint);
+    let mut app = TuiApp::new(&config, base_dir, attach_hint);
     let tick_rate = Duration::from_millis(100);
 
     let result = run_tui_loop(
@@ -391,6 +497,7 @@ pub async fn run_tui(
     .await;
 
     disable_raw_mode()?;
+    stdout().execute(DisableMouseCapture)?;
     stdout().execute(LeaveAlternateScreen)?;
     result
 }
@@ -407,6 +514,9 @@ async fn run_tui_loop(
     loop {
         refresh_runtime_state(app, db.as_ref(), snapshot_path, event_journal_path);
         poll_selection_task(app, db.as_ref(), event_journal_path);
+        if finalize_requested_kill(app, db.as_ref(), event_journal_path) {
+            return Ok(());
+        }
 
         if app.last_db_refresh.elapsed() > Duration::from_secs(2) {
             app.history_state.refresh(db.as_ref());
@@ -427,13 +537,27 @@ async fn run_tui_loop(
         terminal.draw(|f| draw_ui(f, app))?;
 
         if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if handle_key_event(app, config, db, event_journal_path, key.code)? {
+                        return Ok(());
+                    }
                 }
-                if handle_key_event(app, config, db, event_journal_path, key.code)? {
-                    return Ok(());
+                Event::Mouse(mouse) => {
+                    if handle_mouse_event(
+                        app,
+                        db,
+                        event_journal_path,
+                        mouse,
+                        terminal.size()?.into(),
+                    )? {
+                        return Ok(());
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -807,6 +931,7 @@ fn start_manual_selection_task(
     let (tx, rx) = mpsc::channel();
     let config = config.clone();
     let db = db.clone();
+    let preset = app.selected_precision_preset.clone();
     let initial_progress = ManualSelectionProgress {
         phase: ManualSelectionPhase::Discovering,
         selected_roots: selected.len(),
@@ -826,6 +951,7 @@ fn start_manual_selection_task(
             &FfprobeProber,
             db.as_ref(),
             &selected,
+            &preset,
             |progress| {
                 let _ = tx_progress.send(SelectionTaskUpdate::Progress(progress));
             },
@@ -840,6 +966,24 @@ fn start_manual_selection_task(
     });
 }
 
+fn open_preset_selector(app: &mut TuiApp) {
+    if !matches!(app.current_state.run_mode, RunMode::Precision) {
+        app.status_message =
+            Some("Codec selector is only available in precision mode.".to_string());
+        return;
+    }
+
+    let selector = PresetSelectorState::new(&app.base_dir, &app.selected_precision_preset);
+    if selector.entries.is_empty() {
+        app.status_message = Some(format!(
+            "No preset files found in {}",
+            app.base_dir.join("presets").display()
+        ));
+    } else {
+        app.preset_selector = Some(selector);
+    }
+}
+
 fn handle_key_event(
     app: &mut TuiApp,
     config: &Config,
@@ -849,6 +993,10 @@ fn handle_key_event(
 ) -> anyhow::Result<bool> {
     if app.show_quit_modal {
         return handle_quit_modal_key(app, db.as_ref(), event_journal_path, code);
+    }
+
+    if app.preset_selector.is_some() {
+        return handle_preset_selector_key(app, code);
     }
 
     if app.browser.is_some() {
@@ -881,6 +1029,42 @@ fn handle_key_event(
                 app.status_message = Some("Manual selection is already scanning.".to_string());
             } else {
                 app.browser = Some(BrowserState::new(config));
+            }
+        }
+        KeyCode::Char('c') => open_preset_selector(app),
+        KeyCode::Char('d') => {
+            if matches!(app.current_tab, Tab::Queue) {
+                if !matches!(app.current_state.run_mode, RunMode::Precision) {
+                    app.status_message = Some(
+                        "Deleting queue rows is only available in precision mode.".to_string(),
+                    );
+                } else if let Some(idx) = app.queue_state.table_state.selected() {
+                    if let Some(record) = app.queue_state.records.get(idx) {
+                        let source_path = record.source_path.clone();
+                        let started = record.started_at.is_some();
+                        if started {
+                            app.status_message = Some(
+                                "Active transcodes cannot be deleted from the queue.".to_string(),
+                            );
+                        } else if db.remove_pending_queue_item(&source_path) {
+                            append_client_log(
+                                event_journal_path,
+                                "INFO",
+                                &format!("Removed queued item: {}", source_path),
+                            );
+                            app.status_message = Some(format!("Removed {}", source_path));
+                            app.queue_state.refresh(db.as_ref());
+                            app.last_db_refresh = Instant::now();
+                        } else {
+                            app.status_message =
+                                Some("Selected queue row is no longer pending.".to_string());
+                            app.queue_state.refresh(db.as_ref());
+                            app.last_db_refresh = Instant::now();
+                        }
+                    }
+                } else {
+                    app.status_message = Some("Select a queue row first.".to_string());
+                }
             }
         }
         KeyCode::Char('j') | KeyCode::Down => match app.current_tab {
@@ -938,6 +1122,7 @@ fn handle_browser_key(
 
     match code {
         KeyCode::Esc => app.browser = None,
+        KeyCode::Char('c') => open_preset_selector(app),
         KeyCode::Char('j') | KeyCode::Down => {
             if let Some(browser) = app.browser.as_mut() {
                 browser.move_down();
@@ -982,6 +1167,61 @@ fn handle_browser_key(
     Ok(false)
 }
 
+fn handle_preset_selector_key(app: &mut TuiApp, code: KeyCode) -> anyhow::Result<bool> {
+    match code {
+        KeyCode::Esc => {
+            app.preset_selector = None;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(selector) = app.preset_selector.as_mut() {
+                selector.move_down();
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(selector) = app.preset_selector.as_mut() {
+                selector.move_up();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(selector) = app.preset_selector.as_mut() {
+                selector.scroll_to_top();
+            }
+        }
+        KeyCode::End => {
+            if let Some(selector) = app.preset_selector.as_mut() {
+                selector.scroll_to_bottom();
+            }
+        }
+        KeyCode::Enter => {
+            let Some(selector) = app.preset_selector.as_ref() else {
+                return Ok(false);
+            };
+            let Some(entry) = selector.current_entry() else {
+                app.status_message = Some("No preset selected.".to_string());
+                return Ok(false);
+            };
+            if let Some(snapshot) = entry.snapshot() {
+                app.selected_precision_preset = snapshot;
+                app.status_message = Some(format!(
+                    "Precision preset selected: {}",
+                    app.selected_precision_preset.short_label()
+                ));
+                app.preset_selector = None;
+            } else {
+                app.status_message = Some(
+                    entry
+                        .error_summary
+                        .clone()
+                        .unwrap_or_else(|| "This preset entry is not selectable.".to_string()),
+                );
+            }
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
 fn handle_quit_modal_key(
     app: &mut TuiApp,
     db: &WatchdogDb,
@@ -990,71 +1230,186 @@ fn handle_quit_modal_key(
 ) -> anyhow::Result<bool> {
     match code {
         KeyCode::Esc => {
-            app.show_quit_modal = false;
+            if app.quit_kill_state.is_some() {
+                app.status_message = Some(
+                    "Worker stop is already in progress. Wait for shutdown to finish.".to_string(),
+                );
+            } else {
+                app.show_quit_modal = false;
+            }
             return Ok(false);
         }
         KeyCode::Left | KeyCode::Char('h') => app.quit_choice = app.quit_choice.prev(),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
             app.quit_choice = app.quit_choice.next()
         }
-        KeyCode::Char('b') => app.quit_choice = QuitChoice::Background,
-        KeyCode::Char('k') => app.quit_choice = QuitChoice::Kill,
-        KeyCode::Char('c') => app.quit_choice = QuitChoice::Cancel,
-        KeyCode::Enter | KeyCode::Char('q') => {}
+        KeyCode::Char('b') => {
+            return handle_quit_modal_choice(app, db, event_journal_path, QuitChoice::Background)
+        }
+        KeyCode::Char('k') => {
+            return handle_quit_modal_choice(app, db, event_journal_path, QuitChoice::Kill)
+        }
+        KeyCode::Char('y') => {
+            return handle_quit_modal_choice(app, db, event_journal_path, QuitChoice::Copy)
+        }
+        KeyCode::Char('c') => {
+            return handle_quit_modal_choice(app, db, event_journal_path, QuitChoice::Cancel)
+        }
+        KeyCode::Enter | KeyCode::Char('q') => {
+            return handle_quit_modal_choice(app, db, event_journal_path, app.quit_choice)
+        }
         _ => return Ok(false),
     }
 
-    if !matches!(
-        code,
-        KeyCode::Enter
-            | KeyCode::Char('q')
-            | KeyCode::Char('b')
-            | KeyCode::Char('k')
-            | KeyCode::Char('c')
-    ) {
+    Ok(false)
+}
+
+fn handle_quit_modal_choice(
+    app: &mut TuiApp,
+    db: &WatchdogDb,
+    event_journal_path: &Path,
+    choice: QuitChoice,
+) -> anyhow::Result<bool> {
+    app.quit_choice = choice;
+
+    if app.quit_kill_state.is_some() {
+        match choice {
+            QuitChoice::Copy => return copy_attach_hint(app),
+            QuitChoice::Kill => {
+                app.status_message = Some(
+                    "Worker stop is already in progress. This window will close automatically."
+                        .to_string(),
+                );
+            }
+            QuitChoice::Background | QuitChoice::Cancel => {
+                app.status_message = Some(
+                    "Worker stop is already in progress. Wait for shutdown to finish.".to_string(),
+                );
+            }
+        }
         return Ok(false);
     }
 
-    match app.quit_choice {
+    match choice {
         QuitChoice::Background => Ok(true),
         QuitChoice::Cancel => {
             app.show_quit_modal = false;
             Ok(false)
         }
-        QuitChoice::Kill => {
-            if let Some(pid) = app.worker_pid {
-                if pid_is_running(pid) {
-                    kill(Pid::from_raw(pid as i32), Signal::SIGTERM)?;
-                    std::thread::sleep(Duration::from_millis(150));
-                    if pid_is_running(pid) {
-                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                    }
-                    if !wait_for_pid_exit(pid, Duration::from_secs(15)) {
-                        app.status_message =
-                            Some(format!("Timed out waiting for worker {} to exit", pid));
-                        app.show_quit_modal = false;
-                        return Ok(false);
-                    }
-                }
-                db.clear_worker_state();
-                let cleared = db.clear_queue_items();
-                append_client_log(
-                    event_journal_path,
-                    "WARN",
-                    &format!(
-                        "Worker {} stopped by client; cleared {} queued item(s)",
-                        pid, cleared
-                    ),
-                );
-                append_event(
-                    Some(event_journal_path),
-                    "worker_stopped",
-                    json!({"pid": pid, "cleared_queue_items": cleared, "source": "tui_kill"}),
-                );
-            }
-            Ok(true)
+        QuitChoice::Copy => copy_attach_hint(app),
+        QuitChoice::Kill => request_worker_stop(app, db, event_journal_path),
+    }
+}
+
+fn copy_attach_hint(app: &mut TuiApp) -> anyhow::Result<bool> {
+    match copy_to_clipboard(&app.attach_hint) {
+        Ok(()) => {
+            app.status_message = Some("Reattach command copied to the clipboard.".to_string());
+        }
+        Err(error) => {
+            app.status_message = Some(format!("Failed to copy reattach command: {}", error));
         }
     }
+    Ok(false)
+}
+
+fn request_worker_stop(
+    app: &mut TuiApp,
+    _db: &WatchdogDb,
+    _event_journal_path: &Path,
+) -> anyhow::Result<bool> {
+    let Some(pid) = app.worker_pid else {
+        app.show_quit_modal = false;
+        return Ok(true);
+    };
+
+    send_sigterm(pid)?;
+
+    app.quit_choice = QuitChoice::Kill;
+    app.quit_kill_state = Some(QuitKillState {
+        pid,
+        started_at: Instant::now(),
+        followup_signal_sent: false,
+    });
+    app.status_message = Some(format!(
+        "Stopping worker {}. Rsync operations can take a moment to unwind safely.",
+        pid
+    ));
+    Ok(false)
+}
+
+fn send_sigterm(pid: u32) -> anyhow::Result<()> {
+    match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn finalize_requested_kill(app: &mut TuiApp, db: &WatchdogDb, event_journal_path: &Path) -> bool {
+    let Some(kill_state) = app.quit_kill_state.as_mut() else {
+        return false;
+    };
+
+    if !pid_is_running(kill_state.pid) {
+        let pid = kill_state.pid;
+        db.clear_worker_state();
+        let cleared = db.clear_queue_items();
+        append_client_log(
+            event_journal_path,
+            "WARN",
+            &format!(
+                "Worker {} stopped by client; cleared {} queued item(s)",
+                pid, cleared
+            ),
+        );
+        append_event(
+            Some(event_journal_path),
+            "worker_stopped",
+            json!({"pid": pid, "cleared_queue_items": cleared, "source": "tui_kill"}),
+        );
+        app.worker_pid = None;
+        app.quit_kill_state = None;
+        app.show_quit_modal = false;
+        app.status_message = Some(format!(
+            "Worker {} stopped; cleared {} queued item(s).",
+            pid, cleared
+        ));
+        return true;
+    }
+
+    if !kill_state.followup_signal_sent
+        && kill_state.started_at.elapsed() >= Duration::from_millis(150)
+    {
+        let _ = kill(Pid::from_raw(kill_state.pid as i32), Signal::SIGTERM);
+        kill_state.followup_signal_sent = true;
+    }
+
+    false
+}
+
+fn handle_mouse_event(
+    app: &mut TuiApp,
+    db: &Arc<WatchdogDb>,
+    event_journal_path: &Path,
+    mouse: MouseEvent,
+    area: Rect,
+) -> anyhow::Result<bool> {
+    if !app.show_quit_modal {
+        return Ok(false);
+    }
+
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(false);
+    }
+
+    let layout = quit_modal_layout(area);
+    for (choice, rect, _) in quit_button_rects(app, layout.buttons) {
+        if rect_contains(rect, mouse.column, mouse.row) {
+            return handle_quit_modal_choice(app, db.as_ref(), event_journal_path, choice);
+        }
+    }
+
+    Ok(false)
 }
 
 fn format_manual_selection_message(summary: &crate::selection::ManualSelectionSummary) -> String {
@@ -1154,7 +1509,12 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
     render_title_bar(f, outer_chunks[0], app);
     match app.current_tab {
         Tab::Dashboard => dashboard_tab::render_dashboard(f, outer_chunks[1], &app.current_state),
-        Tab::Queue => queue_tab::render_queue(f, outer_chunks[1], &mut app.queue_state),
+        Tab::Queue => queue_tab::render_queue(
+            f,
+            outer_chunks[1],
+            &mut app.queue_state,
+            &app.default_preset,
+        ),
         Tab::Logs => {
             logs_tab::render_logs(f, outer_chunks[1], &app.current_state, &mut app.logs_state)
         }
@@ -1168,7 +1528,16 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
         .as_ref()
         .map(|task| (task.latest_progress.clone(), task.started_at));
     if let Some(browser) = app.browser.as_mut() {
-        render_browser_modal(f, size, browser, browser_progress.as_ref());
+        render_browser_modal(
+            f,
+            size,
+            browser,
+            browser_progress.as_ref(),
+            &app.selected_precision_preset,
+        );
+    }
+    if let Some(selector) = app.preset_selector.as_mut() {
+        render_preset_selector_modal(f, size, selector, &app.selected_precision_preset);
     }
     if app.show_quit_modal {
         render_quit_modal(f, size, app);
@@ -1205,12 +1574,14 @@ fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
-    let help = if app.browser.is_some() && app.selection_task.is_some() {
+    let help = if app.preset_selector.is_some() {
+        preset_selector_help_line(area.width)
+    } else if app.browser.is_some() && app.selection_task.is_some() {
         selection_help_line(area.width)
     } else if app.browser.is_some() {
-        browser_help_line(area.width)
+        browser_help_line(app, area.width)
     } else {
-        main_help_line(area.width)
+        main_help_line(app, area.width)
     };
 
     let footer = Layout::default()
@@ -1222,9 +1593,19 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
     let status_line = if let Some(task) = app.selection_task.as_ref() {
         manual_selection_progress_message(&task.latest_progress, activity_spinner(task.started_at))
     } else {
-        app.status_message
+        let base_line = app
+            .status_message
             .clone()
-            .unwrap_or_else(|| format!("Reattach with {}", app.attach_hint))
+            .unwrap_or_else(|| format!("Reattach with {}", app.attach_hint));
+        if matches!(app.current_state.run_mode, RunMode::Precision) {
+            format!(
+                "Preset: {} | {}",
+                app.selected_precision_preset.short_label(),
+                base_line
+            )
+        } else {
+            base_line
+        }
     };
     f.render_widget(
         Paragraph::new(status_line).style(Style::default().fg(Color::DarkGray)),
@@ -1232,11 +1613,15 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
     );
 }
 
-fn browser_help_line(width: u16) -> Line<'static> {
+fn browser_help_line(app: &TuiApp, width: u16) -> Line<'static> {
     if width < 72 {
-        Line::from("j/k move  Enter open  Space select  a add  Esc close")
+        if matches!(app.current_state.run_mode, RunMode::Precision) {
+            Line::from("j/k move  Enter open  Space select  a add  c codec  Esc close")
+        } else {
+            Line::from("j/k move  Enter open  Space select  a add  Esc close")
+        }
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 " j/k",
                 Style::default()
@@ -1272,6 +1657,19 @@ fn browser_help_line(width: u16) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(":add queue  "),
+        ];
+        if matches!(app.current_state.run_mode, RunMode::Precision) {
+            spans.extend([
+                Span::styled(
+                    "c",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(":codec  "),
+            ]);
+        }
+        spans.extend([
             Span::styled(
                 "Esc",
                 Style::default()
@@ -1279,7 +1677,8 @@ fn browser_help_line(width: u16) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(":close"),
-        ])
+        ]);
+        Line::from(spans)
     }
 }
 
@@ -1300,11 +1699,45 @@ fn selection_help_line(width: u16) -> Line<'static> {
     }
 }
 
-fn main_help_line(width: u16) -> Line<'static> {
+fn preset_selector_help_line(width: u16) -> Line<'static> {
     if width < 72 {
-        Line::from("q quit  1-5 tabs  b browse  j/k scroll  f log-filter")
+        Line::from("j/k move  Enter select  Esc close")
     } else {
         Line::from(vec![
+            Span::styled(
+                " j/k",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":move  "),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":select  "),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":close"),
+        ])
+    }
+}
+
+fn main_help_line(app: &TuiApp, width: u16) -> Line<'static> {
+    if width < 72 {
+        if matches!(app.current_state.run_mode, RunMode::Precision) {
+            Line::from("q quit  1-5 tabs  b browse  c codec  d delete  j/k scroll")
+        } else {
+            Line::from("q quit  1-5 tabs  b browse  j/k scroll  f log-filter")
+        }
+    } else {
+        let mut spans = vec![
             Span::styled(
                 " q",
                 Style::default()
@@ -1326,6 +1759,26 @@ fn main_help_line(width: u16) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(":browse  "),
+        ];
+        if matches!(app.current_state.run_mode, RunMode::Precision) {
+            spans.extend([
+                Span::styled(
+                    "c",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(":codec  "),
+                Span::styled(
+                    "d",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(":delete queue row  "),
+            ]);
+        }
+        spans.extend([
             Span::styled(
                 "j/k",
                 Style::default()
@@ -1333,14 +1786,19 @@ fn main_help_line(width: u16) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(":scroll  "),
-            Span::styled(
-                "f",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(":log-filter"),
-        ])
+        ]);
+        if !matches!(app.current_state.run_mode, RunMode::Precision) {
+            spans.extend([
+                Span::styled(
+                    "f",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(":log-filter"),
+            ]);
+        }
+        Line::from(spans)
     }
 }
 
@@ -1349,6 +1807,7 @@ fn render_browser_modal(
     area: Rect,
     browser: &mut BrowserState,
     selection_progress: Option<&(ManualSelectionProgress, Instant)>,
+    selected_preset: &PresetSnapshot,
 ) {
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
@@ -1370,23 +1829,28 @@ fn render_browser_modal(
         .border_style(Style::default().fg(Color::LightBlue));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let sections = if selection_progress.is_some() && inner.height > 1 {
+    let sections = if selection_progress.is_some() && inner.height > 2 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner)
+    } else {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1)])
-            .split(inner)
     };
     let list_area = sections[0];
-    let progress_area = if sections.len() > 1 {
+    let progress_area = if selection_progress.is_some() && sections.len() > 2 {
         Some(sections[1])
     } else {
         None
     };
+    let preset_area = *sections.last().unwrap_or(&list_area);
     let visible_rows = list_area.height as usize;
     browser.ensure_visible(visible_rows);
 
@@ -1428,14 +1892,26 @@ fn render_browser_modal(
             progress_area,
         );
     }
+
+    let preset_line = format!("Preset: {}", selected_preset.short_label());
+    f.render_widget(
+        Paragraph::new(truncate_right(&preset_line, preset_area.width as usize))
+            .style(Style::default().fg(Color::DarkGray)),
+        preset_area,
+    );
 }
 
-fn render_quit_modal(f: &mut Frame, area: Rect, app: &TuiApp) {
-    let popup = centered_rect(60, 30, area);
+fn render_preset_selector_modal(
+    f: &mut Frame,
+    area: Rect,
+    selector: &mut PresetSelectorState,
+    selected_preset: &PresetSnapshot,
+) {
+    let popup = centered_rect(84, 72, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(" Quit ")
+        .title(" Codec Selector ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(popup);
@@ -1443,61 +1919,263 @@ fn render_quit_modal(f: &mut Frame, area: Rect, app: &TuiApp) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(2)])
+        .split(inner);
+    let content = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(chunks[0]);
+
+    let list_area = content[0];
+    let details_area = content[1];
+    let footer_area = chunks[1];
+    let visible_rows = list_area.height as usize;
+    selector.ensure_visible(visible_rows);
+
+    let items = selector
+        .visible_entries(visible_rows)
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let absolute_idx = selector.scroll_offset + idx;
+            let mut style = if entry.selectable {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            if absolute_idx == selector.selected_index {
+                style = style
+                    .fg(Color::White)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+            }
+            let marker = if entry.snapshot().as_ref() == Some(selected_preset) {
+                "*"
+            } else {
+                " "
+            };
+            ListItem::new(Line::from(Span::styled(
+                truncate_right(
+                    &format!("{} {}", marker, entry.label()),
+                    list_area.width as usize,
+                ),
+                style,
+            )))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(List::new(items), list_area);
+
+    let details = selector
+        .current_entry()
+        .map(|entry| {
+            let mut lines = vec![
+                format!("File: {}", entry.preset_file),
+                format!("Preset: {}", entry.preset_name),
+            ];
+            if let Some(target_codec) = entry.target_codec.as_deref() {
+                lines.push(format!("Target codec: {}", target_codec));
+            }
+            lines.push(format!("Encoder: {}", entry.encoder));
+            lines.push(format!("Quality/CRF: {}", entry.quality_summary));
+            lines.push(format!("Speed preset: {}", entry.speed_preset));
+            lines.push(format!("Subtitles: {}", entry.subtitle_summary));
+            lines.push(format!("Audio: {}", entry.audio_summary));
+            if let Some(error) = entry.error_summary.as_deref() {
+                lines.push(format!("Status: disabled ({})", error));
+            } else {
+                lines.push("Status: selectable".to_string());
+            }
+            lines.join("\n")
+        })
+        .unwrap_or_else(|| "No preset entries found.".to_string());
+    f.render_widget(
+        Paragraph::new(details)
+            .block(
+                Block::default()
+                    .title(" Details ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        details_area,
+    );
+
+    let footer = format!(
+        "Selected preset: {}",
+        truncate_right(&selected_preset.short_label(), footer_area.width as usize)
+    );
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        footer_area,
+    );
+}
+
+fn render_quit_modal(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let layout = quit_modal_layout(area);
+    let popup = layout.popup;
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Quit ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    f.render_widget(block, popup);
+
+    let pid_text = app
+        .quit_kill_state
+        .as_ref()
+        .map(|state| {
+            format!(
+                "Stopping worker {}. Rsync can take time to flush and exit cleanly; this window will close automatically when shutdown finishes.",
+                state.pid
+            )
+        })
+        .or_else(|| {
+            app.worker_pid.map(|pid| {
+                format!(
+                    "Worker {} is still running. Background leaves transcoding active; Kill stops the worker and clears the queue after it exits.",
+                    pid
+                )
+            })
+        })
+        .unwrap_or_else(|| "Worker status is unavailable.".to_string());
+    f.render_widget(
+        Paragraph::new(pid_text).wrap(ratatui::widgets::Wrap { trim: true }),
+        layout.message,
+    );
+
+    for (choice, rect, label) in quit_button_rects(app, layout.buttons) {
+        let selected = app.quit_choice == choice;
+        let disabled = app.quit_kill_state.is_some()
+            && matches!(
+                choice,
+                QuitChoice::Background | QuitChoice::Kill | QuitChoice::Cancel
+            );
+        let border_style = if selected {
+            Style::default().fg(Color::Yellow)
+        } else if disabled {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let text_style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if disabled {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {} ", label), text_style)))
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border_style),
+                ),
+            rect,
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(app.attach_hint.as_str())
+            .block(
+                Block::default()
+                    .title(" Reattach ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        layout.command,
+    );
+
+    let footer_text = if app.quit_kill_state.is_some() {
+        "Keys: y copy command. Waiting for the worker to exit."
+    } else {
+        "Keys: b background, k kill, y copy command, c cancel, Enter confirm."
+    };
+    f.render_widget(
+        Paragraph::new(footer_text)
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center),
+        layout.footer,
+    );
+}
+
+struct QuitModalLayout {
+    popup: Rect,
+    message: Rect,
+    buttons: Rect,
+    command: Rect,
+    footer: Rect,
+}
+
+fn quit_modal_layout(area: Rect) -> QuitModalLayout {
+    let popup = centered_rect(78, 44, area);
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(4),
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Min(4),
             Constraint::Length(2),
         ])
         .split(inner);
 
-    let pid_text = app
-        .worker_pid
-        .map(|pid| format!("Worker {} is still running.", pid))
-        .unwrap_or_else(|| "Worker status is unavailable.".to_string());
-    f.render_widget(
-        Paragraph::new(format!(
-            "{} Background leaves transcoding running. Kill stops the worker and clears the queue.",
-            pid_text
-        ))
-        .wrap(ratatui::widgets::Wrap { trim: true }),
-        chunks[0],
-    );
+    QuitModalLayout {
+        popup,
+        message: chunks[0],
+        buttons: chunks[1],
+        command: chunks[2],
+        footer: chunks[3],
+    }
+}
 
+fn quit_button_rects(app: &TuiApp, area: Rect) -> Vec<(QuitChoice, Rect, &'static str)> {
     let buttons = [
         (QuitChoice::Background, "Background"),
-        (QuitChoice::Kill, "Kill"),
-        (QuitChoice::Cancel, "Cancel"),
-    ]
-    .iter()
-    .map(|(choice, label)| {
-        let selected = app.quit_choice == *choice;
-        Span::styled(
-            format!(" {} ", label),
-            if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+        (
+            QuitChoice::Kill,
+            if app.quit_kill_state.is_some() {
+                "Stopping"
             } else {
-                Style::default().fg(Color::Gray)
+                "Kill"
             },
-        )
-    })
-    .collect::<Vec<_>>();
-    f.render_widget(
-        Paragraph::new(Line::from(buttons)).alignment(Alignment::Center),
-        chunks[1],
-    );
+        ),
+        (QuitChoice::Copy, "Copy Cmd"),
+        (QuitChoice::Cancel, "Cancel"),
+    ];
+    let gap = 1u16;
+    let total_width = buttons.iter().fold(0u16, |acc, (_, label)| {
+        acc.saturating_add(label.len() as u16 + 4)
+    }) + gap.saturating_mul(buttons.len().saturating_sub(1) as u16);
+    let start_x = area.x + area.width.saturating_sub(total_width) / 2;
+    let mut cursor_x = start_x;
 
-    f.render_widget(
-        Paragraph::new(format!(
-            "Reopen later with {}. Keys: b background, k kill, c cancel, Enter confirm.",
-            app.attach_hint
-        ))
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center),
-        chunks[2],
-    );
+    buttons
+        .into_iter()
+        .map(|(choice, label)| {
+            let width = label.len() as u16 + 4;
+            let rect = Rect {
+                x: cursor_x,
+                y: area.y,
+                width,
+                height: area.height,
+            };
+            cursor_x = cursor_x.saturating_add(width + gap);
+            (choice, rect, label)
+        })
+        .collect()
+}
+
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1554,6 +2232,7 @@ fn truncate_left(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::RunMode;
 
     #[test]
     fn browser_state_scrolls_to_keep_selection_visible() {
@@ -1588,5 +2267,50 @@ mod tests {
         assert_eq!(truncate_left("abcdef", 4), "...f");
         assert_eq!(truncate_right("abc", 8), "abc");
         assert_eq!(truncate_left("abc", 8), "abc");
+    }
+
+    #[test]
+    fn open_preset_selector_rejects_non_precision_mode() {
+        let mut app = TuiApp::new(
+            &Config::default_config(),
+            PathBuf::from("/tmp/watchdog"),
+            String::new(),
+        );
+        app.current_state.run_mode = RunMode::Watchdog;
+
+        open_preset_selector(&mut app);
+
+        assert!(app.preset_selector.is_none());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Codec selector is only available in precision mode.")
+        );
+    }
+
+    #[test]
+    fn browser_help_line_only_shows_codec_shortcut_in_precision_mode() {
+        let mut app = TuiApp::new(
+            &Config::default_config(),
+            PathBuf::from("/tmp/watchdog"),
+            String::new(),
+        );
+
+        app.current_state.run_mode = RunMode::Watchdog;
+        let watchdog_help = browser_help_line(&app, 120);
+        let watchdog_text = watchdog_help
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!watchdog_text.contains(":codec"));
+
+        app.current_state.run_mode = RunMode::Precision;
+        let precision_help = browser_help_line(&app, 120);
+        let precision_text = precision_help
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(precision_text.contains(":codec"));
     }
 }

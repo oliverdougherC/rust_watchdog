@@ -1,4 +1,5 @@
 use crate::db::{QueueRecord, WatchdogDb};
+use crate::transcode::PresetSnapshot;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -42,26 +43,58 @@ impl QueueTabState {
     pub fn refresh(&mut self, db: &WatchdogDb) {
         self.records = db.list_queue_items(500);
         self.total_records = self.records.len();
-        if self.table_state.selected().is_none() && !self.records.is_empty() {
+        if let Some(selected) = self.table_state.selected() {
+            if self.records.is_empty() {
+                self.table_state.select(None);
+            } else if selected >= self.records.len() {
+                self.table_state.select(Some(self.records.len() - 1));
+            }
+        } else if !self.records.is_empty() {
             self.table_state.select(Some(0));
         }
     }
 }
 
-pub fn render_queue(f: &mut Frame, area: Rect, tab_state: &mut QueueTabState) {
+fn effective_preset(record: &QueueRecord, default_preset: &PresetSnapshot) -> PresetSnapshot {
+    PresetSnapshot {
+        preset_file: record
+            .preset_file
+            .clone()
+            .unwrap_or_else(|| default_preset.preset_file.clone()),
+        preset_name: record
+            .preset_name
+            .clone()
+            .unwrap_or_else(|| default_preset.preset_name.clone()),
+        target_codec: record
+            .target_codec
+            .clone()
+            .unwrap_or_else(|| default_preset.target_codec.clone()),
+    }
+}
+
+pub fn render_queue(
+    f: &mut Frame,
+    area: Rect,
+    tab_state: &mut QueueTabState,
+    default_preset: &PresetSnapshot,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(5)])
         .split(area);
 
-    let header = Row::new(["Status", "Source", "File", "Share"].iter().map(|h| {
-        Cell::from(Span::styled(
-            *h,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))
-    }))
+    let header = Row::new(
+        ["Status", "Source", "File", "Preset", "Share"]
+            .iter()
+            .map(|h| {
+                Cell::from(Span::styled(
+                    *h,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            }),
+    )
     .height(1);
 
     let rows = tab_state.records.iter().map(|record| {
@@ -80,11 +113,13 @@ pub fn render_queue(f: &mut Frame, area: Rect, tab_state: &mut QueueTabState) {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        let preset = effective_preset(record, default_preset);
 
         Row::new(vec![
             Cell::from(status),
             Cell::from(record.enqueue_source.clone()),
             Cell::from(file_name),
+            Cell::from(preset.short_label()),
             Cell::from(record.share_name.clone()),
         ])
     });
@@ -94,7 +129,8 @@ pub fn render_queue(f: &mut Frame, area: Rect, tab_state: &mut QueueTabState) {
         [
             Constraint::Length(8),
             Constraint::Length(8),
-            Constraint::Min(24),
+            Constraint::Min(20),
+            Constraint::Length(24),
             Constraint::Length(14),
         ],
     )
@@ -117,9 +153,13 @@ pub fn render_queue(f: &mut Frame, area: Rect, tab_state: &mut QueueTabState) {
         .selected()
         .and_then(|idx| tab_state.records.get(idx))
         .map(|record| {
+            let preset = effective_preset(record, default_preset);
             format!(
-                "Path: {}\nQueued: {}  Started: {}  Order: {}",
+                "Path: {}\nPreset: {} [{}] codec={}\nQueued: {}  Started: {}  Order: {}",
                 record.source_path,
+                preset.preset_name,
+                preset.preset_file,
+                preset.target_codec,
                 record.queued_at,
                 record.started_at.as_deref().unwrap_or("-"),
                 record.order_key,
