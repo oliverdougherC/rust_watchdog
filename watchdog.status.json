@@ -3,6 +3,7 @@
   "phase": "Idle",
   "paused": false,
   "nfs_healthy": true,
+  "local_mode": false,
   "simulate_mode": true,
   "run_mode": "watchdog",
   "queue_position": 0,

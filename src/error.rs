@@ -21,7 +21,7 @@ pub enum WatchdogError {
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),
 
-    #[error("NFS mount failed for share '{share}': {reason}")]
+    #[error("Share access failed for share '{share}': {reason}")]
     NfsMount { share: String, reason: String },
 
     #[error("Share scan timed out after {timeout_secs}s ({pending_shares} share(s) pending)")]
@@ -148,7 +148,7 @@ impl WatchdogError {
                 "Verify database path permissions and free disk space; inspect sqlite file ownership.",
             ),
             Self::NfsMount { .. } => Some(
-                "Check NFS server reachability and mount credentials, then re-run doctor/status checks.",
+                "Check configured share roots; in NFS mode also verify server reachability and mount credentials, then re-run doctor/status checks.",
             ),
             Self::ScanTimeout { .. } => Some(
                 "Reduce scan scope or increase `safety.share_scan_timeout_seconds` for slow/unhealthy shares.",

@@ -14,6 +14,7 @@ struct SnapshotPayload<'a> {
     phase: String,
     paused: bool,
     nfs_healthy: bool,
+    local_mode: bool,
     simulate_mode: bool,
     run_mode: &'a str,
     queue_position: u32,
@@ -115,6 +116,7 @@ pub fn write_snapshot(
         phase: state.phase.to_string(),
         paused: matches!(state.phase, crate::state::PipelinePhase::Paused),
         nfs_healthy: state.nfs_healthy,
+        local_mode: state.local_mode,
         simulate_mode: state.simulate_mode,
         run_mode: state.run_mode.as_str(),
         queue_position: state.queue_position,
@@ -268,6 +270,7 @@ mod tests {
         assert_eq!(json["cooldown_files"], 5);
         assert_eq!(json["phase"], "Awaiting Selection");
         assert_eq!(json["run_mode"], "precision");
+        assert_eq!(json["local_mode"], false);
         assert_eq!(json["run"]["skipped_in_use"], 2);
         assert_eq!(json["totals"]["transcoded"], 3);
         assert_eq!(json["reliability"]["scan_timeouts"], 0);

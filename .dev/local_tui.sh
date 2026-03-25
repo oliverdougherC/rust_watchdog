@@ -127,7 +127,6 @@ echo "    staged files in media_share: $VIDEO_COUNT"
 echo "    staged media size: $MEDIA_SIZE"
 
 ESC_SOURCE_DIR="$(toml_escape "$SOURCE_DIR")"
-ESC_INGEST_DIR="$(toml_escape "$INGEST_DIR")"
 ESC_MEDIA_DIR="$(toml_escape "$MEDIA_DIR")"
 ESC_PRESET_FILE="$(toml_escape "$PRESET_FILE")"
 ESC_TMP_DIR="$(toml_escape "$TMP_DIR")"
@@ -139,12 +138,14 @@ ESC_EVENT_PATH="$(toml_escape "$EVENT_PATH")"
 ESC_PRESET_NAME="$(toml_escape "$PRESET_NAME")"
 
 cat > "$CONFIG_PATH" <<EOF
+local_mode = true
+
 [nfs]
-server = "127.0.0.1"
+server = ""
 
 [[shares]]
 name = "local_test_videos"
-remote_path = "$ESC_INGEST_DIR"
+remote_path = ""
 local_mount = "$ESC_MEDIA_DIR"
 
 [transcode]
@@ -214,7 +215,7 @@ fi
 if [[ "$HEADLESS_ONCE" -eq 1 ]]; then
   echo "==> Launching headless once pass"
   echo "    config: $CONFIG_PATH"
-  RUST_LOG="$HEADLESS_LOG_LEVEL" WATCHDOG_ALLOW_LOCAL_MOUNTS=1 WATCHDOG_RUNTIME_MODE=local_test cargo run --release -- --config "$CONFIG_PATH" --once --headless
+  RUST_LOG="$HEADLESS_LOG_LEVEL" cargo run --release -- --config "$CONFIG_PATH" --once --headless
   echo
   echo "==> Headless pass summary (transcode_history by outcome)"
   sqlite3 "$DB_PATH" "select outcome, count(*) from transcode_history group by outcome order by count(*) desc;"
@@ -226,4 +227,4 @@ echo "    config: $CONFIG_PATH"
 echo "    videos staged: $VIDEO_COUNT"
 echo "    press q to quit"
 
-WATCHDOG_ALLOW_LOCAL_MOUNTS=1 WATCHDOG_RUNTIME_MODE=local_test cargo run --release -- --config "$CONFIG_PATH"
+cargo run --release -- --config "$CONFIG_PATH"

@@ -202,6 +202,77 @@ status_snapshot = "{}"
     }
 }
 
+fn write_local_mode_config(with_snapshot: bool) -> TestConfigFile {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("watchdog.db");
+    let media_dir = dir.path().join("media");
+    std::fs::create_dir_all(&media_dir).unwrap();
+    let snapshot_path = dir.path().join("status.json");
+    if with_snapshot {
+        std::fs::write(
+            &snapshot_path,
+            r#"{
+  "phase": "Idle",
+  "nfs_healthy": true,
+  "local_mode": true,
+  "queue_position": 0,
+  "queue_total": 0,
+  "current_file": null,
+  "unhealthy_shares": [],
+  "reliability": {
+    "scan_timeouts": 0,
+    "last_failure_code": null
+  }
+}"#,
+        )
+        .unwrap();
+    }
+    let config_path = dir.path().join("watchdog.toml");
+    let mut file = std::fs::File::create(&config_path).unwrap();
+    writeln!(
+        file,
+        r#"local_mode = true
+
+[nfs]
+server = ""
+
+[[shares]]
+name = "movies"
+remote_path = ""
+local_mount = "{}"
+
+[scan]
+video_extensions = [".mkv"]
+interval_seconds = 300
+
+[safety]
+status_snapshot_stale_seconds = 30
+pause_file = "watchdog.pause"
+max_failures_before_cooldown = 3
+cooldown_base_seconds = 300
+cooldown_max_seconds = 86400
+max_consecutive_pass_failures = 3
+
+[paths]
+database = "{}"
+transcode_temp = "/tmp"
+status_snapshot = "{}"
+"#,
+        media_dir.display(),
+        db_path.display(),
+        if with_snapshot {
+            snapshot_path.to_string_lossy().to_string()
+        } else {
+            String::new()
+        },
+    )
+    .unwrap();
+    TestConfigFile {
+        _dir: dir,
+        path: config_path,
+    }
+}
+
 fn seed_stale_worker_run_mode(config_path: &std::path::Path, run_mode: &str) {
     let db_path = config_path.parent().unwrap().join("watchdog.db");
     let conn = Connection::open(&db_path).unwrap();
@@ -291,6 +362,20 @@ fn healthcheck_invalid_config_returns_20() {
 }
 
 #[test]
+fn healthcheck_local_mode_succeeds_without_nfs_overrides() {
+    let cfg = write_local_mode_config(false);
+    let output = Command::new(bin_path())
+        .args(["--healthcheck", "--config", cfg.path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("storage_mode: local"));
+    assert!(text.contains("share_roots=true"));
+}
+
+#[test]
 fn once_simulate_returns_zero() {
     let output = Command::new(bin_path())
         .args(["--simulate", "--once", "--headless"])
@@ -327,6 +412,20 @@ fn doctor_with_invalid_config_still_runs_diagnostics() {
 }
 
 #[test]
+fn doctor_local_mode_reports_share_roots() {
+    let cfg = write_local_mode_config(true);
+    let output = Command::new(bin_path())
+        .args(["--doctor", "--config", cfg.path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("storage_mode: local"));
+    assert!(text.contains("share_roots:"));
+}
+
+#[test]
 fn status_json_fresh_snapshot_returns_zero() {
     let cfg = write_status_config(true);
     let output = Command::new(bin_path())
@@ -350,6 +449,20 @@ fn status_json_missing_snapshot_returns_degraded() {
     let json = parse_json_output(&output);
     assert_eq!(json["status"], "degraded");
     assert_eq!(json["status_freshness"], "missing");
+}
+
+#[test]
+fn status_json_local_mode_reports_local_storage_mode() {
+    let cfg = write_local_mode_config(true);
+    let output = Command::new(bin_path())
+        .args(["--status-json", "--config", cfg.path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json = parse_json_output(&output);
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["local_mode"], true);
 }
 
 #[test]

@@ -46,7 +46,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
         PipelinePhase::AwaitingSelection => Color::LightBlue,
     };
 
-    let nfs_color = if state.nfs_healthy {
+    let storage_health_color = if state.nfs_healthy {
         Color::Green
     } else {
         Color::Red
@@ -65,17 +65,25 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
 
     let phase_str = state.phase.to_string();
     let phase_badge = StatusBadge::new(&phase_str, phase_color);
-    let nfs_label = if state.nfs_healthy {
+    let storage_mode_label = if state.local_mode { "Local" } else { "NFS" };
+    let storage_health_label = if state.nfs_healthy {
         "Healthy"
     } else {
         "Unhealthy"
     };
-    let nfs_badge = StatusBadge::new(nfs_label, nfs_color);
+    let storage_health_badge = StatusBadge::new(storage_health_label, storage_health_color);
 
     let mut spans = vec![Span::raw(" State: ")];
     spans.extend(phase_badge.to_spans());
-    spans.push(Span::raw("    NFS: "));
-    spans.extend(nfs_badge.to_spans());
+    spans.push(Span::raw("    Storage: "));
+    spans.push(Span::styled(
+        storage_mode_label,
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(" "));
+    spans.extend(storage_health_badge.to_spans());
     spans.push(Span::raw("    Mode: "));
     spans.push(Span::styled(
         env_label,

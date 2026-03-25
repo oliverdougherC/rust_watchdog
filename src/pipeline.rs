@@ -542,12 +542,51 @@ fn reset_run_state(state: &StateManager, db: &Arc<WatchdogDb>) {
     });
 }
 
-fn verify_mounts_and_update_state(
+fn local_share_root_is_healthy(fs: &dyn FileSystem, root: &Path) -> bool {
+    fs.is_dir(root) && fs.list_dir(root).is_ok()
+}
+
+fn verify_share_roots_and_update_state(
     config: &Config,
     deps: &PipelineDeps,
     state: &StateManager,
     dry_run: bool,
 ) -> Result<()> {
+    if config.local_mode {
+        let share_health = config
+            .shares
+            .iter()
+            .map(|share| {
+                let healthy =
+                    local_share_root_is_healthy(deps.fs.as_ref(), Path::new(&share.local_mount));
+                (share.name.clone(), healthy)
+            })
+            .collect::<Vec<_>>();
+        let unhealthy = share_health
+            .iter()
+            .filter_map(|(name, healthy)| (!*healthy).then_some(name.clone()))
+            .collect::<Vec<_>>();
+
+        if let Some(first) = unhealthy.first() {
+            return Err(WatchdogError::NfsMount {
+                share: first.clone(),
+                reason: format!(
+                    "Configured local share root is unavailable or unreadable ({} unhealthy)",
+                    unhealthy.len()
+                ),
+            });
+        }
+
+        state.set_share_health(share_health.clone());
+        state.set_nfs_healthy(share_health.iter().all(|(_, healthy)| *healthy));
+        tui_log(
+            state,
+            "INFO",
+            &format!("Local share roots verified ({} shares)", share_health.len()),
+        );
+        return Ok(());
+    }
+
     let shares: Vec<(String, String, String)> = config
         .shares
         .iter()
@@ -565,9 +604,9 @@ fn verify_mounts_and_update_state(
             return Err(WatchdogError::NfsMount {
                 share: first.clone(),
                 reason: format!(
-                    "Dry-run mode is read-only and will not remount unhealthy shares ({} unhealthy)",
-                    unhealthy.len()
-                ),
+                "Dry-run mode is read-only and will not remount unhealthy shares ({} unhealthy)",
+                unhealthy.len()
+            ),
             });
         }
     } else {
@@ -631,7 +670,7 @@ async fn run_queued_pass(
         return Err(WatchdogError::Paused);
     }
 
-    verify_mounts_and_update_state(config, deps, state, dry_run)?;
+    verify_share_roots_and_update_state(config, deps, state, dry_run)?;
     let transcode_queue = load_queue_candidates(config, base_dir, deps, db, state);
     if transcode_queue.is_empty() {
         tui_log(state, "INFO", "Durable queue is empty after refresh");
@@ -758,7 +797,7 @@ pub async fn run_watchdog_pass(
         return Err(WatchdogError::Paused);
     }
 
-    verify_mounts_and_update_state(config, deps, state, dry_run)?;
+    verify_share_roots_and_update_state(config, deps, state, dry_run)?;
 
     // Prepare paths
     let temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);

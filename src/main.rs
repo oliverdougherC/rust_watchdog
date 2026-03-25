@@ -53,6 +53,7 @@ struct HealthcheckChecks {
 struct HealthcheckResult {
     status: String,
     exit_code: i32,
+    local_mode: bool,
     checks: HealthcheckChecks,
     paused: bool,
     cooldown_files: i64,
@@ -104,6 +105,7 @@ struct DoctorMountCheck {
 struct StatusResult {
     status: String,
     exit_code: i32,
+    local_mode: bool,
     mode: String,
     run_mode: String,
     paused: bool,
@@ -131,6 +133,60 @@ struct SnapshotDiagnostics {
     age_seconds: Option<u64>,
     snapshot: Option<Value>,
     snapshot_path: Option<PathBuf>,
+}
+
+fn storage_mode_name(local_mode: bool) -> &'static str {
+    if local_mode {
+        "local"
+    } else {
+        "nfs"
+    }
+}
+
+fn share_health_check_label(local_mode: bool) -> &'static str {
+    if local_mode {
+        "share_roots"
+    } else {
+        "nfs"
+    }
+}
+
+fn share_health_text_label(local_mode: bool) -> &'static str {
+    if local_mode {
+        "local_roots_healthy"
+    } else {
+        "nfs_healthy"
+    }
+}
+
+fn share_health_subject_label(local_mode: bool) -> &'static str {
+    if local_mode {
+        "share_root"
+    } else {
+        "mount"
+    }
+}
+
+fn share_health_section_label(local_mode: bool) -> &'static str {
+    if local_mode {
+        "share_roots"
+    } else {
+        "mounts"
+    }
+}
+
+fn host_share_root_is_healthy(path: &Path) -> bool {
+    if !path.exists() || !path.is_dir() {
+        return false;
+    }
+
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => match entries.next() {
+            Some(Ok(_)) | None => true,
+            Some(Err(_)) => false,
+        },
+        Err(_) => false,
+    }
 }
 
 #[derive(Parser)]
@@ -731,7 +787,7 @@ async fn run() -> anyhow::Result<()> {
         };
 
         let (state, _state_rx) = StateManager::new();
-        seed_state_from_db(&state, &db, cli.simulate);
+        seed_state_from_db(&state, &db, cli.simulate, config.local_mode);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let deps = if cli.simulate {
             create_simulated_deps(&config)
@@ -921,7 +977,7 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seed_state_from_db(state: &StateManager, db: &WatchdogDb, simulate: bool) {
+fn seed_state_from_db(state: &StateManager, db: &WatchdogDb, simulate: bool, local_mode: bool) {
     let total_saved = db.get_total_space_saved();
     let total_transcoded = db.get_transcode_count();
     let total_inspected = db.get_inspected_count();
@@ -932,6 +988,7 @@ fn seed_state_from_db(state: &StateManager, db: &WatchdogDb, simulate: bool) {
         s.total_space_saved = total_saved;
         s.total_transcoded = total_transcoded as u64;
         s.total_inspected = total_inspected as u64;
+        s.local_mode = local_mode;
         s.simulate_mode = simulate;
         s.consecutive_pass_failures = service_state.consecutive_pass_failures;
         s.auto_paused = service_state.auto_paused_at.is_some();
@@ -1087,13 +1144,18 @@ fn run_healthcheck(
         println!("watchdog_healthcheck");
         println!("  status: {}", result.status);
         println!("  exit_code: {}", result.exit_code);
+        println!("  storage_mode: {}", storage_mode_name(result.local_mode));
         println!("  mode: {}", result.mode);
         println!("  run_mode: {}", result.run_mode);
         println!("  paused: {}", result.paused);
         println!("  cooldown_files: {}", result.cooldown_files);
         println!(
-            "  checks: config={} db={} dependencies={} nfs={}",
-            result.checks.config, result.checks.db, result.checks.dependencies, result.checks.nfs
+            "  checks: config={} db={} dependencies={} {}={}",
+            result.checks.config,
+            result.checks.db,
+            result.checks.dependencies,
+            share_health_check_label(result.local_mode),
+            result.checks.nfs
         );
         println!("  db_query_ok: {}", result.db_query_ok);
         if !result.missing_dependencies.is_empty() {
@@ -1118,8 +1180,11 @@ fn run_healthcheck(
         if !result.mount_checks.is_empty() {
             for mount in &result.mount_checks {
                 println!(
-                    "  mount: {} healthy={} latency_ms={}",
-                    mount.share, mount.healthy, mount.latency_ms
+                    "  {}: {} healthy={} latency_ms={}",
+                    share_health_subject_label(result.local_mode),
+                    mount.share,
+                    mount.healthy,
+                    mount.latency_ms
                 );
             }
         }
@@ -1206,6 +1271,8 @@ fn evaluate_healthcheck(
                 true
             } else if let Some(forced) = forced_unhealthy.as_ref() {
                 !forced.iter().any(|s| s == &share.name)
+            } else if config.local_mode {
+                host_share_root_is_healthy(std::path::Path::new(&share.local_mount))
             } else {
                 mount_manager.is_healthy(std::path::Path::new(&share.local_mount))
             };
@@ -1247,6 +1314,7 @@ fn evaluate_healthcheck(
             "failed".to_string()
         },
         exit_code,
+        local_mode: config.local_mode,
         checks,
         paused,
         cooldown_files,
@@ -1400,6 +1468,7 @@ fn run_status(
         let result = StatusResult {
             status: "error".to_string(),
             exit_code: STATUS_INTERNAL_FAIL,
+            local_mode: config.local_mode,
             mode: if simulate {
                 "simulate".to_string()
             } else {
@@ -1430,6 +1499,7 @@ fn run_status(
             println!("watchdog_status");
             println!("  status: error");
             println!("  exit_code: {}", STATUS_INTERNAL_FAIL);
+            println!("  storage_mode: {}", config.storage_mode_name());
             println!("  db_query_ok: false");
             println!("  hint: run watchdog --doctor for database diagnostics");
         }
@@ -1462,6 +1532,10 @@ fn run_status(
     let nfs_healthy = snapshot
         .and_then(|s| s.get("nfs_healthy"))
         .and_then(Value::as_bool);
+    let local_mode = snapshot
+        .and_then(|s| s.get("local_mode"))
+        .and_then(Value::as_bool)
+        .unwrap_or(config.local_mode);
     let run_mode = fresh_snapshot_run_mode(&snapshot_diag)
         .or_else(|| live_worker_run_mode(&service_state))
         .unwrap_or_else(|| "watchdog".to_string());
@@ -1513,6 +1587,7 @@ fn run_status(
     let result = StatusResult {
         status,
         exit_code,
+        local_mode,
         mode: if simulate {
             "simulate".to_string()
         } else {
@@ -1546,6 +1621,7 @@ fn run_status(
         println!("watchdog_status");
         println!("  status: {}", result.status);
         println!("  exit_code: {}", result.exit_code);
+        println!("  storage_mode: {}", storage_mode_name(result.local_mode));
         println!("  mode: {}", result.mode);
         println!("  run_mode: {}", result.run_mode);
         println!("  paused: {}", result.paused);
@@ -1563,7 +1639,8 @@ fn run_status(
             println!("  current_file: {}", file);
         }
         println!(
-            "  nfs_healthy: {}",
+            "  {}: {}",
+            share_health_text_label(result.local_mode),
             result
                 .nfs_healthy
                 .map(|v| v.to_string())
@@ -1631,6 +1708,8 @@ fn run_doctor(
         let started = std::time::Instant::now();
         let healthy = if simulate {
             true
+        } else if config.local_mode {
+            host_share_root_is_healthy(std::path::Path::new(&share.local_mount))
         } else {
             mount_manager.is_healthy(std::path::Path::new(&share.local_mount))
         };
@@ -1647,6 +1726,7 @@ fn run_doctor(
 
     println!("watchdog_doctor");
     println!("  mode: {}", if simulate { "simulate" } else { "live" });
+    println!("  storage_mode: {}", config.storage_mode_name());
     println!(
         "  config: {}",
         if validation_errors.is_empty() {
@@ -1675,7 +1755,7 @@ fn run_doctor(
                 .unwrap_or_default()
         );
     }
-    println!("  mounts:");
+    println!("  {}:", share_health_section_label(config.local_mode));
     for mount in &mount_checks {
         println!(
             "    - {} [{}]: {} ({} ms)",

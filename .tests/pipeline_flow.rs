@@ -553,6 +553,29 @@ impl MountManager for TestMountManager {
     }
 }
 
+struct CountingMountManager {
+    healthy: bool,
+    remount_success: bool,
+    remount_calls: Arc<AtomicUsize>,
+}
+
+impl MountManager for CountingMountManager {
+    fn is_healthy(&self, _mount_point: &Path) -> bool {
+        self.healthy
+    }
+
+    fn remount(
+        &self,
+        _server: &str,
+        _remote_path: &str,
+        _local_mount: &Path,
+        _share_name: &str,
+    ) -> Result<bool> {
+        self.remount_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(self.remount_success)
+    }
+}
+
 enum InUseMode {
     Never,
     Always,
@@ -757,6 +780,104 @@ async fn dry_run_does_not_mutate_db_or_filesystem() {
     assert!(db.get_recent_transcodes(10).is_empty());
     assert!(fs.has_path(&wd_old));
     assert_eq!(fs.mutation_calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_mode_bypasses_mount_manager_and_scans_successfully() {
+    let mut cfg = base_config();
+    cfg.local_mode = true;
+    cfg.nfs.server.clear();
+    cfg.shares[0].remote_path.clear();
+    cfg.normalize();
+
+    let fs = Arc::new(TestFs::new(&cfg));
+    fs.insert(
+        Path::new("/mnt/movies/Local.Mode.Movie.mkv"),
+        50_000_000,
+        1000.0,
+    );
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let remount_calls = Arc::new(AtomicUsize::new(0));
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(CountingMountManager {
+            healthy: false,
+            remount_success: false,
+            remount_calls: remount_calls.clone(),
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let result = run_pipeline_loop(
+        cfg,
+        PathBuf::from("."),
+        deps,
+        db,
+        state,
+        RunMode::Watchdog,
+        true,
+        false,
+        tx.subscribe(),
+    )
+    .await;
+
+    assert!(result.is_ok());
+    assert_eq!(remount_calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_mode_dry_run_fails_for_inaccessible_share_root_without_remount() {
+    let mut cfg = base_config();
+    cfg.local_mode = true;
+    cfg.nfs.server.clear();
+    cfg.shares[0].remote_path.clear();
+    cfg.normalize();
+
+    let fs = Arc::new(TestFs::new(&cfg));
+    cfg.shares[0].local_mount = "/missing/movies".to_string();
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let remount_calls = Arc::new(AtomicUsize::new(0));
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::TimeoutAlways,
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(CountingMountManager {
+            healthy: false,
+            remount_success: false,
+            remount_calls: remount_calls.clone(),
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let result = run_pipeline_loop(
+        cfg,
+        PathBuf::from("."),
+        deps,
+        db,
+        state,
+        RunMode::Watchdog,
+        true,
+        false,
+        tx.subscribe(),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(remount_calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

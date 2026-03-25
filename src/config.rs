@@ -29,6 +29,9 @@ pub fn bundled_preset_dir(base_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub local_mode: bool,
+
+    #[serde(default)]
     pub nfs: NfsConfig,
 
     #[serde(default)]
@@ -424,6 +427,7 @@ impl Config {
     /// Create a default config (useful for simulation mode).
     pub fn default_config() -> Self {
         let mut config = Config {
+            local_mode: false,
             nfs: NfsConfig::default(),
             shares: vec![
                 ShareConfig {
@@ -508,6 +512,14 @@ impl Config {
         }
     }
 
+    pub fn storage_mode_name(&self) -> &'static str {
+        if self.local_mode {
+            "local"
+        } else {
+            "nfs"
+        }
+    }
+
     /// Validate the config and return any errors.
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
@@ -515,11 +527,14 @@ impl Config {
         if self.shares.is_empty() {
             errors.push("No shares configured".to_string());
         }
+        if !self.local_mode && self.nfs.server.trim().is_empty() {
+            errors.push("nfs.server must not be empty".to_string());
+        }
         for share in &self.shares {
             if share.name.is_empty() {
                 errors.push("Share has empty name".to_string());
             }
-            if share.remote_path.is_empty() {
+            if !self.local_mode && share.remote_path.is_empty() {
                 errors.push(format!("Share '{}' has empty remote_path", share.name));
             }
             if share.local_mount.is_empty() {
@@ -808,6 +823,26 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| e.contains("local_mount must be an absolute path")));
+    }
+
+    #[test]
+    fn test_validate_local_mode_allows_empty_nfs_fields() {
+        let mut cfg = Config::default_config();
+        cfg.local_mode = true;
+        cfg.nfs.server.clear();
+        cfg.shares[0].remote_path.clear();
+
+        let errs = cfg.validate();
+        assert!(!errs.iter().any(|e| e.contains("empty remote_path")));
+    }
+
+    #[test]
+    fn test_validate_nfs_mode_requires_server() {
+        let mut cfg = Config::default_config();
+        cfg.nfs.server.clear();
+
+        let errs = cfg.validate();
+        assert!(errs.iter().any(|e| e.contains("nfs.server")));
     }
 
     #[test]

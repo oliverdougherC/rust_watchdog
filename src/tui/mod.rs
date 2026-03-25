@@ -725,6 +725,10 @@ fn state_from_runtime(
             .get("nfs_healthy")
             .and_then(Value::as_bool)
             .unwrap_or(state.nfs_healthy);
+        state.local_mode = snapshot
+            .get("local_mode")
+            .and_then(Value::as_bool)
+            .unwrap_or(state.local_mode);
         state.simulate_mode = snapshot
             .get("simulate_mode")
             .and_then(Value::as_bool)

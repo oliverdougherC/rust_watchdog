@@ -1,10 +1,10 @@
 # Jellyfin AV1 Transcoding Watchdog
 
-Automated media transcoding pipeline for Jellyfin libraries. Scans NFS-mounted media shares, identifies files that need transcoding (wrong codec or excessive bitrate), transcodes them to AV1 using HandBrakeCLI, verifies the output, and atomically replaces the originals.
+Automated media transcoding pipeline for Jellyfin libraries. Scans either NFS-mounted media shares or local host directories, identifies files that need transcoding (wrong codec or excessive bitrate), transcodes them to AV1 using HandBrakeCLI, verifies the output, and atomically replaces the originals.
 
 ## Features
 
-- **Automatic scanning** of multiple NFS media shares (movies, TV, etc.)
+- **Automatic scanning** of multiple NFS media shares or local media directories
 - **Smart filtering** — skips files already in the target codec and under the bitrate threshold
 - **AV1 transcoding** via HandBrakeCLI with configurable presets
 - **Verification** — checks duration, stream counts, and file health before replacing
@@ -44,7 +44,7 @@ cargo build --release
 
 # Copy and edit the example config
 cp .watchdog/watchdog.toml.example .watchdog/watchdog.toml
-# Edit .watchdog/watchdog.toml with your NFS server, share paths, and preferences
+# Edit .watchdog/watchdog.toml with your NFS server or local media paths and preferences
 # Bundled presets and default runtime state also live under ./.watchdog/
 
 # Dry run — scan and report what would be transcoded
@@ -100,8 +100,8 @@ What it does:
 
 - Creates an isolated sandbox at `.local_tui_run/`
 - Rsync-stages videos in two hops: source -> `ingest_tmp` -> sandbox share path
-- Generates a single-share config pointing only to that sandboxed media dir
-- Launches the TUI with local-mount checks enabled for testing
+- Generates a single-share config with `local_mode = true` pointing only to that sandboxed media dir
+- Launches the TUI against the local-mode config
 - Exercises watchdog's rsync transfer path while transcoding
 
 Optional:
@@ -177,8 +177,9 @@ See [`.watchdog/watchdog.toml.example`](.watchdog/watchdog.toml.example) for a c
 
 The CLI defaults to `.watchdog/watchdog.toml`. If that hidden config is absent, the binary still falls back to a legacy root-level `watchdog.toml`.
 
-- **`[nfs]`** — NFS server IP
-- **`[[shares]]`** — media share definitions (name, remote path, local mount point)
+- **`local_mode`** — when `true`, scan `shares[].local_mount` directly on the host and ignore NFS remount logic
+- **`[nfs]`** — NFS server IP (required only when `local_mode = false`)
+- **`[[shares]]`** — media share definitions (name plus local scan path in `local_mount`; `remote_path` is required only in NFS mode)
 - **`[transcode]`** — codec target, bitrate threshold, HandBrake preset, timeout, stall timeout, retries, and retry-time timeout scaling/caps
 - HandBrake preset JSON files are loaded from the hidden `./.watchdog/presets/` directory
 - **`[scan]`** — video extensions, optional include/exclude globs (path-aware or basename-only patterns), scan interval, per-pass queue cap, optional `probe_workers`
@@ -205,6 +206,20 @@ The CLI defaults to `.watchdog/watchdog.toml`. If that hidden config is absent, 
 The pipeline runs in a loop: **scan** → **filter** → **transcode** → **verify** → **replace** → **wait**.
 
 All external tools (ffprobe, HandBrakeCLI, rsync, mount_nfs) and filesystem operations are abstracted behind traits, enabling full simulation without touching real files.
+
+### Local Mode Example
+
+```toml
+local_mode = true
+
+[nfs]
+server = ""
+
+[[shares]]
+name = "local_movies"
+remote_path = ""
+local_mount = "/Users/you/Videos/Movies"
+```
 
 ## Database
 

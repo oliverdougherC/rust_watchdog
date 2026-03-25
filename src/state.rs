@@ -74,6 +74,7 @@ impl std::fmt::Display for ProgressStage {
 pub struct AppState {
     pub phase: PipelinePhase,
     pub nfs_healthy: bool,
+    pub local_mode: bool,
     pub simulate_mode: bool,
     pub run_mode: RunMode,
 
@@ -133,6 +134,7 @@ impl Default for AppState {
         Self {
             phase: PipelinePhase::Idle,
             nfs_healthy: true,
+            local_mode: false,
             simulate_mode: false,
             run_mode: RunMode::Watchdog,
             current_file: None,
@@ -297,6 +299,12 @@ impl StateManager {
     pub fn set_nfs_healthy(&self, healthy: bool) {
         self.tx.send_modify(|state| {
             state.nfs_healthy = healthy;
+        });
+    }
+
+    pub fn set_local_mode(&self, local_mode: bool) {
+        self.tx.send_modify(|state| {
+            state.local_mode = local_mode;
         });
     }
 
