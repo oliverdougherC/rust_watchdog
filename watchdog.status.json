@@ -1,9 +1,10 @@
 {
-  "timestamp": "2026-03-18T17:43:26.678325+00:00",
+  "timestamp": "2026-03-27T18:45:55.917919+00:00",
   "phase": "Idle",
   "paused": false,
   "nfs_healthy": true,
-  "local_mode": false,
+  "local_mode": true,
+  "local_fs_warnings": [],
   "simulate_mode": true,
   "run_mode": "watchdog",
   "queue_position": 0,
@@ -21,26 +22,29 @@
   "transcode_eta": "",
   "totals": {
     "transcoded": 0,
-    "inspected": 2,
+    "inspected": 0,
     "space_saved_bytes": 0
   },
   "run": {
-    "inspected": 2,
+    "inspected": 0,
     "transcoded": 0,
-    "failures": 2,
+    "failures": 0,
     "retries_scheduled": 0,
     "space_saved_bytes": 0,
     "skipped_inspected": 0,
     "skipped_young": 0,
+    "skipped_temporary": 0,
+    "skipped_unstable": 2,
     "skipped_cooldown": 0,
     "skipped_filtered": 0,
     "skipped_in_use": 0,
+    "skipped_hardlinked": 0,
     "skipped_quarantined": 0
   },
   "reliability": {
     "scan_timeouts": 0,
     "retries_scheduled_total": 0,
-    "last_failure_code": "verification_container_mismatch",
+    "last_failure_code": null,
     "consecutive_pass_failures": 0,
     "auto_paused": false,
     "auto_pause_reason": null,
@@ -48,12 +52,7 @@
     "quarantined_files": 0
   },
   "cooldown_files": 0,
-  "top_failure_reasons": [
-    [
-      "verification_container_mismatch",
-      2
-    ]
-  ],
+  "top_failure_reasons": [],
   "share_health": [
     {
       "name": "movies",
@@ -65,10 +64,5 @@
     }
   ],
   "unhealthy_shares": [],
-  "latest_failure": {
-    "source_path": "/Volumes/JellyfinTV/Breaking.Bad/Season 03/Breaking.Bad.S03E04.mkv",
-    "failure_reason": "verification_container_mismatch",
-    "failure_code": "verification_container_mismatch",
-    "completed_at": "2026-03-18T17:43:26"
-  }
+  "latest_failure": null
 }

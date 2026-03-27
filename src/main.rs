@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use watchdog::config::{Config, DEFAULT_CONFIG_PATH, LEGACY_DEFAULT_CONFIG_PATH};
+use watchdog::config::{
+    path_is_same_or_nested, Config, DEFAULT_CONFIG_PATH, LEGACY_DEFAULT_CONFIG_PATH,
+};
 use watchdog::db::WatchdogDb;
 use watchdog::diagnostics::{log_anyhow_error, print_anyhow_error_report};
 use watchdog::event_journal::{append_event, resolve_event_journal_path};
@@ -70,6 +72,10 @@ struct HealthcheckResult {
     consecutive_pass_failures: u32,
     auto_pause_reason: Option<String>,
     quarantine_count: i64,
+    skipped_temporary: u64,
+    skipped_unstable: u64,
+    skipped_hardlinked: u64,
+    local_fs_warnings: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -125,6 +131,10 @@ struct StatusResult {
     status_freshness: String,
     snapshot_age_seconds: Option<u64>,
     snapshot_path: Option<String>,
+    skipped_temporary: u64,
+    skipped_unstable: u64,
+    skipped_hardlinked: u64,
+    local_fs_warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -133,6 +143,16 @@ struct SnapshotDiagnostics {
     age_seconds: Option<u64>,
     snapshot: Option<Value>,
     snapshot_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalDeploymentDiagnostics {
+    resolved_temp_dir: PathBuf,
+    temp_writable: bool,
+    temp_inside_share_root: bool,
+    temp_fs_type: Option<String>,
+    share_fs_types: Vec<(String, PathBuf, Option<String>)>,
+    local_fs_warnings: Vec<String>,
 }
 
 fn storage_mode_name(local_mode: bool) -> &'static str {
@@ -187,6 +207,187 @@ fn host_share_root_is_healthy(path: &Path) -> bool {
         },
         Err(_) => false,
     }
+}
+
+fn parse_mount_entry(line: &str) -> Option<(PathBuf, String)> {
+    if let Some((_, right)) = line.split_once(" on ") {
+        if let Some((mount, rest)) = right.split_once(" (") {
+            let fs_type = rest
+                .split([',', ')'])
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !fs_type.is_empty() {
+                return Some((PathBuf::from(mount.trim()), fs_type));
+            }
+        }
+        if let Some((mount, rest)) = right.split_once(" type ") {
+            let fs_type = rest
+                .split([' ', '('])
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !fs_type.is_empty() {
+                return Some((PathBuf::from(mount.trim()), fs_type));
+            }
+        }
+    }
+    None
+}
+
+fn filesystem_type_for_path(path: &Path) -> Option<String> {
+    let cmd = Command::new("mount");
+    let out = run_command(
+        cmd,
+        RunOptions {
+            timeout: Some(Duration::from_secs(3)),
+            stdout_limit: 256 * 1024,
+            stderr_limit: 4096,
+            ..RunOptions::default()
+        },
+    )
+    .ok()?;
+    if out.timed_out || !out.status.success() {
+        return None;
+    }
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(parse_mount_entry)
+        .filter(|(mount_point, _)| normalized.starts_with(mount_point))
+        .max_by_key(|(mount_point, _)| mount_point.components().count())
+        .map(|(_, fs_type)| fs_type)
+}
+
+fn is_network_filesystem(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "nfs" | "nfs4" | "smbfs" | "cifs" | "afpfs" | "webdav" | "fuse.sshfs"
+    )
+}
+
+fn path_suggests_download_area(path: &Path) -> bool {
+    let lowered = path.to_string_lossy().to_ascii_lowercase();
+    [
+        "download",
+        "incomplete",
+        "torrent",
+        "qbittorrent",
+        "sabnzbd",
+        "usenet",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn path_is_writable(path: &Path) -> bool {
+    let Some(target) = nearest_existing_path(path) else {
+        return false;
+    };
+    nix::unistd::access(&target, nix::unistd::AccessFlags::W_OK).is_ok()
+}
+
+fn collect_local_deployment_diagnostics(
+    config: &Config,
+    base_dir: &Path,
+) -> LocalDeploymentDiagnostics {
+    let resolved_temp_dir = config.resolve_path(base_dir, &config.paths.transcode_temp);
+    let temp_fs_type = filesystem_type_for_path(&resolved_temp_dir);
+    let temp_writable = path_is_writable(&resolved_temp_dir);
+    let mut local_fs_warnings = Vec::new();
+    let mut share_fs_types = Vec::new();
+    let temp_inside_share_root = config.shares.iter().any(|share| {
+        let root = Path::new(&share.local_mount);
+        path_is_same_or_nested(root, &resolved_temp_dir)
+    });
+
+    for share in &config.shares {
+        let root = PathBuf::from(&share.local_mount);
+        let fs_type = filesystem_type_for_path(&root);
+        if path_suggests_download_area(&root) {
+            local_fs_warnings.push(format!(
+                "share '{}' path looks like a downloads/incomplete area ({})",
+                share.name,
+                root.display()
+            ));
+        }
+        if config.local_mode {
+            if let Some(ref fs_type) = fs_type {
+                if is_network_filesystem(fs_type) {
+                    local_fs_warnings.push(format!(
+                        "local share '{}' is on network filesystem '{}' ({})",
+                        share.name,
+                        fs_type,
+                        root.display()
+                    ));
+                }
+            }
+        }
+        share_fs_types.push((share.name.clone(), root, fs_type));
+    }
+
+    if temp_inside_share_root {
+        local_fs_warnings.push(format!(
+            "transcode temp directory is inside a scanned share root ({})",
+            resolved_temp_dir.display()
+        ));
+    }
+    if config.local_mode {
+        if let Some(ref fs_type) = temp_fs_type {
+            if is_network_filesystem(fs_type) {
+                local_fs_warnings.push(format!(
+                    "local temp directory is on network filesystem '{}' ({})",
+                    fs_type,
+                    resolved_temp_dir.display()
+                ));
+            }
+        }
+    }
+
+    LocalDeploymentDiagnostics {
+        resolved_temp_dir,
+        temp_writable,
+        temp_inside_share_root,
+        temp_fs_type,
+        share_fs_types,
+        local_fs_warnings,
+    }
+}
+
+fn snapshot_run_counter(snapshot: Option<&Value>, key: &str) -> u64 {
+    snapshot
+        .and_then(|s| s.get("run"))
+        .and_then(|run| run.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn snapshot_local_fs_warnings(snapshot: Option<&Value>) -> Vec<String> {
+    snapshot
+        .and_then(|s| s.get("local_fs_warnings"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Parser)]
@@ -530,7 +731,7 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let validation_errors = config.validate();
+    let validation_errors = config.validate_with_base_dir(&base_dir);
     if run_healthcheck_mode && !cli.simulate && !validation_errors.is_empty() {
         for err in &validation_errors {
             error!("Config validation error: {}", err);
@@ -788,6 +989,9 @@ async fn run() -> anyhow::Result<()> {
 
         let (state, _state_rx) = StateManager::new();
         seed_state_from_db(&state, &db, cli.simulate, config.local_mode);
+        state.set_local_fs_warnings(
+            collect_local_deployment_diagnostics(&config, &base_dir).local_fs_warnings,
+        );
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let deps = if cli.simulate {
             create_simulated_deps(&config)
@@ -1207,6 +1411,12 @@ fn run_healthcheck(
             println!("  auto_pause_reason: {}", reason);
         }
         println!("  quarantine_count: {}", result.quarantine_count);
+        println!("  skipped_temporary: {}", result.skipped_temporary);
+        println!("  skipped_unstable: {}", result.skipped_unstable);
+        println!("  skipped_hardlinked: {}", result.skipped_hardlinked);
+        for warning in &result.local_fs_warnings {
+            println!("  local_fs_warning: {}", warning);
+        }
     }
 
     Ok(result.exit_code)
@@ -1226,6 +1436,8 @@ fn evaluate_healthcheck(
     let service_state = db.get_service_state();
     let quarantine_count = db.quarantine_count();
     let snapshot_diag = collect_snapshot_diagnostics(config, base_dir);
+    let deployment_diag = collect_local_deployment_diagnostics(config, base_dir);
+    let snapshot = snapshot_diag.snapshot.as_ref();
     let run_mode = fresh_snapshot_run_mode(&snapshot_diag)
         .or_else(|| live_worker_run_mode(&service_state))
         .unwrap_or_else(|| "watchdog".to_string());
@@ -1288,12 +1500,23 @@ fn evaluate_healthcheck(
         .filter(|s| !s.healthy)
         .map(|s| s.share.clone())
         .collect::<Vec<_>>();
+    let temp_safe = deployment_diag.temp_writable && !deployment_diag.temp_inside_share_root;
+    let local_fs_warnings = if snapshot.is_some() {
+        let from_snapshot = snapshot_local_fs_warnings(snapshot);
+        if from_snapshot.is_empty() {
+            deployment_diag.local_fs_warnings.clone()
+        } else {
+            from_snapshot
+        }
+    } else {
+        deployment_diag.local_fs_warnings.clone()
+    };
 
     let checks = HealthcheckChecks {
         config: true,
         db: db_query_ok,
         dependencies: missing_dependencies.is_empty(),
-        nfs: unhealthy_shares.is_empty(),
+        nfs: unhealthy_shares.is_empty() && temp_safe,
     };
     let exit_code = if !checks.config {
         HC_CONFIG_FAIL
@@ -1335,6 +1558,10 @@ fn evaluate_healthcheck(
         consecutive_pass_failures: service_state.consecutive_pass_failures,
         auto_pause_reason: service_state.auto_pause_reason,
         quarantine_count,
+        skipped_temporary: snapshot_run_counter(snapshot, "skipped_temporary"),
+        skipped_unstable: snapshot_run_counter(snapshot, "skipped_unstable"),
+        skipped_hardlinked: snapshot_run_counter(snapshot, "skipped_hardlinked"),
+        local_fs_warnings,
     }
 }
 
@@ -1492,6 +1719,10 @@ fn run_status(
             status_freshness: "missing".to_string(),
             snapshot_age_seconds: None,
             snapshot_path: None,
+            skipped_temporary: 0,
+            skipped_unstable: 0,
+            skipped_hardlinked: 0,
+            local_fs_warnings: Vec::new(),
         };
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1513,6 +1744,7 @@ fn run_status(
     let service_state = db.get_service_state();
     let quarantine_count = db.quarantine_count();
     let snapshot_diag = collect_snapshot_diagnostics(config, base_dir);
+    let deployment_diag = collect_local_deployment_diagnostics(config, base_dir);
 
     let snapshot = snapshot_diag.snapshot.as_ref();
     let phase = snapshot
@@ -1561,12 +1793,27 @@ fn run_status(
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .or_else(|| latest_failure.and_then(|f| f.failure_code));
+    let local_fs_warnings = {
+        let from_snapshot = snapshot_local_fs_warnings(snapshot);
+        if from_snapshot.is_empty() {
+            deployment_diag.local_fs_warnings.clone()
+        } else {
+            from_snapshot
+        }
+    };
+    let temp_safe = deployment_diag.temp_writable && !deployment_diag.temp_inside_share_root;
 
     let auto_paused = service_state.auto_paused_at.is_some();
     let unhealthy = auto_paused
         || service_state.consecutive_pass_failures
             >= config.safety.max_consecutive_pass_failures.max(1)
-        || nfs_healthy == Some(false);
+        || nfs_healthy == Some(false)
+        || !temp_safe
+        || (config.local_mode
+            && config
+                .shares
+                .iter()
+                .any(|share| !host_share_root_is_healthy(Path::new(&share.local_mount))));
     let degraded = snapshot_diag.freshness == "stale" || snapshot_diag.freshness == "missing";
     let exit_code = if unhealthy {
         STATUS_UNHEALTHY
@@ -1613,6 +1860,10 @@ fn run_status(
         snapshot_path: snapshot_diag
             .snapshot_path
             .map(|p| p.to_string_lossy().to_string()),
+        skipped_temporary: snapshot_run_counter(snapshot, "skipped_temporary"),
+        skipped_unstable: snapshot_run_counter(snapshot, "skipped_unstable"),
+        skipped_hardlinked: snapshot_run_counter(snapshot, "skipped_hardlinked"),
+        local_fs_warnings,
     };
 
     if json_output {
@@ -1667,6 +1918,12 @@ fn run_status(
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "-".to_string())
         );
+        println!("  skipped_temporary: {}", result.skipped_temporary);
+        println!("  skipped_unstable: {}", result.skipped_unstable);
+        println!("  skipped_hardlinked: {}", result.skipped_hardlinked);
+        for warning in &result.local_fs_warnings {
+            println!("  local_fs_warning: {}", warning);
+        }
     }
 
     Ok(exit_code)
@@ -1680,6 +1937,7 @@ fn run_doctor(
     validation_errors: &[String],
 ) -> anyhow::Result<i32> {
     let db_ok = db.healthcheck_query_ok();
+    let deployment_diag = collect_local_deployment_diagnostics(config, base_dir);
     let deps = ["ffprobe", "HandBrakeCLI", "rsync"];
     let dep_results: Vec<DoctorDependency> = deps
         .iter()
@@ -1743,6 +2001,19 @@ fn run_doctor(
             .unwrap_or_else(|_| base_dir.to_path_buf())
             .display()
     );
+    println!(
+        "  resolved_temp_dir: {}",
+        deployment_diag.resolved_temp_dir.display()
+    );
+    println!("  temp_dir_writable: {}", deployment_diag.temp_writable);
+    println!(
+        "  temp_dir_inside_share_root: {}",
+        deployment_diag.temp_inside_share_root
+    );
+    println!(
+        "  temp_dir_fs_type: {}",
+        deployment_diag.temp_fs_type.as_deref().unwrap_or("unknown")
+    );
     println!("  dependencies:");
     for dep in &dep_results {
         println!(
@@ -1757,8 +2028,14 @@ fn run_doctor(
     }
     println!("  {}:", share_health_section_label(config.local_mode));
     for mount in &mount_checks {
+        let fs_type = deployment_diag
+            .share_fs_types
+            .iter()
+            .find(|(name, _, _)| name == &mount.share)
+            .and_then(|(_, _, fs_type)| fs_type.as_deref())
+            .unwrap_or("unknown");
         println!(
-            "    - {} [{}]: {} ({} ms)",
+            "    - {} [{}]: {} ({} ms, fs_type={})",
             mount.share,
             mount.mount,
             if mount.healthy {
@@ -1766,7 +2043,8 @@ fn run_doctor(
             } else {
                 "unhealthy"
             },
-            mount.latency_ms
+            mount.latency_ms,
+            fs_type
         );
     }
     println!("  status_freshness: {}", snapshot_diag.freshness);
@@ -1791,9 +2069,16 @@ fn run_doctor(
             println!("    - {}", err);
         }
     }
+    if !deployment_diag.local_fs_warnings.is_empty() {
+        println!("  local_fs_warnings:");
+        for warning in &deployment_diag.local_fs_warnings {
+            println!("    - {}", warning);
+        }
+    }
 
     let has_missing_deps = dep_results.iter().any(|d| !d.found);
     let has_unhealthy_mounts = mount_checks.iter().any(|m| !m.healthy);
+    let temp_unsafe = !deployment_diag.temp_writable || deployment_diag.temp_inside_share_root;
     let snapshot_degraded =
         !simulate && snapshot_diag.snapshot_path.is_some() && snapshot_diag.freshness != "fresh";
     let safety_trip = service_state.auto_paused_at.is_some()
@@ -1803,6 +2088,7 @@ fn run_doctor(
         || !db_ok
         || has_missing_deps
         || has_unhealthy_mounts
+        || temp_unsafe
         || snapshot_degraded
         || safety_trip;
     println!("  status: {}", if failed { "failed" } else { "ok" });

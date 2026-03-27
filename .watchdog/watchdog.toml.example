@@ -1,17 +1,17 @@
-local_mode = false
+local_mode = true
 
 [nfs]
-server = "192.168.1.244"
+server = ""
 
 [[shares]]
 name = "movies"
-remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/Movies"
-local_mount = "/Volumes/JellyfinMovies"
+remote_path = ""
+local_mount = "/srv/media/Movies"
 
 [[shares]]
 name = "tv"
-remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/TV"
-local_mount = "/Volumes/JellyfinTV"
+remote_path = ""
+local_mount = "/srv/media/TV"
 
 [transcode]
 max_average_bitrate_mbps = 25.0
@@ -35,13 +35,17 @@ max_files_per_pass = 0
 probe_workers = 0
 
 [safety]
-min_file_age_seconds = 0
+min_file_age_seconds = 900
 pause_file = "watchdog.pause"
 max_failures_before_cooldown = 3
 cooldown_base_seconds = 300
 cooldown_max_seconds = 86400
 in_use_guard_enabled = false
 in_use_guard_command = "lsof"
+stable_observations_required = 3
+stable_window_seconds = 900
+protect_hardlinked_files = true
+temporary_suffixes = [".watchdog.tmp", ".watchdog.old", ".!qB", ".part", ".partial", ".tmp"]
 recovery_scan_interval_seconds = 43200
 share_scan_timeout_seconds = 180
 max_consecutive_pass_failures = 3
@@ -66,18 +70,18 @@ events = ["pass_failure_summary", "replacement_summary", "cooldown_alert"]
 timeout_seconds = 5
 
 [paths]
-transcode_temp = "/Volumes/External/tmp/"
+transcode_temp = "tmp"
 database = "watchdog.db"
 log_dir = "logs"
 status_snapshot = ""
 event_journal = ""
 
-# Local-mode example:
-# local_mode = true
+# Advanced NFS example:
+# local_mode = false
 # [nfs]
-# server = ""
+# server = "192.168.1.244"
 #
 # [[shares]]
-# name = "local_movies"
-# remote_path = ""
-# local_mount = "/Users/you/Videos/Movies"
+# name = "movies"
+# remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/Movies"
+# local_mount = "/Volumes/JellyfinMovies"

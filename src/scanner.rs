@@ -135,6 +135,11 @@ impl FileSystem for RealFileSystem {
         Ok(mtime)
     }
 
+    fn link_count(&self, path: &Path) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(path)?.nlink())
+    }
+
     fn exists(&self, path: &Path) -> bool {
         path.exists()
     }

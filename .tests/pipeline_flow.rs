@@ -15,6 +15,7 @@ use watchdog::traits::*;
 struct TestMediaFile {
     size: u64,
     mtime: f64,
+    link_count: u64,
     codec: String,
     format_name: String,
     duration_seconds: f64,
@@ -47,6 +48,7 @@ fn default_media_file(path: &Path, size: u64, mtime: f64) -> TestMediaFile {
     TestMediaFile {
         size,
         mtime,
+        link_count: 1,
         codec: codec.to_string(),
         format_name: format_name_for_path(path),
         duration_seconds: 100.0,
@@ -117,6 +119,12 @@ impl TestFs {
 
     fn get_media(&self, path: &Path) -> Option<TestMediaFile> {
         self.files.lock().unwrap().get(path).cloned()
+    }
+
+    fn set_link_count(&self, path: &Path, link_count: u64) {
+        if let Some(file) = self.files.lock().unwrap().get_mut(path) {
+            file.link_count = link_count;
+        }
     }
 
     fn has_path(&self, path: &Path) -> bool {
@@ -259,6 +267,21 @@ impl FileSystem for FsHandle {
             .unwrap()
             .get(path)
             .map(|v| v.mtime)
+            .ok_or_else(|| {
+                WatchdogError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "not found",
+                ))
+            })
+    }
+
+    fn link_count(&self, path: &Path) -> Result<u64> {
+        self.0
+            .files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|v| v.link_count)
             .ok_or_else(|| {
                 WatchdogError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -624,6 +647,7 @@ impl InUseDetector for TestInUseDetector {
 
 fn base_config() -> Config {
     let mut cfg = Config::default_config();
+    cfg.local_mode = false;
     cfg.transcode.preset_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".watchdog")
         .join("presets")
@@ -639,6 +663,9 @@ fn base_config() -> Config {
     cfg.scan.interval_seconds = 1;
     cfg.transcode.max_retries = 2;
     cfg.transcode.timeout_seconds = 1;
+    cfg.safety.min_file_age_seconds = 0;
+    cfg.safety.stable_observations_required = 1;
+    cfg.safety.stable_window_seconds = 0;
     cfg.normalize();
     cfg
 }
@@ -1754,6 +1781,137 @@ async fn scan_timeout_aborts_pass_before_transcode() {
     .unwrap_err();
     assert!(matches!(err, WatchdogError::ScanTimeout { .. }));
     assert!(db.get_recent_transcodes(10).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unstable_file_is_deferred_until_stable() {
+    let mut cfg = base_config();
+    cfg.safety.stable_observations_required = 2;
+    cfg.safety.stable_window_seconds = 0;
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Settling.File.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let first = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.files_transcoded, 0);
+    assert_eq!(db.get_transcode_count(), 0);
+    assert_eq!(state.snapshot().run_skipped_unstable, 1);
+
+    let second = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.files_transcoded, 1);
+    assert_eq!(db.get_transcode_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hardlinked_file_is_deferred_until_links_drop() {
+    let mut cfg = base_config();
+    cfg.safety.stable_observations_required = 2;
+    cfg.safety.stable_window_seconds = 0;
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Hardlinked.File.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    fs.set_link_count(&source, 2);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let first = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.files_transcoded, 0);
+    assert_eq!(db.get_transcode_count(), 0);
+    assert_eq!(db.quarantine_count(), 0);
+    assert_eq!(state.snapshot().run_skipped_hardlinked, 1);
+
+    fs.set_link_count(&source, 1);
+
+    let second = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.files_transcoded, 0);
+    assert_eq!(db.get_transcode_count(), 0);
+    assert_eq!(state.snapshot().run_skipped_unstable, 1);
+
+    let third = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(third.files_transcoded, 1);
+    assert_eq!(db.get_transcode_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

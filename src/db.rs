@@ -68,6 +68,16 @@ pub struct FileFailureState {
 }
 
 #[derive(Debug, Clone)]
+pub struct FileReadinessState {
+    pub file_path: String,
+    pub last_seen_size: u64,
+    pub last_seen_mtime: f64,
+    pub first_stable_at: i64,
+    pub stable_observations: u32,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct CooldownRecord {
     pub file_path: String,
     pub consecutive_failures: u32,
@@ -254,6 +264,15 @@ impl WatchdogDb {
                 updated_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS file_readiness_state (
+                file_path TEXT PRIMARY KEY,
+                last_seen_size INTEGER NOT NULL,
+                last_seen_mtime REAL NOT NULL,
+                first_stable_at INTEGER NOT NULL,
+                stable_observations INTEGER NOT NULL DEFAULT 1,
+                last_seen_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS file_quarantine (
                 file_path TEXT PRIMARY KEY,
                 quarantined_at TEXT NOT NULL,
@@ -294,6 +313,9 @@ impl WatchdogDb {
 
             CREATE INDEX IF NOT EXISTS idx_file_failure_state_next_eligible_at
                 ON file_failure_state (next_eligible_at);
+
+            CREATE INDEX IF NOT EXISTS idx_file_readiness_state_last_seen_at
+                ON file_readiness_state (last_seen_at);
 
             CREATE INDEX IF NOT EXISTS idx_file_quarantine_quarantined_at
                 ON file_quarantine (quarantined_at DESC);
@@ -523,6 +545,107 @@ impl WatchdogDb {
         )
         .optional()
         .unwrap_or(None)
+    }
+
+    pub fn get_file_readiness_state(&self, path: &str) -> Option<FileReadinessState> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT file_path, last_seen_size, last_seen_mtime, first_stable_at, stable_observations, last_seen_at
+             FROM file_readiness_state WHERE file_path = ?1",
+            params![path],
+            |row| {
+                Ok(FileReadinessState {
+                    file_path: row.get(0)?,
+                    last_seen_size: row.get::<_, i64>(1)?.max(0) as u64,
+                    last_seen_mtime: row.get(2)?,
+                    first_stable_at: row.get(3)?,
+                    stable_observations: row.get::<_, i64>(4)?.max(0) as u32,
+                    last_seen_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .unwrap_or(None)
+    }
+
+    pub fn record_file_readiness_observation(
+        &self,
+        path: &str,
+        size: u64,
+        mtime: f64,
+        now_ts: i64,
+    ) -> Option<FileReadinessState> {
+        let conn = self.lock();
+        let previous = conn
+            .query_row(
+                "SELECT file_path, last_seen_size, last_seen_mtime, first_stable_at, stable_observations, last_seen_at
+                 FROM file_readiness_state WHERE file_path = ?1",
+                params![path],
+                |row| {
+                    Ok(FileReadinessState {
+                        file_path: row.get(0)?,
+                        last_seen_size: row.get::<_, i64>(1)?.max(0) as u64,
+                        last_seen_mtime: row.get(2)?,
+                        first_stable_at: row.get(3)?,
+                        stable_observations: row.get::<_, i64>(4)?.max(0) as u32,
+                        last_seen_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .unwrap_or(None);
+        let (first_stable_at, stable_observations) = match previous.as_ref() {
+            Some(previous)
+                if previous.last_seen_size == size
+                    && (previous.last_seen_mtime - mtime).abs() < 1.0 =>
+            {
+                (
+                    previous.first_stable_at.max(0),
+                    previous.stable_observations.saturating_add(1),
+                )
+            }
+            _ => (now_ts, 1),
+        };
+        if let Err(e) = conn.execute(
+            "INSERT INTO file_readiness_state
+             (file_path, last_seen_size, last_seen_mtime, first_stable_at, stable_observations, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_path) DO UPDATE SET
+                 last_seen_size=excluded.last_seen_size,
+                 last_seen_mtime=excluded.last_seen_mtime,
+                 first_stable_at=excluded.first_stable_at,
+                 stable_observations=excluded.stable_observations,
+                 last_seen_at=excluded.last_seen_at",
+            params![
+                path,
+                size as i64,
+                mtime,
+                first_stable_at,
+                stable_observations as i64,
+                now_ts,
+            ],
+        ) {
+            error!("DB error in record_file_readiness_observation('{}'): {}", path, e);
+            return None;
+        }
+        Some(FileReadinessState {
+            file_path: path.to_string(),
+            last_seen_size: size,
+            last_seen_mtime: mtime,
+            first_stable_at,
+            stable_observations,
+            last_seen_at: now_ts,
+        })
+    }
+
+    pub fn clear_file_readiness_state(&self, path: &str) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "DELETE FROM file_readiness_state WHERE file_path = ?1",
+            params![path],
+        ) {
+            error!("DB error in clear_file_readiness_state('{}'): {}", path, e);
+        }
     }
 
     /// Clear file failure-state after successful replacement.
@@ -1087,6 +1210,16 @@ impl WatchdogDb {
         }
     }
 
+    pub fn defer_queue_item(&self, source_path: &str) {
+        let conn = self.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE queue_items SET started_at = NULL WHERE source_path = ?1",
+            params![source_path],
+        ) {
+            error!("DB error in defer_queue_item('{}'): {}", source_path, e);
+        }
+    }
+
     pub fn mark_queue_item_started(&self, source_path: &str) {
         let conn = self.lock();
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -1517,6 +1650,7 @@ impl WatchdogDb {
             "inspected_files",
             "space_saved_log",
             "file_failure_state",
+            "file_readiness_state",
             "file_quarantine",
             "service_state",
             "queue_items",
@@ -1545,6 +1679,9 @@ impl WatchdogDb {
             ("file_failure_state", "file_path"),
             ("file_failure_state", "next_eligible_at"),
             ("file_failure_state", "last_failure_code"),
+            ("file_readiness_state", "file_path"),
+            ("file_readiness_state", "stable_observations"),
+            ("file_readiness_state", "last_seen_at"),
             ("file_quarantine", "file_path"),
             ("file_quarantine", "manual_clear_required"),
             ("service_state", "consecutive_pass_failures"),

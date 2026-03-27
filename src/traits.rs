@@ -114,6 +114,9 @@ pub trait FileSystem: Send + Sync {
     /// Get file modification time as fractional seconds since epoch.
     fn file_mtime(&self, path: &Path) -> Result<f64>;
 
+    /// Get the hardlink count for a file.
+    fn link_count(&self, path: &Path) -> Result<u64>;
+
     /// Check if a path exists.
     fn exists(&self, path: &Path) -> bool;
 

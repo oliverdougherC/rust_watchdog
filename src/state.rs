@@ -106,9 +106,12 @@ pub struct AppState {
     pub run_space_saved: i64,
     pub run_skipped_inspected: u64,
     pub run_skipped_young: u64,
+    pub run_skipped_temporary: u64,
+    pub run_skipped_unstable: u64,
     pub run_skipped_cooldown: u64,
     pub run_skipped_filtered: u64,
     pub run_skipped_in_use: u64,
+    pub run_skipped_hardlinked: u64,
     pub run_skipped_quarantined: u64,
     pub scan_timeout_count: u64,
     pub consecutive_pass_failures: u32,
@@ -121,6 +124,7 @@ pub struct AppState {
     pub top_failure_reasons: Vec<(String, u64)>,
     pub last_failure_code: Option<String>,
     pub share_health: Vec<(String, bool)>,
+    pub local_fs_warnings: Vec<String>,
 
     // Timing
     pub last_pass_time: Option<DateTime<Utc>>,
@@ -160,9 +164,12 @@ impl Default for AppState {
             run_space_saved: 0,
             run_skipped_inspected: 0,
             run_skipped_young: 0,
+            run_skipped_temporary: 0,
+            run_skipped_unstable: 0,
             run_skipped_cooldown: 0,
             run_skipped_filtered: 0,
             run_skipped_in_use: 0,
+            run_skipped_hardlinked: 0,
             run_skipped_quarantined: 0,
             scan_timeout_count: 0,
             consecutive_pass_failures: 0,
@@ -173,6 +180,7 @@ impl Default for AppState {
             top_failure_reasons: Vec::new(),
             last_failure_code: None,
             share_health: Vec::new(),
+            local_fs_warnings: Vec::new(),
             last_pass_time: None,
             log_lines: VecDeque::with_capacity(500),
         }
@@ -312,6 +320,12 @@ impl StateManager {
     pub fn set_share_health(&self, share_health: Vec<(String, bool)>) {
         self.tx.send_modify(|state| {
             state.share_health = share_health;
+        });
+    }
+
+    pub fn set_local_fs_warnings(&self, warnings: Vec<String>) {
+        self.tx.send_modify(|state| {
+            state.local_fs_warnings = warnings;
         });
     }
 

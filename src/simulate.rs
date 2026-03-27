@@ -271,6 +271,17 @@ impl FileSystem for SimulatedFileSystem {
         })
     }
 
+    fn link_count(&self, path: &Path) -> Result<u64> {
+        if self.find_file(path).is_some() {
+            Ok(1)
+        } else {
+            Err(crate::error::WatchdogError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "simulated file not found",
+            )))
+        }
+    }
+
     fn exists(&self, path: &Path) -> bool {
         self.find_file(path).is_some()
     }
@@ -641,6 +652,9 @@ impl FileSystem for SimulatedFileSystemWrapper {
     }
     fn file_mtime(&self, path: &Path) -> Result<f64> {
         self.0.file_mtime(path)
+    }
+    fn link_count(&self, path: &Path) -> Result<u64> {
+        self.0.link_count(path)
     }
     fn exists(&self, path: &Path) -> bool {
         self.0.exists(path)

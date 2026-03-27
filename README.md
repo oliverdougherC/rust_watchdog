@@ -1,10 +1,10 @@
 # Jellyfin AV1 Transcoding Watchdog
 
-Automated media transcoding pipeline for Jellyfin libraries. Scans either NFS-mounted media shares or local host directories, identifies files that need transcoding (wrong codec or excessive bitrate), transcodes them to AV1 using HandBrakeCLI, verifies the output, and atomically replaces the originals.
+Automated media transcoding pipeline for Jellyfin libraries. It is now tuned primarily for local library roots, with conservative safety defaults for deployments that live next to an *arr stack. It scans media directories, identifies files that need transcoding (wrong codec or excessive bitrate), transcodes them to AV1 using HandBrakeCLI, verifies the output, and atomically replaces the originals.
 
 ## Features
 
-- **Automatic scanning** of multiple NFS media shares or local media directories
+- **Automatic scanning** of multiple local media directories or NFS media shares
 - **Smart filtering** — skips files already in the target codec and under the bitrate threshold
 - **AV1 transcoding** via HandBrakeCLI with configurable presets
 - **Verification** — checks duration, stream counts, and file health before replacing
@@ -14,7 +14,7 @@ Automated media transcoding pipeline for Jellyfin libraries. Scans either NFS-mo
 - **Headless mode** — log-to-stdout for running as a system service
 - **Simulation mode** — test the full pipeline with fake data, no real files needed
 - **Graceful shutdown** — responds to SIGTERM/SIGINT, cleans up in-progress work
-- **Safety controls** — min file age, pause file, cooldown/backoff for repeatedly failing files
+- **Safety controls** — min file age, persistent readiness tracking, temporary-file deferral, hardlink protection, pause file, cooldown/backoff for repeatedly failing files
 - **Safety tripwire** — auto-pauses the pipeline after consecutive pass-level failures
 - **Failure quarantine** — isolates repeatedly failing files until manually cleared
 - **Healthcheck mode** — fast read-only status for service supervisors (`--healthcheck`, `--healthcheck-json`)
@@ -31,7 +31,7 @@ Automated media transcoding pipeline for Jellyfin libraries. Scans either NFS-mo
 - **HandBrakeCLI** — for AV1 transcoding
 - **ffprobe** — for media metadata inspection (part of FFmpeg)
 - **rsync** — for file transfers
-- **macOS** — uses `mount_nfs` for NFS management (Linux support would need a small adapter)
+- **macOS** — local mode is fully supported; NFS mode uses `mount_nfs` (Linux support would need a small adapter)
 
 ## Quick Start
 
@@ -44,7 +44,9 @@ cargo build --release
 
 # Copy and edit the example config
 cp .watchdog/watchdog.toml.example .watchdog/watchdog.toml
-# Edit .watchdog/watchdog.toml with your NFS server or local media paths and preferences
+# Edit .watchdog/watchdog.toml with your local library roots and preferences
+# Keep transcode_temp outside any scanned library root
+# Point watchdog at final library roots, not download or incomplete directories
 # Bundled presets and default runtime state also live under ./.watchdog/
 
 # Dry run — scan and report what would be transcoded
@@ -177,14 +179,23 @@ See [`.watchdog/watchdog.toml.example`](.watchdog/watchdog.toml.example) for a c
 
 The CLI defaults to `.watchdog/watchdog.toml`. If that hidden config is absent, the binary still falls back to a legacy root-level `watchdog.toml`.
 
-- **`local_mode`** — when `true`, scan `shares[].local_mount` directly on the host and ignore NFS remount logic
-- **`[nfs]`** — NFS server IP (required only when `local_mode = false`)
+- **`local_mode`** — local-first default; scan `shares[].local_mount` directly on the host and ignore NFS remount logic
+- **`[nfs]`** — NFS server IP (required only for advanced NFS deployments when `local_mode = false`)
 - **`[[shares]]`** — media share definitions (name plus local scan path in `local_mount`; `remote_path` is required only in NFS mode)
 - **`[transcode]`** — codec target, bitrate threshold, HandBrake preset, timeout, stall timeout, retries, and retry-time timeout scaling/caps
 - HandBrake preset JSON files are loaded from the hidden `./.watchdog/presets/` directory
 - **`[scan]`** — video extensions, optional include/exclude globs (path-aware or basename-only patterns), scan interval, per-pass queue cap, optional `probe_workers`
-- **`[safety]`** — min file age, pause file path, failure cooldown policy, pass-failure tripwire thresholds, quarantine thresholds/codes, optional in-use guard command, periodic recovery scan interval, bounded share scan timeout, status snapshot freshness threshold
+- **`[safety]`** — min file age, stable observation count/window, temporary suffix deferrals, hardlink protection, pause file path, failure cooldown policy, pass-failure tripwire thresholds, quarantine thresholds/codes, optional in-use guard command, periodic recovery scan interval, bounded share scan timeout, status snapshot freshness threshold
 - **`[paths]`** — temp directory for transcoding, database location, optional status snapshot output path, optional NDJSON event journal path
+- The default `transcode_temp = "tmp"` resolves next to the config/app directory and is rejected if it points inside a scanned share root
+
+## Deploying Beside an *Arr Stack
+
+- Watch final library roots only. Do not watch qBittorrent, sabnzbd, incomplete, or staging directories.
+- The default readiness gate waits for files to age, remain unchanged across multiple observations, and stay stable for a full window before they are eligible.
+- Hardlinked files are deferred until their link count drops back to `1`, which protects common *arr seeding and post-import layouts.
+- Temporary/import artifacts matching configured suffixes are deferred automatically.
+- Local mode is the recommended deployment model. NFS is still supported, but it is treated as an advanced setup rather than the primary path.
 - **`[notify]`** — optional webhook notifications (`pass_failure_summary`, `replacement_summary`, `cooldown_alert`)
 
 ## TUI Controls
@@ -216,19 +227,34 @@ local_mode = true
 server = ""
 
 [[shares]]
-name = "local_movies"
+name = "movies"
 remote_path = ""
-local_mount = "/Users/you/Videos/Movies"
+local_mount = "/srv/media/Movies"
+```
+
+### Advanced NFS Example
+
+```toml
+local_mode = false
+
+[nfs]
+server = "192.168.1.244"
+
+[[shares]]
+name = "movies"
+remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/Movies"
+local_mount = "/Volumes/JellyfinMovies"
 ```
 
 ## Database
 
-Uses SQLite (WAL mode) with seven primary tables:
+Uses SQLite (WAL mode) with eight primary tables:
 
 - `inspected_files` — tracks which files have been checked (by path + size + mtime)
 - `transcode_history` — full record of every transcode attempt (human `failure_reason` + machine `failure_code`)
 - `space_saved_log` — timeseries of cumulative space savings
 - `file_failure_state` — per-file retry/cooldown and last failure code tracking
+- `file_readiness_state` — persistent file stability observations used to defer settling files safely
 - `queue_items` — durable pending/active queue rows with preset snapshots
 - `file_quarantine` / `service_state` — quarantine set and pass-level safety tripwire state
 

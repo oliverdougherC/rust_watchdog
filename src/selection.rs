@@ -270,6 +270,17 @@ mod tests {
                 })
         }
 
+        fn link_count(&self, path: &Path) -> Result<u64> {
+            if self.files.lock().unwrap().contains_key(path) {
+                Ok(1)
+            } else {
+                Err(WatchdogError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing",
+                )))
+            }
+        }
+
         fn exists(&self, path: &Path) -> bool {
             self.files.lock().unwrap().contains_key(path)
         }

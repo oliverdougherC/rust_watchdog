@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::{NewQueueItem, QueueRecord, TranscodeOutcome, WatchdogDb};
+use crate::db::{FileReadinessState, NewQueueItem, QueueRecord, TranscodeOutcome, WatchdogDb};
 use crate::error::{Result, WatchdogError};
 use crate::event_journal::{append_event, append_log_event, resolve_event_journal_path};
 use crate::nfs::ensure_all_mounts;
@@ -23,7 +23,7 @@ use std::collections::BinaryHeap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
@@ -38,10 +38,38 @@ const FAILURE_CODE_AUTO_PAUSED_SAFETY_TRIP: &str = "auto_paused_safety_trip";
 enum SkipReason {
     Inspected,
     Young,
+    Temporary,
+    Unstable,
     Cooldown,
     Filtered,
     InUse,
+    Hardlinked,
     Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessDeferredReason {
+    Young,
+    Temporary,
+    Unstable,
+    Hardlinked,
+}
+
+impl ReadinessDeferredReason {
+    fn skip_reason(self) -> SkipReason {
+        match self {
+            Self::Young => SkipReason::Young,
+            Self::Temporary => SkipReason::Temporary,
+            Self::Unstable => SkipReason::Unstable,
+            Self::Hardlinked => SkipReason::Hardlinked,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReadinessDecision {
+    deferred: Option<ReadinessDeferredReason>,
+    link_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -214,6 +242,134 @@ fn preset_contract_cache_key(
     )
 }
 
+fn hardlink_transition_cache() -> &'static Mutex<HashMap<String, u64>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn basename_matches_temporary_suffix(config: &Config, path: &Path) -> Option<String> {
+    let basename = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    config
+        .safety
+        .temporary_suffixes
+        .iter()
+        .find(|suffix| basename.ends_with(&suffix.to_ascii_lowercase()))
+        .cloned()
+}
+
+fn evaluate_file_readiness(
+    config: &Config,
+    deps: &PipelineDeps,
+    db: &WatchdogDb,
+    path: &Path,
+    size: u64,
+    mtime: f64,
+    now_ts: i64,
+) -> ReadinessDecision {
+    if basename_matches_temporary_suffix(config, path).is_some() {
+        return ReadinessDecision {
+            deferred: Some(ReadinessDeferredReason::Temporary),
+            link_count: None,
+        };
+    }
+
+    let path_key = path.to_string_lossy().to_string();
+    let link_count = if config.safety.protect_hardlinked_files {
+        deps.fs.link_count(path).ok()
+    } else {
+        None
+    };
+    if let Some(link_count) = link_count {
+        if link_count > 1 {
+            db.clear_file_readiness_state(&path_key);
+            return ReadinessDecision {
+                deferred: Some(ReadinessDeferredReason::Hardlinked),
+                link_count: Some(link_count),
+            };
+        }
+    }
+
+    let readiness = db
+        .record_file_readiness_observation(&path_key, size, mtime, now_ts)
+        .unwrap_or(FileReadinessState {
+            file_path: path_key,
+            last_seen_size: size,
+            last_seen_mtime: mtime,
+            first_stable_at: now_ts,
+            stable_observations: 1,
+            last_seen_at: now_ts,
+        });
+    let _ = (
+        &readiness.file_path,
+        readiness.last_seen_size,
+        readiness.last_seen_mtime,
+        readiness.last_seen_at,
+    );
+    let file_age_secs = now_ts.saturating_sub(mtime.floor() as i64).max(0) as u64;
+    if file_age_secs < config.safety.min_file_age_seconds {
+        return ReadinessDecision {
+            deferred: Some(ReadinessDeferredReason::Young),
+            link_count: None,
+        };
+    }
+
+    let stable_for_seconds = now_ts.saturating_sub(readiness.first_stable_at).max(0) as u64;
+    let observations_ok =
+        readiness.stable_observations >= config.safety.stable_observations_required.max(1);
+    let window_ok = stable_for_seconds >= config.safety.stable_window_seconds;
+    if !observations_ok || !window_ok {
+        return ReadinessDecision {
+            deferred: Some(ReadinessDeferredReason::Unstable),
+            link_count,
+        };
+    }
+
+    ReadinessDecision {
+        deferred: None,
+        link_count,
+    }
+}
+
+fn clear_hardlink_transition(path: &str) {
+    if let Ok(mut cache) = hardlink_transition_cache().lock() {
+        cache.remove(path);
+    }
+}
+
+fn maybe_emit_hardlink_deferral(
+    config: &Config,
+    base_dir: &Path,
+    state: &StateManager,
+    path: &str,
+    link_count: u64,
+    stage: &str,
+) {
+    let mut should_emit = false;
+    if let Ok(mut cache) = hardlink_transition_cache().lock() {
+        let entry = cache.insert(path.to_string(), link_count);
+        should_emit = entry != Some(link_count);
+    }
+    if should_emit {
+        let message = format!(
+            "Deferred hardlinked file until link count returns to 1: {} [{} links, {}]",
+            path, link_count, stage
+        );
+        warn!("{}", message);
+        tui_log(state, "WARN", &message);
+        emit_event(
+            config,
+            base_dir,
+            "readiness_deferred",
+            json!({
+                "path": path,
+                "reason": "hardlinked",
+                "link_count": link_count,
+                "stage": stage,
+            }),
+        );
+    }
+}
+
 fn build_local_temp_paths(
     temp_dir: &Path,
     share_name: &str,
@@ -369,13 +525,29 @@ fn queue_row_to_candidate(
     }
     if let Some(failure_state) = db.get_file_failure_state(&record.source_path) {
         if failure_state.next_eligible_at > chrono::Utc::now().timestamp() {
-            db.remove_queue_item(&record.source_path);
+            db.defer_queue_item(&record.source_path);
             return None;
         }
     }
-    let file_age_secs = (chrono::Utc::now().timestamp() as f64 - mtime).max(0.0);
-    if file_age_secs < config.safety.min_file_age_seconds as f64 {
-        db.remove_queue_item(&record.source_path);
+    let readiness = evaluate_file_readiness(
+        config,
+        deps,
+        db.as_ref(),
+        &path,
+        size,
+        mtime,
+        chrono::Utc::now().timestamp(),
+    );
+    apply_readiness_deferral(
+        config,
+        base_dir,
+        state,
+        &record.source_path,
+        &readiness,
+        "queue_refresh",
+    );
+    if readiness.deferred.is_some() {
+        db.defer_queue_item(&record.source_path);
         return None;
     }
 
@@ -523,6 +695,33 @@ fn enqueue_queue_candidates(
     db.enqueue_queue_items(&items)
 }
 
+fn apply_readiness_deferral(
+    config: &Config,
+    base_dir: &Path,
+    state: &StateManager,
+    path_str: &str,
+    decision: &ReadinessDecision,
+    stage: &str,
+) {
+    if let Some(reason) = decision.deferred {
+        increment_skip_counter(state, reason.skip_reason());
+        if reason == ReadinessDeferredReason::Hardlinked {
+            maybe_emit_hardlink_deferral(
+                config,
+                base_dir,
+                state,
+                path_str,
+                decision.link_count.unwrap_or(0),
+                stage,
+            );
+        } else {
+            clear_hardlink_transition(path_str);
+        }
+    } else {
+        clear_hardlink_transition(path_str);
+    }
+}
+
 fn reset_run_state(state: &StateManager, db: &Arc<WatchdogDb>) {
     state.set_current_file(None);
     state.reset_file_progress();
@@ -534,9 +733,12 @@ fn reset_run_state(state: &StateManager, db: &Arc<WatchdogDb>) {
         s.run_space_saved = 0;
         s.run_skipped_inspected = 0;
         s.run_skipped_young = 0;
+        s.run_skipped_temporary = 0;
+        s.run_skipped_unstable = 0;
         s.run_skipped_cooldown = 0;
         s.run_skipped_filtered = 0;
         s.run_skipped_in_use = 0;
+        s.run_skipped_hardlinked = 0;
         s.run_skipped_quarantined = 0;
         s.quarantined_files = db.quarantine_count().max(0) as u64;
     });
@@ -943,13 +1145,20 @@ pub async fn run_watchdog_pass(
                 continue;
             }
 
-            let file_age_secs = (now_ts as f64 - entry.mtime).max(0.0);
-            if file_age_secs < config.safety.min_file_age_seconds as f64 {
-                increment_skip_counter(state, SkipReason::Young);
+            let path_string = entry.path.to_string_lossy().to_string();
+            let readiness = evaluate_file_readiness(
+                config,
+                deps,
+                db.as_ref(),
+                &entry.path,
+                entry.size,
+                entry.mtime,
+                now_ts,
+            );
+            apply_readiness_deferral(config, base_dir, state, &path_string, &readiness, "scan");
+            if readiness.deferred.is_some() {
                 continue;
             }
-
-            let path_string = entry.path.to_string_lossy().to_string();
             if db.is_quarantined(&path_string) {
                 increment_skip_counter(state, SkipReason::Quarantined);
                 if !dry_run {
@@ -1275,8 +1484,47 @@ async fn process_transcode_queue(
         state.set_queue_info(processed, progress_total as u32);
         state.reset_file_progress();
 
+        let live_size = match deps.fs.file_size(path) {
+            Ok(size) => size,
+            Err(err) => {
+                warn!(
+                    "Failed to stat queued file before import {}: {}",
+                    path_str, err
+                );
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
+                continue;
+            }
+        };
+        let live_mtime = match deps.fs.file_mtime(path) {
+            Ok(mtime) => mtime,
+            Err(err) => {
+                warn!(
+                    "Failed to read queued file mtime before import {}: {}",
+                    path_str, err
+                );
+                db.remove_queue_item(&path_str);
+                outstanding_paths.remove(path);
+                continue;
+            }
+        };
+        let readiness = evaluate_file_readiness(
+            config,
+            deps,
+            db.as_ref(),
+            path,
+            live_size,
+            live_mtime,
+            chrono::Utc::now().timestamp(),
+        );
+        apply_readiness_deferral(config, base_dir, state, &path_str, &readiness, "pre_import");
+        if readiness.deferred.is_some() {
+            db.defer_queue_item(&path_str);
+            continue;
+        }
+
         let transcode_start = Instant::now();
-        let original_size = deps.fs.file_size(path).unwrap_or(entry.size) as i64;
+        let original_size = live_size as i64;
         let db_row_id = match db.record_transcode_start(
             &path_str,
             share_name,
@@ -2857,9 +3105,12 @@ fn increment_skip_counter(state: &StateManager, reason: SkipReason) {
     state.update(|s| match reason {
         SkipReason::Inspected => s.run_skipped_inspected += 1,
         SkipReason::Young => s.run_skipped_young += 1,
+        SkipReason::Temporary => s.run_skipped_temporary += 1,
+        SkipReason::Unstable => s.run_skipped_unstable += 1,
         SkipReason::Cooldown => s.run_skipped_cooldown += 1,
         SkipReason::Filtered => s.run_skipped_filtered += 1,
         SkipReason::InUse => s.run_skipped_in_use += 1,
+        SkipReason::Hardlinked => s.run_skipped_hardlinked += 1,
         SkipReason::Quarantined => s.run_skipped_quarantined += 1,
     });
 }

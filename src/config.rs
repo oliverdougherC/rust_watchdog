@@ -1,5 +1,6 @@
 use crate::error::{Result, WatchdogError};
 use serde::Deserialize;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub const APP_DIR_NAME: &str = ".watchdog";
@@ -28,7 +29,7 @@ pub fn bundled_preset_dir(base_dir: &Path) -> PathBuf {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default = "default_local_mode")]
     pub local_mode: bool,
 
     #[serde(default)]
@@ -69,6 +70,10 @@ impl Default for NfsConfig {
 
 fn default_nfs_server() -> String {
     "192.168.1.244".to_string()
+}
+
+fn default_local_mode() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +242,18 @@ pub struct SafetyConfig {
     #[serde(default = "default_in_use_guard_command")]
     pub in_use_guard_command: String,
 
+    #[serde(default = "default_stable_observations_required")]
+    pub stable_observations_required: u32,
+
+    #[serde(default = "default_stable_window_seconds")]
+    pub stable_window_seconds: u64,
+
+    #[serde(default = "default_protect_hardlinked_files")]
+    pub protect_hardlinked_files: bool,
+
+    #[serde(default = "default_temporary_suffixes")]
+    pub temporary_suffixes: Vec<String>,
+
     #[serde(default = "default_recovery_scan_interval_seconds")]
     pub recovery_scan_interval_seconds: u64,
 
@@ -269,6 +286,10 @@ impl Default for SafetyConfig {
             cooldown_max_seconds: default_cooldown_max_seconds(),
             in_use_guard_enabled: false,
             in_use_guard_command: default_in_use_guard_command(),
+            stable_observations_required: default_stable_observations_required(),
+            stable_window_seconds: default_stable_window_seconds(),
+            protect_hardlinked_files: default_protect_hardlinked_files(),
+            temporary_suffixes: default_temporary_suffixes(),
             recovery_scan_interval_seconds: default_recovery_scan_interval_seconds(),
             share_scan_timeout_seconds: default_share_scan_timeout_seconds(),
             max_consecutive_pass_failures: default_max_consecutive_pass_failures(),
@@ -281,7 +302,7 @@ impl Default for SafetyConfig {
 }
 
 fn default_min_file_age_seconds() -> u64 {
-    0
+    900
 }
 fn default_pause_file() -> String {
     "watchdog.pause".to_string()
@@ -297,6 +318,29 @@ fn default_cooldown_max_seconds() -> u64 {
 }
 fn default_in_use_guard_command() -> String {
     "lsof".to_string()
+}
+
+fn default_stable_observations_required() -> u32 {
+    3
+}
+
+fn default_stable_window_seconds() -> u64 {
+    900
+}
+
+fn default_protect_hardlinked_files() -> bool {
+    true
+}
+
+fn default_temporary_suffixes() -> Vec<String> {
+    vec![
+        ".watchdog.tmp".to_string(),
+        ".watchdog.old".to_string(),
+        ".!qB".to_string(),
+        ".part".to_string(),
+        ".partial".to_string(),
+        ".tmp".to_string(),
+    ]
 }
 fn default_recovery_scan_interval_seconds() -> u64 {
     43_200
@@ -402,13 +446,48 @@ impl Default for PathsConfig {
 }
 
 fn default_transcode_temp() -> String {
-    "/Volumes/External/tmp/".to_string()
+    "tmp".to_string()
 }
 fn default_database() -> String {
     "watchdog.db".to_string()
 }
 fn default_log_dir() -> String {
     "logs".to_string()
+}
+
+fn normalize_absoluteish_path(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+pub fn resolve_path_for_containment(path: &Path) -> PathBuf {
+    let normalized = normalize_absoluteish_path(path);
+    let mut existing = normalized.clone();
+    let mut missing_suffix: Vec<OsString> = Vec::new();
+
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return normalized;
+        };
+        missing_suffix.push(name.to_os_string());
+        if !existing.pop() {
+            return normalized;
+        }
+    }
+
+    let mut resolved = existing
+        .canonicalize()
+        .map(|path| normalize_absoluteish_path(&path))
+        .unwrap_or_else(|_| normalize_absoluteish_path(&existing));
+    for segment in missing_suffix.iter().rev() {
+        resolved.push(segment);
+    }
+    normalize_absoluteish_path(&resolved)
+}
+
+pub fn path_is_same_or_nested(container: &Path, candidate: &Path) -> bool {
+    let resolved_container = resolve_path_for_containment(container);
+    let resolved_candidate = resolve_path_for_containment(candidate);
+    resolved_candidate == resolved_container || resolved_candidate.starts_with(&resolved_container)
 }
 
 impl Config {
@@ -427,18 +506,18 @@ impl Config {
     /// Create a default config (useful for simulation mode).
     pub fn default_config() -> Self {
         let mut config = Config {
-            local_mode: false,
+            local_mode: default_local_mode(),
             nfs: NfsConfig::default(),
             shares: vec![
                 ShareConfig {
                     name: "movies".to_string(),
-                    remote_path: "/mnt/DataStore/share/jellyfin/jfmedia/Movies".to_string(),
-                    local_mount: "/Volumes/JellyfinMovies".to_string(),
+                    remote_path: String::new(),
+                    local_mount: "/Users/Shared/Media/Movies".to_string(),
                 },
                 ShareConfig {
                     name: "tv".to_string(),
-                    remote_path: "/mnt/DataStore/share/jellyfin/jfmedia/TV".to_string(),
-                    local_mount: "/Volumes/JellyfinTV".to_string(),
+                    remote_path: String::new(),
+                    local_mount: "/Users/Shared/Media/TV".to_string(),
                 },
             ],
             transcode: TranscodeConfig::default(),
@@ -453,6 +532,11 @@ impl Config {
 
     /// Normalize values to make matching deterministic across user styles.
     pub fn normalize(&mut self) {
+        for share in &mut self.shares {
+            share.name = share.name.trim().to_string();
+            share.remote_path = share.remote_path.trim().to_string();
+            share.local_mount = share.local_mount.trim().to_string();
+        }
         self.transcode.target_codec = self.transcode.target_codec.trim().to_lowercase();
         self.scan.video_extensions = self
             .scan
@@ -483,6 +567,13 @@ impl Config {
             .collect();
         self.safety.pause_file = self.safety.pause_file.trim().to_string();
         self.safety.in_use_guard_command = self.safety.in_use_guard_command.trim().to_string();
+        self.safety.temporary_suffixes = self
+            .safety
+            .temporary_suffixes
+            .iter()
+            .map(|suffix| suffix.trim().to_string())
+            .filter(|suffix| !suffix.is_empty())
+            .collect();
         self.safety.quarantine_failure_codes = self
             .safety
             .quarantine_failure_codes
@@ -642,6 +733,9 @@ impl Config {
                     .to_string(),
             );
         }
+        if self.safety.stable_observations_required == 0 {
+            errors.push("safety.stable_observations_required must be >= 1".to_string());
+        }
         for code in &self.safety.quarantine_failure_codes {
             let valid = code
                 .chars()
@@ -651,6 +745,13 @@ impl Config {
                     "safety.quarantine_failure_codes contains invalid code '{}'",
                     code
                 ));
+            }
+        }
+        for suffix in &self.safety.temporary_suffixes {
+            if suffix.is_empty() || suffix == "." {
+                errors.push(
+                    "safety.temporary_suffixes must not contain empty values or '.'".to_string(),
+                );
             }
         }
         if !(self.notify.webhook_url.is_empty()
@@ -686,6 +787,30 @@ impl Config {
             }
         }
 
+        errors
+    }
+
+    pub fn validate_with_base_dir(&self, base_dir: &Path) -> Vec<String> {
+        let mut errors = self.validate();
+        let resolved_temp =
+            resolve_path_for_containment(&self.resolve_path(base_dir, &self.paths.transcode_temp));
+        let mut seen_mounts = std::collections::HashSet::new();
+        for share in &self.shares {
+            let normalized_mount = resolve_path_for_containment(Path::new(&share.local_mount));
+            if !seen_mounts.insert(normalized_mount.clone()) {
+                errors.push(format!(
+                    "Duplicate normalized share local_mount '{}'",
+                    normalized_mount.display()
+                ));
+            }
+            if path_is_same_or_nested(&normalized_mount, &resolved_temp) {
+                errors.push(format!(
+                    "paths.transcode_temp must not be inside share '{}' local_mount ({})",
+                    share.name,
+                    normalized_mount.display()
+                ));
+            }
+        }
         errors
     }
 }
@@ -839,10 +964,62 @@ mod tests {
     #[test]
     fn test_validate_nfs_mode_requires_server() {
         let mut cfg = Config::default_config();
+        cfg.local_mode = false;
         cfg.nfs.server.clear();
 
         let errs = cfg.validate();
         assert!(errs.iter().any(|e| e.contains("nfs.server")));
+    }
+
+    #[test]
+    fn test_validate_runtime_rejects_temp_dir_inside_share_root() {
+        let mut cfg = Config::default_config();
+        cfg.shares = vec![ShareConfig {
+            name: "movies".to_string(),
+            remote_path: String::new(),
+            local_mount: "/srv/media/movies".to_string(),
+        }];
+        cfg.paths.transcode_temp = "/srv/media/movies/tmp".to_string();
+
+        let errs = cfg.validate_with_base_dir(Path::new("/"));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("paths.transcode_temp must not be inside share")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_runtime_rejects_symlinked_temp_dir_inside_share_root() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let share_root = tempdir.path().join("media").join("movies");
+        let real_temp = share_root.join("transcode-temp");
+        let symlink_path = tempdir.path().join("outside-temp-link");
+        std::fs::create_dir_all(&real_temp).unwrap();
+        std::os::unix::fs::symlink(&real_temp, &symlink_path).unwrap();
+
+        let mut cfg = Config::default_config();
+        cfg.shares = vec![ShareConfig {
+            name: "movies".to_string(),
+            remote_path: String::new(),
+            local_mount: share_root.to_string_lossy().to_string(),
+        }];
+        cfg.paths.transcode_temp = symlink_path.to_string_lossy().to_string();
+
+        let errs = cfg.validate_with_base_dir(Path::new("/"));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("paths.transcode_temp must not be inside share")));
+    }
+
+    #[test]
+    fn test_validate_temporary_suffix_constraints() {
+        let mut cfg = Config::default_config();
+        cfg.safety.temporary_suffixes = vec![".".to_string()];
+
+        let errs = cfg.validate();
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("temporary_suffixes must not contain empty values")));
     }
 
     #[test]

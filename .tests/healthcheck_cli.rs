@@ -54,7 +54,9 @@ fn write_basic_config() -> TestConfigFile {
     let mut file = std::fs::File::create(&config_path).unwrap();
     writeln!(
         file,
-        r#"[nfs]
+        r#"local_mode = false
+
+[nfs]
 server = "127.0.0.1"
 
 [[shares]]
@@ -117,7 +119,9 @@ fn write_invalid_config() -> TestConfigFile {
     let mut file = std::fs::File::create(&config_path).unwrap();
     writeln!(
         file,
-        r#"[nfs]
+        r#"local_mode = false
+
+[nfs]
 server = "127.0.0.1"
 
 [[shares]]
@@ -163,7 +167,9 @@ fn write_status_config(with_snapshot: bool) -> TestConfigFile {
     let mut file = std::fs::File::create(&config_path).unwrap();
     writeln!(
         file,
-        r#"[nfs]
+        r#"local_mode = false
+
+[nfs]
 server = "127.0.0.1"
 
 [[shares]]
@@ -259,6 +265,77 @@ transcode_temp = "/tmp"
 status_snapshot = "{}"
 "#,
         media_dir.display(),
+        db_path.display(),
+        if with_snapshot {
+            snapshot_path.to_string_lossy().to_string()
+        } else {
+            String::new()
+        },
+    )
+    .unwrap();
+    TestConfigFile {
+        _dir: dir,
+        path: config_path,
+    }
+}
+
+fn write_nfs_download_area_config(with_snapshot: bool) -> TestConfigFile {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("watchdog.db");
+    let share_root = dir.path().join("downloads").join("movies");
+    std::fs::create_dir_all(&share_root).unwrap();
+    let snapshot_path = dir.path().join("status.json");
+    if with_snapshot {
+        std::fs::write(
+            &snapshot_path,
+            r#"{
+  "phase": "Idle",
+  "nfs_healthy": true,
+  "local_mode": false,
+  "queue_position": 0,
+  "queue_total": 0,
+  "current_file": null,
+  "unhealthy_shares": [],
+  "reliability": {
+    "scan_timeouts": 0,
+    "last_failure_code": null
+  }
+}"#,
+        )
+        .unwrap();
+    }
+    let config_path = dir.path().join("watchdog.toml");
+    let mut file = std::fs::File::create(&config_path).unwrap();
+    writeln!(
+        file,
+        r#"local_mode = false
+
+[nfs]
+server = "127.0.0.1"
+
+[[shares]]
+name = "movies"
+remote_path = "/remote/movies"
+local_mount = "{}"
+
+[scan]
+video_extensions = [".mkv"]
+interval_seconds = 300
+
+[safety]
+status_snapshot_stale_seconds = 30
+pause_file = "watchdog.pause"
+max_failures_before_cooldown = 3
+cooldown_base_seconds = 300
+cooldown_max_seconds = 86400
+max_consecutive_pass_failures = 3
+
+[paths]
+database = "{}"
+transcode_temp = "/tmp"
+status_snapshot = "{}"
+"#,
+        share_root.display(),
         db_path.display(),
         if with_snapshot {
             snapshot_path.to_string_lossy().to_string()
@@ -463,6 +540,26 @@ fn status_json_local_mode_reports_local_storage_mode() {
     let json = parse_json_output(&output);
     assert_eq!(json["status"], "ok");
     assert_eq!(json["local_mode"], true);
+}
+
+#[test]
+fn status_json_warns_about_download_area_in_nfs_mode() {
+    let cfg = write_nfs_download_area_config(true);
+    let output = Command::new(bin_path())
+        .args(["--status-json", "--config", cfg.path.to_str().unwrap()])
+        .env("WATCHDOG_ALLOW_LOCAL_MOUNTS", "1")
+        .env("WATCHDOG_RUNTIME_MODE", "local_test")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json = parse_json_output(&output);
+    let warnings = json["local_fs_warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| {
+        warning
+            .as_str()
+            .is_some_and(|text| text.contains("downloads/incomplete area"))
+    }));
 }
 
 #[test]
