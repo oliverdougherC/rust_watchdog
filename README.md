@@ -186,6 +186,7 @@ The CLI defaults to `.watchdog/watchdog.toml`. If that hidden config is absent, 
 - HandBrake preset JSON files are loaded from the hidden `./.watchdog/presets/` directory
 - **`[scan]`** — video extensions, optional include/exclude globs (path-aware or basename-only patterns), scan interval, per-pass queue cap, optional `probe_workers`
 - **`[safety]`** — min file age, stable observation count/window, temporary suffix deferrals, hardlink protection, pause file path, failure cooldown policy, pass-failure tripwire thresholds, quarantine thresholds/codes, optional in-use guard command, periodic recovery scan interval, bounded share scan timeout, status snapshot freshness threshold
+- **`[metrics]`** — user-editable cumulative counters (`space_saved_bytes`, `transcoded_files`, `inspected_files`, `retries_scheduled`) plus `flush_interval_seconds` to throttle how often watchdog writes updated totals back into the config
 - **`[paths]`** — temp directory for transcoding, database location, optional status snapshot output path, optional NDJSON event journal path
 - The default `transcode_temp = "tmp"` resolves next to the config/app directory and is rejected if it points inside a scanned share root
 

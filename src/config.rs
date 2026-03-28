@@ -51,7 +51,13 @@ pub struct Config {
     pub safety: SafetyConfig,
 
     #[serde(default)]
+    pub metrics: MetricsConfig,
+
+    #[serde(default)]
     pub notify: NotifyConfig,
+
+    #[serde(skip)]
+    pub metrics_loaded_from_file: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -399,6 +405,24 @@ pub struct PathsConfig {
     pub event_journal: String,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub space_saved_bytes: i64,
+
+    #[serde(default)]
+    pub transcoded_files: u64,
+
+    #[serde(default)]
+    pub inspected_files: u64,
+
+    #[serde(default)]
+    pub retries_scheduled: u64,
+
+    #[serde(default = "default_metrics_flush_interval_seconds")]
+    pub flush_interval_seconds: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotifyConfig {
     #[serde(default)]
@@ -421,6 +445,18 @@ impl Default for NotifyConfig {
     }
 }
 
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            space_saved_bytes: 0,
+            transcoded_files: 0,
+            inspected_files: 0,
+            retries_scheduled: 0,
+            flush_interval_seconds: default_metrics_flush_interval_seconds(),
+        }
+    }
+}
+
 fn default_notify_events() -> Vec<String> {
     vec![
         "pass_failure_summary".to_string(),
@@ -431,6 +467,10 @@ fn default_notify_events() -> Vec<String> {
 
 fn default_notify_timeout_seconds() -> u64 {
     5
+}
+
+fn default_metrics_flush_interval_seconds() -> u64 {
+    60
 }
 
 impl Default for PathsConfig {
@@ -498,7 +538,10 @@ impl Config {
             return Err(WatchdogError::ConfigNotFound(path.to_path_buf()));
         }
         let content = std::fs::read_to_string(path)?;
+        let parsed: toml::Value = toml::from_str(&content)?;
+        let metrics_loaded_from_file = parsed.get("metrics").is_some();
         let mut config: Config = toml::from_str(&content)?;
+        config.metrics_loaded_from_file = metrics_loaded_from_file;
         config.normalize();
         Ok(config)
     }
@@ -524,7 +567,9 @@ impl Config {
             scan: ScanConfig::default(),
             paths: PathsConfig::default(),
             safety: SafetyConfig::default(),
+            metrics: MetricsConfig::default(),
             notify: NotifyConfig::default(),
+            metrics_loaded_from_file: true,
         };
         config.normalize();
         config
@@ -727,6 +772,9 @@ impl Config {
         if self.safety.status_snapshot_stale_seconds < 5 {
             errors.push("safety.status_snapshot_stale_seconds must be >= 5".to_string());
         }
+        if self.metrics.flush_interval_seconds < 5 {
+            errors.push("metrics.flush_interval_seconds must be >= 5".to_string());
+        }
         if self.safety.in_use_guard_enabled && self.safety.in_use_guard_command.is_empty() {
             errors.push(
                 "safety.in_use_guard_command must not be empty when in_use_guard_enabled=true"
@@ -815,6 +863,42 @@ impl Config {
     }
 }
 
+pub fn read_metrics_from_path(path: &Path) -> Result<MetricsConfig> {
+    Ok(Config::load(path)?.metrics)
+}
+
+pub fn write_metrics_to_path(path: &Path, metrics: &MetricsConfig) -> Result<()> {
+    if !path.exists() {
+        return Err(WatchdogError::ConfigNotFound(path.to_path_buf()));
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    let mut doc = content.parse::<toml_edit::DocumentMut>().map_err(|err| {
+        WatchdogError::Config(format!(
+            "Failed to parse config for metrics persistence: {err}"
+        ))
+    })?;
+
+    if !doc.as_table().contains_key("metrics") {
+        doc["metrics"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    let Some(table) = doc["metrics"].as_table_mut() else {
+        return Err(WatchdogError::Config(
+            "Config [metrics] entry exists but is not a table".to_string(),
+        ));
+    };
+
+    table["space_saved_bytes"] = toml_edit::value(metrics.space_saved_bytes);
+    table["transcoded_files"] = toml_edit::value(metrics.transcoded_files as i64);
+    table["inspected_files"] = toml_edit::value(metrics.inspected_files as i64);
+    table["retries_scheduled"] = toml_edit::value(metrics.retries_scheduled as i64);
+    table["flush_interval_seconds"] = toml_edit::value(metrics.flush_interval_seconds as i64);
+
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,6 +983,16 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_metrics_flush_interval() {
+        let mut cfg = Config::default_config();
+        cfg.metrics.flush_interval_seconds = 4;
+        let errs = cfg.validate();
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("metrics.flush_interval_seconds")));
+    }
+
+    #[test]
     fn test_validate_quarantine_failure_code_format() {
         let mut cfg = Config::default_config();
         cfg.safety.quarantine_failure_codes = vec!["bad-code".to_string()];
@@ -969,6 +1063,60 @@ mod tests {
 
         let errs = cfg.validate();
         assert!(errs.iter().any(|e| e.contains("nfs.server")));
+    }
+
+    #[test]
+    fn test_load_marks_metrics_section_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("watchdog.toml");
+        std::fs::write(
+            &config_path,
+            r#"local_mode = true
+
+[metrics]
+space_saved_bytes = 42
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&config_path).unwrap();
+        assert!(cfg.metrics_loaded_from_file);
+        assert_eq!(cfg.metrics.space_saved_bytes, 42);
+    }
+
+    #[test]
+    fn test_write_metrics_to_path_updates_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("watchdog.toml");
+        std::fs::write(
+            &config_path,
+            r#"local_mode = true
+
+[paths]
+database = "watchdog.db"
+"#,
+        )
+        .unwrap();
+
+        write_metrics_to_path(
+            &config_path,
+            &MetricsConfig {
+                space_saved_bytes: 128,
+                transcoded_files: 3,
+                inspected_files: 9,
+                retries_scheduled: 2,
+                flush_interval_seconds: 90,
+            },
+        )
+        .unwrap();
+
+        let cfg = Config::load(&config_path).unwrap();
+        assert_eq!(cfg.metrics.space_saved_bytes, 128);
+        assert_eq!(cfg.metrics.transcoded_files, 3);
+        assert_eq!(cfg.metrics.inspected_files, 9);
+        assert_eq!(cfg.metrics.retries_scheduled, 2);
+        assert_eq!(cfg.metrics.flush_interval_seconds, 90);
+        assert_eq!(cfg.paths.database, "watchdog.db");
     }
 
     #[test]

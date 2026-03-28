@@ -2,6 +2,10 @@ use crate::config::Config;
 use crate::db::{FileReadinessState, NewQueueItem, QueueRecord, TranscodeOutcome, WatchdogDb};
 use crate::error::{Result, WatchdogError};
 use crate::event_journal::{append_event, append_log_event, resolve_event_journal_path};
+use crate::metrics::{
+    flush_global_metrics_now, maybe_flush_global_metrics_delta, sync_cumulative_metrics_state,
+    CumulativeMetricsDelta,
+};
 use crate::nfs::ensure_all_mounts;
 use crate::notify::{send_webhook, NotifyEvent};
 use crate::probe::{evaluate_transcode_need, verify_transcode, TranscodeEval, VerificationOutcome};
@@ -473,10 +477,19 @@ fn finalize_runtime_state(state: &StateManager, db: &Arc<WatchdogDb>) {
             .map(|(reason, count)| (reason.clone(), *count as u64))
             .collect();
     });
+    if let Some(metrics) = flush_global_metrics_now() {
+        sync_cumulative_metrics_state(state, metrics);
+    }
     state.set_last_pass_time();
     state.set_current_file(None);
     state.reset_file_progress();
     state.set_queue_info(0, db.get_queue_count().max(0) as u32);
+}
+
+fn note_cumulative_metrics_delta(state: &StateManager, delta: CumulativeMetricsDelta) {
+    if let Some(metrics) = maybe_flush_global_metrics_delta(delta) {
+        sync_cumulative_metrics_state(state, metrics);
+    }
 }
 
 fn queue_row_to_candidate(
@@ -1840,6 +1853,13 @@ async fn process_transcode_queue(
                         s.run_retries_scheduled += 1;
                         s.total_retries_scheduled += 1;
                     });
+                    note_cumulative_metrics_delta(
+                        state,
+                        CumulativeMetricsDelta {
+                            retries_scheduled: 1,
+                            ..CumulativeMetricsDelta::default()
+                        },
+                    );
                     db.requeue_queue_item(&path_str);
                     transcode_queue.push(item.clone());
                 } else {
@@ -1866,6 +1886,13 @@ async fn process_transcode_queue(
                                 s.run_retries_scheduled += 1;
                                 s.total_retries_scheduled += 1;
                             });
+                            note_cumulative_metrics_delta(
+                                state,
+                                CumulativeMetricsDelta {
+                                    retries_scheduled: 1,
+                                    ..CumulativeMetricsDelta::default()
+                                },
+                            );
                         }
                         RetryScheduleDisposition::Quarantined => {
                             stats.transcode_failures += 1;
@@ -2190,7 +2217,6 @@ async fn process_transcode_queue(
                     None,
                 );
                 db.clear_file_failure_state(&path_str);
-                db.log_space_saved(db.get_total_space_saved() + space_saved);
                 stats.files_transcoded += 1;
                 stats.space_saved_bytes += space_saved;
                 state.update(|s| {
@@ -2199,6 +2225,15 @@ async fn process_transcode_queue(
                     s.run_transcoded += 1;
                     s.run_space_saved += space_saved;
                 });
+                note_cumulative_metrics_delta(
+                    state,
+                    CumulativeMetricsDelta {
+                        space_saved_bytes: space_saved,
+                        transcoded_files: 1,
+                        ..CumulativeMetricsDelta::default()
+                    },
+                );
+                db.log_space_saved(state.snapshot().total_space_saved);
                 send_webhook(
                     &config.notify,
                     NotifyEvent::ReplacementSummary,
@@ -2287,6 +2322,13 @@ fn process_probe_batch(
             s.total_inspected += 1;
             s.run_inspected += 1;
         });
+        note_cumulative_metrics_delta(
+            state,
+            CumulativeMetricsDelta {
+                inspected_files: 1,
+                ..CumulativeMetricsDelta::default()
+            },
+        );
 
         match probe_result {
             None => {

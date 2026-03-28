@@ -8,12 +8,17 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use watchdog::config::{
-    path_is_same_or_nested, Config, DEFAULT_CONFIG_PATH, LEGACY_DEFAULT_CONFIG_PATH,
+    path_is_same_or_nested, write_metrics_to_path, Config, MetricsConfig, DEFAULT_CONFIG_PATH,
+    LEGACY_DEFAULT_CONFIG_PATH,
 };
 use watchdog::db::WatchdogDb;
 use watchdog::diagnostics::{log_anyhow_error, print_anyhow_error_report};
 use watchdog::event_journal::{append_event, resolve_event_journal_path};
 use watchdog::in_use::CommandInUseDetector;
+use watchdog::metrics::{
+    flush_global_metrics_now, set_global_metrics_persistence, sync_cumulative_metrics_state,
+    CumulativeMetrics, MetricsPersistence,
+};
 use watchdog::nfs::SystemMountManager;
 use watchdog::pipeline::{run_pipeline_loop, set_tui_log_event_path, PipelineDeps};
 use watchdog::probe::FfprobeProber;
@@ -929,6 +934,14 @@ async fn run() -> anyhow::Result<()> {
         std::process::exit(exit_code);
     }
 
+    maybe_bootstrap_persisted_metrics(
+        &mut config,
+        &cli.config,
+        db.as_ref(),
+        cli.simulate,
+        cli.dry_run,
+    );
+
     // Validate config (doctor mode handles diagnostics itself)
     if !validation_errors.is_empty() && !cli.simulate {
         for err in &validation_errors {
@@ -988,7 +1001,16 @@ async fn run() -> anyhow::Result<()> {
         };
 
         let (state, _state_rx) = StateManager::new();
-        seed_state_from_db(&state, &db, cli.simulate, config.local_mode);
+        if cli.simulate || cli.dry_run {
+            set_global_metrics_persistence(None);
+        } else {
+            set_global_metrics_persistence(Some(Arc::new(MetricsPersistence::new(
+                cli.config.clone(),
+                CumulativeMetrics::from(&config.metrics),
+                Duration::from_secs(config.metrics.flush_interval_seconds.max(5)),
+            ))));
+        }
+        seed_state_from_config(&state, &db, &config, cli.simulate);
         state.set_local_fs_warnings(
             collect_local_deployment_diagnostics(&config, &base_dir).local_fs_warnings,
         );
@@ -1098,6 +1120,9 @@ async fn run() -> anyhow::Result<()> {
         )
         .await;
 
+        if let Some(metrics) = flush_global_metrics_now() {
+            sync_cumulative_metrics_state(&state, metrics);
+        }
         let _ = shutdown_tx.send(());
         if !cli.dry_run {
             db.clear_worker_state();
@@ -1181,18 +1206,55 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seed_state_from_db(state: &StateManager, db: &WatchdogDb, simulate: bool, local_mode: bool) {
-    let total_saved = db.get_total_space_saved();
-    let total_transcoded = db.get_transcode_count();
-    let total_inspected = db.get_inspected_count();
+fn maybe_bootstrap_persisted_metrics(
+    config: &mut Config,
+    config_path: &Path,
+    db: &WatchdogDb,
+    simulate: bool,
+    dry_run: bool,
+) {
+    if simulate || dry_run || config.metrics_loaded_from_file {
+        return;
+    }
+
+    let migrated = MetricsConfig {
+        space_saved_bytes: db.get_total_space_saved(),
+        transcoded_files: db.get_transcode_count().max(0) as u64,
+        inspected_files: db.get_inspected_count().max(0) as u64,
+        retries_scheduled: config.metrics.retries_scheduled,
+        flush_interval_seconds: config.metrics.flush_interval_seconds.max(5),
+    };
+
+    match write_metrics_to_path(config_path, &migrated) {
+        Ok(()) => {
+            info!(
+                "Seeded [metrics] in {} from historical database totals",
+                config_path.display()
+            );
+            config.metrics = migrated;
+            config.metrics_loaded_from_file = true;
+        }
+        Err(err) => {
+            warn!(
+                "Failed to seed [metrics] in {}: {}",
+                config_path.display(),
+                err
+            );
+        }
+    }
+}
+
+fn seed_state_from_config(state: &StateManager, db: &WatchdogDb, config: &Config, simulate: bool) {
     let top_reasons = db.get_top_failure_reasons(3);
     let service_state = db.get_service_state();
     let quarantined = db.quarantine_count();
+    let metrics = CumulativeMetrics::from(&config.metrics);
     state.update(|s| {
-        s.total_space_saved = total_saved;
-        s.total_transcoded = total_transcoded as u64;
-        s.total_inspected = total_inspected as u64;
-        s.local_mode = local_mode;
+        s.total_space_saved = metrics.space_saved_bytes;
+        s.total_transcoded = metrics.transcoded_files;
+        s.total_inspected = metrics.inspected_files;
+        s.total_retries_scheduled = metrics.retries_scheduled;
+        s.local_mode = config.local_mode;
         s.simulate_mode = simulate;
         s.consecutive_pass_failures = service_state.consecutive_pass_failures;
         s.auto_paused = service_state.auto_paused_at.is_some();

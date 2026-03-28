@@ -2,6 +2,8 @@ use rusqlite::Connection;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt};
 
 fn bin_path() -> &'static str {
     env!("CARGO_BIN_EXE_watchdog")
@@ -45,6 +47,35 @@ fn parse_json_output(output: &std::process::Output) -> serde_json::Value {
 struct TestConfigFile {
     _dir: tempfile::TempDir,
     path: PathBuf,
+}
+
+fn add_mock_tools(cmd: &mut Command) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for tool in ["ffprobe", "HandBrakeCLI", "rsync"] {
+        let path = dir.path().join(tool);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"{tool} test-stub 1.0\"\nelse\n  echo \"{tool} test-stub\"\nfi\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+    }
+
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = if existing_path.is_empty() {
+        dir.path().display().to_string()
+    } else {
+        format!("{}:{}", dir.path().display(), existing_path)
+    };
+    cmd.env("PATH", combined_path);
+    dir
 }
 
 fn write_basic_config() -> TestConfigFile {
@@ -441,7 +472,9 @@ fn healthcheck_invalid_config_returns_20() {
 #[test]
 fn healthcheck_local_mode_succeeds_without_nfs_overrides() {
     let cfg = write_local_mode_config(false);
-    let output = Command::new(bin_path())
+    let mut cmd = Command::new(bin_path());
+    let _tools = add_mock_tools(&mut cmd);
+    let output = cmd
         .args(["--healthcheck", "--config", cfg.path.to_str().unwrap()])
         .output()
         .unwrap();
@@ -491,7 +524,9 @@ fn doctor_with_invalid_config_still_runs_diagnostics() {
 #[test]
 fn doctor_local_mode_reports_share_roots() {
     let cfg = write_local_mode_config(true);
-    let output = Command::new(bin_path())
+    let mut cmd = Command::new(bin_path());
+    let _tools = add_mock_tools(&mut cmd);
+    let output = cmd
         .args(["--doctor", "--config", cfg.path.to_str().unwrap()])
         .output()
         .unwrap();
