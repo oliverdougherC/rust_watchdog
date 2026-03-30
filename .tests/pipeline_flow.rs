@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
-use watchdog::config::{Config, ShareConfig};
+use watchdog::config::{Config, HardlinkPolicy, ShareConfig};
 use watchdog::db::{NewQueueItem, TranscodeOutcome, WatchdogDb};
 use watchdog::error::{Result, WatchdogError};
 use watchdog::pipeline::{run_pipeline_loop, run_watchdog_pass, PipelineDeps};
@@ -1839,6 +1839,7 @@ async fn unstable_file_is_deferred_until_stable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn hardlinked_file_is_deferred_until_links_drop() {
     let mut cfg = base_config();
+    cfg.safety.hardlink_policy = Some(HardlinkPolicy::Defer);
     cfg.safety.stable_observations_required = 2;
     cfg.safety.stable_window_seconds = 0;
     let fs = Arc::new(TestFs::new(&cfg));
@@ -1909,6 +1910,48 @@ async fn hardlinked_file_is_deferred_until_links_drop() {
     .unwrap();
     assert_eq!(third.files_transcoded, 1);
     assert_eq!(db.get_transcode_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hardlinked_file_transcodes_when_policy_is_transcode() {
+    let mut cfg = base_config();
+    cfg.safety.hardlink_policy = Some(HardlinkPolicy::Transcode);
+    let fs = Arc::new(TestFs::new(&cfg));
+    let source = PathBuf::from("/mnt/movies/Hardlinked.Transcode.File.mkv");
+    fs.insert(&source, 50_000_000, 1000.0);
+    fs.set_link_count(&source, 2);
+    let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
+    let (state, _rx) = StateManager::new();
+    let deps = PipelineDeps {
+        fs: Arc::new(FsHandle(fs.clone())),
+        prober: Box::new(TestProber { fs: fs.clone() }),
+        transcoder: Box::new(TestTranscoder::new(
+            fs.clone(),
+            TranscodeMode::SuccessWithOutputSize(10_000_000),
+        )),
+        transfer: Box::new(TestTransfer { fs: fs.clone() }),
+        mount_manager: Box::new(TestMountManager {
+            healthy: true,
+            remount_success: true,
+        }),
+        in_use_detector: Box::new(TestInUseDetector::never()),
+    };
+    let (tx, _) = broadcast::channel(1);
+
+    let result = run_watchdog_pass(
+        &cfg,
+        Path::new("."),
+        &deps,
+        &db,
+        &state,
+        false,
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.files_transcoded, 1);
+    assert_eq!(db.get_transcode_count(), 1);
+    assert_eq!(state.snapshot().run_skipped_hardlinked, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

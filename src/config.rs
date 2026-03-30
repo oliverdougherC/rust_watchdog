@@ -249,6 +249,14 @@ fn default_interval() -> u64 {
     300
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HardlinkPolicy {
+    Defer,
+    Ignore,
+    Transcode,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SafetyConfig {
     #[serde(default = "default_min_file_age_seconds")]
@@ -277,6 +285,9 @@ pub struct SafetyConfig {
 
     #[serde(default = "default_stable_window_seconds")]
     pub stable_window_seconds: u64,
+
+    #[serde(default)]
+    pub hardlink_policy: Option<HardlinkPolicy>,
 
     #[serde(default = "default_protect_hardlinked_files")]
     pub protect_hardlinked_files: bool,
@@ -318,6 +329,7 @@ impl Default for SafetyConfig {
             in_use_guard_command: default_in_use_guard_command(),
             stable_observations_required: default_stable_observations_required(),
             stable_window_seconds: default_stable_window_seconds(),
+            hardlink_policy: None,
             protect_hardlinked_files: default_protect_hardlinked_files(),
             temporary_suffixes: default_temporary_suffixes(),
             recovery_scan_interval_seconds: default_recovery_scan_interval_seconds(),
@@ -356,6 +368,18 @@ fn default_stable_observations_required() -> u32 {
 
 fn default_stable_window_seconds() -> u64 {
     900
+}
+
+impl SafetyConfig {
+    pub fn effective_hardlink_policy(&self) -> HardlinkPolicy {
+        self.hardlink_policy.unwrap_or({
+            if self.protect_hardlinked_files {
+                HardlinkPolicy::Defer
+            } else {
+                HardlinkPolicy::Transcode
+            }
+        })
+    }
 }
 
 fn default_protect_hardlinked_files() -> bool {
@@ -1077,6 +1101,36 @@ mod tests {
 
         let errs = cfg.validate();
         assert!(!errs.iter().any(|e| e.contains("empty remote_path")));
+    }
+
+    #[test]
+    fn test_hardlink_policy_defaults_to_legacy_defer_behavior() {
+        let cfg = Config::default_config();
+        assert_eq!(
+            cfg.safety.effective_hardlink_policy(),
+            HardlinkPolicy::Defer
+        );
+    }
+
+    #[test]
+    fn test_hardlink_policy_false_legacy_flag_maps_to_transcode() {
+        let mut cfg = Config::default_config();
+        cfg.safety.protect_hardlinked_files = false;
+        assert_eq!(
+            cfg.safety.effective_hardlink_policy(),
+            HardlinkPolicy::Transcode
+        );
+    }
+
+    #[test]
+    fn test_hardlink_policy_explicit_setting_overrides_legacy_flag() {
+        let mut cfg = Config::default_config();
+        cfg.safety.protect_hardlinked_files = true;
+        cfg.safety.hardlink_policy = Some(HardlinkPolicy::Ignore);
+        assert_eq!(
+            cfg.safety.effective_hardlink_policy(),
+            HardlinkPolicy::Ignore
+        );
     }
 
     #[test]

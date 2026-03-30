@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, HardlinkPolicy};
 use crate::db::{FileReadinessState, NewQueueItem, QueueRecord, TranscodeOutcome, WatchdogDb};
 use crate::error::{Result, WatchdogError};
 use crate::event_journal::{append_event, append_log_event, resolve_event_journal_path};
@@ -56,7 +56,8 @@ enum ReadinessDeferredReason {
     Young,
     Temporary,
     Unstable,
-    Hardlinked,
+    HardlinkedDeferred,
+    HardlinkedIgnored,
 }
 
 impl ReadinessDeferredReason {
@@ -65,7 +66,7 @@ impl ReadinessDeferredReason {
             Self::Young => SkipReason::Young,
             Self::Temporary => SkipReason::Temporary,
             Self::Unstable => SkipReason::Unstable,
-            Self::Hardlinked => SkipReason::Hardlinked,
+            Self::HardlinkedDeferred | Self::HardlinkedIgnored => SkipReason::Hardlinked,
         }
     }
 }
@@ -278,16 +279,20 @@ fn evaluate_file_readiness(
     }
 
     let path_key = path.to_string_lossy().to_string();
-    let link_count = if config.safety.protect_hardlinked_files {
-        deps.fs.link_count(path).ok()
-    } else {
-        None
+    let hardlink_policy = config.safety.effective_hardlink_policy();
+    let link_count = match hardlink_policy {
+        HardlinkPolicy::Defer | HardlinkPolicy::Ignore => deps.fs.link_count(path).ok(),
+        HardlinkPolicy::Transcode => None,
     };
     if let Some(link_count) = link_count {
         if link_count > 1 {
             db.clear_file_readiness_state(&path_key);
             return ReadinessDecision {
-                deferred: Some(ReadinessDeferredReason::Hardlinked),
+                deferred: Some(match hardlink_policy {
+                    HardlinkPolicy::Defer => ReadinessDeferredReason::HardlinkedDeferred,
+                    HardlinkPolicy::Ignore => ReadinessDeferredReason::HardlinkedIgnored,
+                    HardlinkPolicy::Transcode => unreachable!(),
+                }),
                 link_count: Some(link_count),
             };
         }
@@ -723,7 +728,7 @@ fn apply_readiness_deferral(
 ) {
     if let Some(reason) = decision.deferred {
         increment_skip_counter(state, reason.skip_reason());
-        if reason == ReadinessDeferredReason::Hardlinked {
+        if reason == ReadinessDeferredReason::HardlinkedDeferred {
             maybe_emit_hardlink_deferral(
                 config,
                 base_dir,

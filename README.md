@@ -73,6 +73,7 @@ Recommended deployment shape:
 - Use `--doctor`, `--healthcheck`, and `--status-json` as part of deployment validation.
 - Keep `in_use_guard_enabled = false` in container deployments unless you deliberately share a PID namespace. `lsof` inside one container cannot see file users in other containers by default.
 - The bundled `HEVC_MKV` preset uses HandBrake's `x265_10bit` encoder. It is CPU-based, so an NVIDIA GPU is available for future presets but is not used by this preset as shipped.
+- Hardlinks are controlled by `safety.hardlink_policy`: `defer` waits for a single-link file, `ignore` skips while hardlinked, and `transcode` processes the file normally. The personal-server templates now default to `transcode`.
 
 Example local-mode config for Ubuntu:
 
@@ -233,6 +234,7 @@ See `.watchdog/watchdog.toml.example` for the full sample. Important sections:
 - `[transcode]`: target codec, bitrate threshold, preset file/name, timeouts, retries, and disk-space multiplier
 - `[scan]`: extensions, include/exclude globs, interval, and optional worker count
 - `[safety]`: readiness gates, cooldowns, quarantine, in-use guard, and status freshness thresholds
+- `safety.hardlink_policy`: `defer`, `ignore`, or `transcode` (`protect_hardlinked_files` is still accepted as a legacy alias)
 - `[metrics]`: persistent counters flushed back into config on an interval
 - `[paths]`: temp dir, DB path, log dir, status snapshot path, and event journal path
 
