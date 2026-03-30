@@ -147,13 +147,13 @@ fn default_max_bitrate() -> f64 {
     25.0
 }
 fn default_target_codec() -> String {
-    "av1".to_string()
+    "hevc".to_string()
 }
 fn default_preset_file() -> String {
-    "presets/AV1_MKV.json".to_string()
+    "presets/HEVC_MKV.json".to_string()
 }
 fn default_preset_name() -> String {
-    "AV1_MKV".to_string()
+    "HEVC_MKV".to_string()
 }
 fn default_timeout() -> u64 {
     18000

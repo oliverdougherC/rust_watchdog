@@ -29,18 +29,25 @@ logs/
 # Local runtime/config artifacts
 watchdog.toml
 watchdog.pause
+watchdog.status.json
+watchdog.events.ndjson
+watchdog.preset-cache/
 status.json
 status_snapshot*.json
 events.ndjson
 *.lock
 .watchdog/watchdog.toml
 .watchdog/watchdog.pause
+.watchdog/.DS_Store
 .watchdog/*.db
 .watchdog/*.db-wal
 .watchdog/*.db-shm
 .watchdog/*.lock
 .watchdog/*.status.json
 .watchdog/*.events.ndjson
+.watchdog/watchdog.status.json
+.watchdog/watchdog.events.ndjson
+.watchdog/watchdog.preset-cache/
 .watchdog/*.preset-cache/
 
 .local_tui_run/

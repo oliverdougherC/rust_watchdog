@@ -40,16 +40,11 @@ fn format_name_for_path(path: &Path) -> String {
 }
 
 fn default_media_file(path: &Path, size: u64, mtime: f64) -> TestMediaFile {
-    let codec = if path.to_string_lossy().contains(".av1.") {
-        "av1"
-    } else {
-        "h264"
-    };
     TestMediaFile {
         size,
         mtime,
         link_count: 1,
-        codec: codec.to_string(),
+        codec: "h264".to_string(),
         format_name: format_name_for_path(path),
         duration_seconds: 100.0,
         video_stream_count: 1,
@@ -654,6 +649,8 @@ fn base_config() -> Config {
         .join("AV1_MKV.json")
         .display()
         .to_string();
+    cfg.transcode.preset_name = "AV1_MKV".to_string();
+    cfg.transcode.target_codec = "av1".to_string();
     cfg.shares = vec![ShareConfig {
         name: "movies".to_string(),
         remote_path: "/remote/movies".to_string(),
@@ -1233,8 +1230,8 @@ async fn precision_mode_processes_manual_override_for_already_compliant_file() {
     let mut cfg = base_config();
     cfg.scan.interval_seconds = 60;
     let fs = Arc::new(TestFs::new(&cfg));
-    let source = PathBuf::from("/mnt/movies/Precision.Movie.av1.mkv");
-    fs.insert(&source, 50_000_000, 1000.0);
+    let source = PathBuf::from("/mnt/movies/Precision.Movie.mkv");
+    fs.insert_transcoded(&source, 50_000_000, 1000.0);
     let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
     let (state, _rx) = StateManager::new();
     let deps = PipelineDeps {

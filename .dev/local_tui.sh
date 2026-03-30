@@ -7,8 +7,8 @@ WORK_DIR="$ROOT_DIR/.local_tui_run"
 KEEP_WORK_DIR=0
 PREPARE_ONLY=0
 HEADLESS_ONCE=0
-PRESET_FILE="${WATCHDOG_REAL_PRESET_FILE:-"$ROOT_DIR/.watchdog/presets/AV1_MKV.json"}"
-PRESET_NAME="${WATCHDOG_REAL_PRESET_NAME:-AV1_MKV}"
+PRESET_FILE="${WATCHDOG_REAL_PRESET_FILE:-"$ROOT_DIR/.watchdog/presets/HEVC_MKV.json"}"
+PRESET_NAME="${WATCHDOG_REAL_PRESET_NAME:-HEVC_MKV}"
 SCAN_INTERVAL="${WATCHDOG_LOCAL_TUI_SCAN_INTERVAL:-120}"
 HEADLESS_LOG_LEVEL="${WATCHDOG_LOCAL_TUI_HEADLESS_LOG_LEVEL:-info}"
 
@@ -150,7 +150,7 @@ local_mount = "$ESC_MEDIA_DIR"
 
 [transcode]
 max_average_bitrate_mbps = 25.0
-target_codec = "av1"
+target_codec = "hevc"
 preset_file = "$ESC_PRESET_FILE"
 preset_name = "$ESC_PRESET_NAME"
 timeout_seconds = 18000

@@ -27,6 +27,26 @@ fn allow_local_mounts_for_testing() -> bool {
 pub struct SystemMountManager;
 
 impl SystemMountManager {
+    fn remount_command(os: &str, remote: &str, local_mount: &Path) -> (&'static str, Command) {
+        match os {
+            "macos" => {
+                let mut cmd = Command::new("mount_nfs");
+                cmd.arg(remote).arg(local_mount);
+                ("mount_nfs", cmd)
+            }
+            "linux" => {
+                let mut cmd = Command::new("mount");
+                cmd.args(["-t", "nfs"]).arg(remote).arg(local_mount);
+                ("mount", cmd)
+            }
+            _ => {
+                let mut cmd = Command::new("mount");
+                cmd.args(["-t", "nfs"]).arg(remote).arg(local_mount);
+                ("mount", cmd)
+            }
+        }
+    }
+
     fn parse_mount_fs_type(mount_output: &str, mount_point: &Path) -> Option<String> {
         let needle = format!(" on {} (", mount_point.display());
         for line in mount_output.lines() {
@@ -144,17 +164,18 @@ impl MountManager for SystemMountManager {
         let max_attempts = 3;
 
         for attempt in 1..=max_attempts {
+            let (mount_cmd_name, cmd) =
+                Self::remount_command(std::env::consts::OS, &remote, local_mount);
             warn!(
-                "[{}] Remount attempt {}/{} using mount_nfs {} {}",
+                "[{}] Remount attempt {}/{} using {} {} {}",
                 share_name,
                 attempt,
                 max_attempts,
+                mount_cmd_name,
                 remote,
                 local_mount.display()
             );
 
-            let mut cmd = Command::new("mount_nfs");
-            cmd.arg(&remote).arg(local_mount);
             let command_repr = format_command_for_log(&cmd);
             let output = run_command(
                 cmd,
@@ -177,8 +198,9 @@ impl MountManager for SystemMountManager {
                         return Ok(true);
                     }
                     warn!(
-                        "[{}] mount_nfs command succeeded but mount is still unhealthy at {} (elapsed={:.1}s)",
+                        "[{}] {} command succeeded but mount is still unhealthy at {} (elapsed={:.1}s)",
                         share_name,
+                        mount_cmd_name,
                         local_mount.display(),
                         result.elapsed.as_secs_f64()
                     );
@@ -186,8 +208,9 @@ impl MountManager for SystemMountManager {
                 Ok(result) => {
                     if result.timed_out {
                         warn!(
-                            "[{}] mount_nfs timed out after 30s (elapsed={:.1}s): remote={} local={} command={}",
+                            "[{}] {} timed out after 30s (elapsed={:.1}s): remote={} local={} command={}",
                             share_name,
+                            mount_cmd_name,
                             result.elapsed.as_secs_f64(),
                             remote,
                             local_mount.display(),
@@ -200,8 +223,9 @@ impl MountManager for SystemMountManager {
                         .map(|hint| format!(" likely_cause={}", hint))
                         .unwrap_or_default();
                     warn!(
-                        "[{}] mount_nfs failed: remote={} local={} status={} elapsed={:.1}s stderr={}{}",
+                        "[{}] {} failed: remote={} local={} status={} elapsed={:.1}s stderr={}{}",
                         share_name,
+                        mount_cmd_name,
                         remote,
                         local_mount.display(),
                         describe_exit_status(&result.status),
@@ -211,7 +235,10 @@ impl MountManager for SystemMountManager {
                     );
                 }
                 Err(e) => {
-                    error!("[{}] Failed to execute mount_nfs: {}", share_name, e);
+                    error!(
+                        "[{}] Failed to execute {}: {}",
+                        share_name, mount_cmd_name, e
+                    );
                 }
             }
 
@@ -294,5 +321,33 @@ mod tests {
         let mount_point = Path::new("/Volumes/JellyfinTV");
         let fs_type = SystemMountManager::parse_mount_fs_type(output, mount_point);
         assert!(fs_type.is_none());
+    }
+
+    #[test]
+    fn remount_command_uses_mount_nfs_on_macos() {
+        let (name, cmd) = SystemMountManager::remount_command(
+            "macos",
+            "10.0.0.2:/media",
+            Path::new("/Volumes/Media"),
+        );
+        assert_eq!(name, "mount_nfs");
+        assert_eq!(
+            format_command_for_log(&cmd),
+            "mount_nfs 10.0.0.2:/media /Volumes/Media"
+        );
+    }
+
+    #[test]
+    fn remount_command_uses_mount_on_linux() {
+        let (name, cmd) = SystemMountManager::remount_command(
+            "linux",
+            "10.0.0.2:/media",
+            Path::new("/mnt/media"),
+        );
+        assert_eq!(name, "mount");
+        assert_eq!(
+            format_command_for_log(&cmd),
+            "mount -t nfs 10.0.0.2:/media /mnt/media"
+        );
     }
 }

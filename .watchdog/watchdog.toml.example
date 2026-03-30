@@ -15,9 +15,9 @@ local_mount = "/srv/media/TV"
 
 [transcode]
 max_average_bitrate_mbps = 25.0
-target_codec = "av1"
-preset_file = "presets/AV1_MKV.json"
-preset_name = "AV1_MKV"
+target_codec = "hevc"
+preset_file = "presets/HEVC_MKV.json"
+preset_name = "HEVC_MKV"
 timeout_seconds = 18000
 stall_timeout_seconds = 600
 max_retries = 1
@@ -91,4 +91,4 @@ event_journal = ""
 # [[shares]]
 # name = "movies"
 # remote_path = "/mnt/DataStore/share/jellyfin/jfmedia/Movies"
-# local_mount = "/Volumes/JellyfinMovies"
+# local_mount = "/mnt/media/Movies"

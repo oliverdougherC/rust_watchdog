@@ -378,6 +378,7 @@ fn build_local_temp_paths(
     temp_dir: &Path,
     share_name: &str,
     source_path: &Path,
+    target_codec: &str,
     output_extension: &str,
 ) -> (PathBuf, PathBuf) {
     let hash = format!("{:016x}", stable_path_hash(source_path));
@@ -394,8 +395,12 @@ fn build_local_temp_paths(
 
     let local_source = temp_dir.join(format!("{}_{}__{}", share_name, hash, source_name));
     let local_output = temp_dir.join(format!(
-        "{}_{}__{}.av1.{}",
-        share_name, hash, name_no_ext, output_extension
+        "{}_{}__{}.{}.{}",
+        share_name,
+        hash,
+        name_no_ext,
+        target_codec.trim().to_ascii_lowercase(),
+        output_extension
     ));
     (local_source, local_output)
 }
@@ -1020,7 +1025,7 @@ pub async fn run_watchdog_pass(
         deps.fs.create_dir_all(&temp_dir)?;
     }
 
-    // Clean up stale temp files from previous crashes (e.g., leftover .av1.* or source copies).
+    // Clean up stale temp files from previous crashes (e.g., leftover codec-tagged outputs or source copies).
     // Only clean files we own (prefixed with a share name + underscore).
     if !dry_run {
         if let Ok(entries) = deps.fs.list_dir(&temp_dir) {
@@ -1662,6 +1667,7 @@ async fn process_transcode_queue(
             &temp_dir,
             share_name,
             path,
+            &preset.target_codec,
             &preset_contract.container_extension,
         );
 
@@ -3911,8 +3917,8 @@ mod tests {
         let temp_dir = Path::new("/tmp/watchdog");
         let a = Path::new("/mnt/movies/A/Movie.mkv");
         let b = Path::new("/mnt/movies/B/Movie.mkv");
-        let (a_source, a_output) = build_local_temp_paths(temp_dir, "movies", a, "mkv");
-        let (b_source, b_output) = build_local_temp_paths(temp_dir, "movies", b, "mkv");
+        let (a_source, a_output) = build_local_temp_paths(temp_dir, "movies", a, "av1", "mkv");
+        let (b_source, b_output) = build_local_temp_paths(temp_dir, "movies", b, "av1", "mkv");
 
         assert_ne!(a_source, b_source);
         assert_ne!(a_output, b_output);
@@ -3927,12 +3933,25 @@ mod tests {
         let temp_dir = Path::new("/tmp/watchdog");
         let source = Path::new("/mnt/movies/Movie.mp4");
         let (_local_source, local_output) =
-            build_local_temp_paths(temp_dir, "movies", source, "mkv");
+            build_local_temp_paths(temp_dir, "movies", source, "av1", "mkv");
 
         assert!(local_output
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with("__Movie.av1.mkv")));
+    }
+
+    #[test]
+    fn build_local_temp_paths_uses_target_codec_in_filename() {
+        let temp_dir = Path::new("/tmp/watchdog");
+        let source = Path::new("/mnt/movies/Movie.mp4");
+        let (_local_source, local_output) =
+            build_local_temp_paths(temp_dir, "movies", source, "h264", "mp4");
+
+        assert!(local_output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("__Movie.h264.mp4")));
     }
 
     #[test]
@@ -3989,10 +4008,18 @@ mod tests {
 
     #[test]
     fn preset_contract_cache_key_distinguishes_target_codec_snapshots() {
-        let av1 =
-            PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "av1");
-        let h264 =
-            PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "h264");
+        let av1 = PresetSnapshot::normalized(
+            Path::new("/"),
+            "presets/AV1_MKV.json",
+            "AV1_MKV",
+            "av1",
+        );
+        let h264 = PresetSnapshot::normalized(
+            Path::new("/"),
+            "presets/AV1_MKV.json",
+            "AV1_MKV",
+            "h264",
+        );
         let payload = r#"{"PresetList":[]}"#;
 
         assert_ne!(

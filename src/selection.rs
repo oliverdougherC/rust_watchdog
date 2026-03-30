@@ -347,7 +347,7 @@ mod tests {
         let cfg = config();
         let fs = TestFs::new();
         fs.insert("/mnt/movies/needs-a.mkv", 10, 1.0);
-        fs.insert("/mnt/movies/already-av1.mkv", 10, 1.0);
+        fs.insert("/mnt/movies/already-target.mkv", 10, 1.0);
         let db = WatchdogDb::open_in_memory().unwrap();
 
         let summary = enqueue_manual_paths(

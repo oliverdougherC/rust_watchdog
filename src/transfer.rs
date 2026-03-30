@@ -1149,7 +1149,7 @@ mod tests {
         let source = Path::new("/media/movie.mp4");
         let final_path = Path::new("/media/movie.mkv");
         let local_source = Path::new("/tmp/source.mp4");
-        let local_new = Path::new("/tmp/new.av1.mkv");
+        let local_new = Path::new("/tmp/new.transcoded.mkv");
         fs.insert(source, 100);
         fs.insert(local_source, 100);
         fs.insert(local_new, 50);
@@ -1192,7 +1192,7 @@ mod tests {
         let source = Path::new("/media/movie.mp4");
         let final_path = Path::new("/media/movie.mkv");
         let local_source = Path::new("/tmp/source.mp4");
-        let local_new = Path::new("/tmp/new.av1.mkv");
+        let local_new = Path::new("/tmp/new.transcoded.mkv");
         let temp_remote = Path::new("/media/movie.mkv.watchdog.tmp");
         fs.insert(source, 100);
         fs.insert(local_source, 100);

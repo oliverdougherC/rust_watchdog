@@ -3,16 +3,15 @@
     {
       "AlignAVStart" : true,
       "AudioAutomaticNamingBehavior" : "unnamed",
-      "AudioCopyMask": [
+      "AudioCopyMask" : [
         "copy:aac",
         "copy:ac3",
         "copy:eac3",
-        "copy:dts",
         "copy:dtshd",
+        "copy:dts",
+        "copy:opus",
         "copy:truehd",
-        "copy:flac",
-        "copy:alac",
-        "copy:opus"
+        "copy:flac"
       ],
       "AudioEncoderFallback" : "opus",
       "AudioLanguageList" : [
@@ -21,11 +20,16 @@
       "AudioList" : [
         {
           "AudioBitrate" : 1152,
+          "AudioCompressionLevel" : -1,
+          "AudioDitherMethod" : "auto",
           "AudioEncoder" : "copy",
           "AudioMixdown" : "7point1",
+          "AudioNormalizeMixLevel" : false,
           "AudioSamplerate" : "auto",
           "AudioTrackDRCSlider" : 0,
-          "AudioTrackGainSlider" : 0
+          "AudioTrackGainSlider" : 0,
+          "AudioTrackQuality" : -1,
+          "AudioTrackQualityEnable" : false
         }
       ],
       "AudioSecondaryEncoderMode" : true,
@@ -35,7 +39,7 @@
       "ChildrenArray" : [
 
       ],
-      "Default" : false,
+      "Default" : true,
       "FileFormat" : "av_mkv",
       "Folder" : false,
       "FolderOpen" : false,
@@ -52,14 +56,14 @@
       "PictureColorspaceCustom" : "",
       "PictureColorspacePreset" : "off",
       "PictureCombDetectCustom" : "",
-      "PictureCombDetectPreset" : "default",
+      "PictureCombDetectPreset" : "off",
       "PictureCropMode" : 0,
       "PictureDARWidth" : 3840,
       "PictureDeblockCustom" : "strength=strong:thresh=20:blocksize=8",
       "PictureDeblockPreset" : "off",
       "PictureDeblockTune" : "medium",
       "PictureDeinterlaceCustom" : "",
-      "PictureDeinterlaceFilter" : "decomb",
+      "PictureDeinterlaceFilter" : "off",
       "PictureDeinterlacePreset" : "default",
       "PictureDenoiseCustom" : "",
       "PictureDenoiseFilter" : "off",
@@ -94,7 +98,7 @@
       "PictureWidth" : 0,
       "PresetDescription" : "",
       "PresetDisabled" : false,
-      "PresetName" : "AV1_MKV",
+      "PresetName" : "HEVC_MKV",
       "SubtitleAddCC" : false,
       "SubtitleAddForeignAudioSearch" : true,
       "SubtitleAddForeignAudioSubtitle" : false,
@@ -111,21 +115,21 @@
       "VideoAvgBitrate" : 6000,
       "VideoColorMatrixCodeOverride" : 0,
       "VideoColorRange" : "auto",
-      "VideoEncoder" : "svt_av1_10bit",
+      "VideoEncoder" : "x265_10bit",
       "VideoFramerate" : "auto",
       "VideoFramerateMode" : "vfr",
       "VideoGrayScale" : false,
       "VideoHWDecode" : 0,
       "VideoLevel" : "auto",
       "VideoMultiPass" : false,
-      "VideoOptionExtra" : "",
+      "VideoOptionExtra" : "keyint=48:no-open-gop",
       "VideoPasshtruHDRDynamicMetadata" : "all",
-      "VideoPreset" : "6",
+      "VideoPreset" : "slow",
       "VideoProfile" : "auto",
-      "VideoQualitySlider" : 22,
+      "VideoQualitySlider" : 18,
       "VideoQualityType" : 2,
       "VideoScaler" : "swscale",
-      "VideoTune" : "vq",
+      "VideoTune" : "",
       "VideoTurboMultiPass" : false,
       "x264Option" : "",
       "x264UseAdvancedOptions" : false

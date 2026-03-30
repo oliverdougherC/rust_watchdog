@@ -1644,7 +1644,7 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
 
 fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
     let block = Block::default()
-        .title(" Jellyfin AV1 Transcoding Watchdog ")
+        .title(" Jellyfin Transcoding Watchdog ")
         .title_style(
             Style::default()
                 .fg(Color::Cyan)

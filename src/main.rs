@@ -396,11 +396,7 @@ fn snapshot_local_fs_warnings(snapshot: Option<&Value>) -> Vec<String> {
 }
 
 #[derive(Parser)]
-#[command(
-    name = "watchdog",
-    about = "Jellyfin AV1 Transcoding Watchdog",
-    version
-)]
+#[command(name = "watchdog", about = "Jellyfin Transcoding Watchdog", version)]
 struct Cli {
     /// Run in simulation mode with fake data
     #[arg(long)]
@@ -596,7 +592,7 @@ async fn run() -> anyhow::Result<()> {
         .init();
 
     info!(
-        "Starting Jellyfin AV1 Transcoding Watchdog v{}",
+        "Starting Jellyfin Transcoding Watchdog v{}",
         env!("CARGO_PKG_VERSION")
     );
     info!(

@@ -2,7 +2,7 @@
 name = "watchdog"
 version = "0.1.0"
 edition = "2021"
-description = "Jellyfin AV1 Transcoding Watchdog"
+description = "Jellyfin Transcoding Watchdog"
 
 [[bin]]
 name = "watchdog"

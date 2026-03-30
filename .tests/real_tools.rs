@@ -21,9 +21,9 @@ fn run_real_tools_smoke(input_env: &str) {
 
     let preset_file = std::env::var("WATCHDOG_REAL_PRESET_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(".watchdog/presets/AV1_MKV.json"));
+        .unwrap_or_else(|_| PathBuf::from(".watchdog/presets/HEVC_MKV.json"));
     let preset_name =
-        std::env::var("WATCHDOG_REAL_PRESET_NAME").unwrap_or_else(|_| "AV1_MKV".to_string());
+        std::env::var("WATCHDOG_REAL_PRESET_NAME").unwrap_or_else(|_| "HEVC_MKV".to_string());
     if !preset_file.exists() {
         return;
     }
