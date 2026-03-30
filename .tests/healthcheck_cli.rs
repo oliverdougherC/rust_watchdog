@@ -310,6 +310,55 @@ status_snapshot = "{}"
     }
 }
 
+fn write_local_mode_config_with_missing_snapshot_path() -> TestConfigFile {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("watchdog.db");
+    let media_dir = dir.path().join("media");
+    let snapshot_path = dir.path().join("status.json");
+    std::fs::create_dir_all(&media_dir).unwrap();
+
+    let config_path = dir.path().join("watchdog.toml");
+    let mut file = std::fs::File::create(&config_path).unwrap();
+    writeln!(
+        file,
+        r#"local_mode = true
+
+[nfs]
+server = ""
+
+[[shares]]
+name = "movies"
+remote_path = ""
+local_mount = "{}"
+
+[scan]
+video_extensions = [".mkv"]
+interval_seconds = 300
+
+[safety]
+status_snapshot_stale_seconds = 30
+pause_file = "watchdog.pause"
+max_failures_before_cooldown = 3
+cooldown_base_seconds = 300
+cooldown_max_seconds = 86400
+max_consecutive_pass_failures = 3
+
+[paths]
+database = "{}"
+transcode_temp = "/tmp"
+status_snapshot = "{}"
+"#,
+        media_dir.display(),
+        db_path.display(),
+        snapshot_path.display(),
+    )
+    .unwrap();
+    TestConfigFile {
+        _dir: dir,
+        path: config_path,
+    }
+}
+
 fn write_nfs_download_area_config(with_snapshot: bool) -> TestConfigFile {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("watchdog.db");
@@ -535,6 +584,22 @@ fn doctor_local_mode_reports_share_roots() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("storage_mode: local"));
     assert!(text.contains("share_roots:"));
+}
+
+#[test]
+fn doctor_local_mode_allows_missing_snapshot_before_first_run() {
+    let cfg = write_local_mode_config_with_missing_snapshot_path();
+    let mut cmd = Command::new(bin_path());
+    let _tools = add_mock_tools(&mut cmd);
+    let output = cmd
+        .args(["--doctor", "--config", cfg.path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("status_freshness: missing"));
+    assert!(text.contains("status: ok"));
 }
 
 #[test]

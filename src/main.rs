@@ -2137,8 +2137,7 @@ fn run_doctor(
     let has_missing_deps = dep_results.iter().any(|d| !d.found);
     let has_unhealthy_mounts = mount_checks.iter().any(|m| !m.healthy);
     let temp_unsafe = !deployment_diag.temp_writable || deployment_diag.temp_inside_share_root;
-    let snapshot_degraded =
-        !simulate && snapshot_diag.snapshot_path.is_some() && snapshot_diag.freshness != "fresh";
+    let snapshot_degraded = !simulate && snapshot_diag.freshness == "stale";
     let safety_trip = service_state.auto_paused_at.is_some()
         || service_state.consecutive_pass_failures
             >= config.safety.max_consecutive_pass_failures.max(1);
