@@ -10,6 +10,32 @@ pub const SAMPLE_CONFIG_PATH: &str = ".watchdog/watchdog.toml.example";
 pub const BUNDLED_PRESET_DIR_NAME: &str = "presets";
 pub const HIDDEN_BUNDLED_PRESET_DIR_PATH: &str = ".watchdog/presets";
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| existing == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+pub fn bundled_preset_search_roots(base_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    push_unique_path(&mut roots, base_dir.join(BUNDLED_PRESET_DIR_NAME));
+    push_unique_path(&mut roots, app_dir(base_dir).join(BUNDLED_PRESET_DIR_NAME));
+
+    if let Ok(cwd) = std::env::current_dir() {
+        push_unique_path(&mut roots, cwd.join(BUNDLED_PRESET_DIR_NAME));
+        push_unique_path(&mut roots, app_dir(&cwd).join(BUNDLED_PRESET_DIR_NAME));
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            push_unique_path(&mut roots, exe_dir.join(BUNDLED_PRESET_DIR_NAME));
+            push_unique_path(&mut roots, app_dir(exe_dir).join(BUNDLED_PRESET_DIR_NAME));
+        }
+    }
+
+    roots
+}
+
 pub fn app_dir(base_dir: &Path) -> PathBuf {
     if base_dir.file_name().and_then(|name| name.to_str()) == Some(APP_DIR_NAME) {
         base_dir.to_path_buf()
@@ -19,12 +45,10 @@ pub fn app_dir(base_dir: &Path) -> PathBuf {
 }
 
 pub fn bundled_preset_dir(base_dir: &Path) -> PathBuf {
-    let direct = base_dir.join(BUNDLED_PRESET_DIR_NAME);
-    if direct.exists() {
-        direct
-    } else {
-        app_dir(base_dir).join(BUNDLED_PRESET_DIR_NAME)
-    }
+    bundled_preset_search_roots(base_dir)
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| base_dir.join(BUNDLED_PRESET_DIR_NAME))
 }
 
 #[derive(Debug, Clone, Deserialize)]

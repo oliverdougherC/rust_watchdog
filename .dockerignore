@@ -1,0 +1,14 @@
+target
+.git
+.github
+.idea
+.claude
+.dev
+.local_tui_run
+.test_videos
+.tests
+.watchdog
+watchdog.events.ndjson
+watchdog.status.json
+Dockerfile.*
+deploy/*.local.*

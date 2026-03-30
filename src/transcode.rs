@@ -1,4 +1,7 @@
-use crate::config::{bundled_preset_dir, BUNDLED_PRESET_DIR_NAME, HIDDEN_BUNDLED_PRESET_DIR_PATH};
+use crate::config::{
+    bundled_preset_dir, bundled_preset_search_roots, BUNDLED_PRESET_DIR_NAME,
+    HIDDEN_BUNDLED_PRESET_DIR_PATH,
+};
 use crate::error::{Result, WatchdogError};
 use crate::process::{
     configure_subprocess_group, describe_exit_status, format_command_for_log, infer_failure_hint,
@@ -203,6 +206,18 @@ impl PresetContract {
 }
 
 pub fn resolve_preset_path(base_dir: &Path, preset_file: &str) -> PathBuf {
+    resolve_preset_path_from_roots(
+        base_dir,
+        preset_file,
+        &bundled_preset_search_roots(base_dir),
+    )
+}
+
+fn resolve_preset_path_from_roots(
+    base_dir: &Path,
+    preset_file: &str,
+    search_roots: &[PathBuf],
+) -> PathBuf {
     let configured_path = Path::new(preset_file);
     let direct_path = if configured_path.is_absolute() {
         configured_path.to_path_buf()
@@ -213,37 +228,46 @@ pub fn resolve_preset_path(base_dir: &Path, preset_file: &str) -> PathBuf {
         return direct_path;
     }
 
-    if !configured_path.is_absolute() {
-        if let Ok(suffix) = configured_path.strip_prefix(BUNDLED_PRESET_DIR_NAME) {
-            let alternate = bundled_preset_dir(base_dir).join(suffix);
-            if alternate.exists() {
-                return alternate;
-            }
-        }
-        if let Ok(suffix) = configured_path.strip_prefix(HIDDEN_BUNDLED_PRESET_DIR_PATH) {
-            let alternate = bundled_preset_dir(base_dir).join(suffix);
-            if alternate.exists() {
-                return alternate;
-            }
-        }
-    }
-
-    let is_bare_filename = !configured_path.is_absolute()
-        && configured_path
-            .parent()
-            .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."));
-    if is_bare_filename {
-        let fallback = bundled_preset_dir(base_dir).join(
-            configured_path
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new(preset_file)),
-        );
-        if fallback.exists() {
-            return fallback;
-        }
+    if let Some(alternate) = resolve_preset_path_in_search_roots(configured_path, search_roots) {
+        return alternate;
     }
 
     direct_path
+}
+
+fn resolve_preset_path_in_search_roots(
+    configured_path: &Path,
+    search_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    if configured_path.is_absolute() {
+        return None;
+    }
+
+    if let Ok(suffix) = configured_path.strip_prefix(BUNDLED_PRESET_DIR_NAME) {
+        return find_existing_preset_path(search_roots, suffix);
+    }
+    if let Ok(suffix) = configured_path.strip_prefix(HIDDEN_BUNDLED_PRESET_DIR_PATH) {
+        return find_existing_preset_path(search_roots, suffix);
+    }
+
+    let is_bare_filename = configured_path
+        .parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."));
+    if is_bare_filename {
+        let suffix = configured_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new(""));
+        return find_existing_preset_path(search_roots, Path::new(suffix));
+    }
+
+    None
+}
+
+fn find_existing_preset_path(search_roots: &[PathBuf], suffix: &Path) -> Option<PathBuf> {
+    search_roots
+        .iter()
+        .map(|root| root.join(suffix))
+        .find(|candidate| candidate.exists())
 }
 
 pub fn load_preset_catalog(base_dir: &Path) -> Vec<PresetCatalogEntry> {
@@ -1339,7 +1363,8 @@ fn should_mark_transcode_stalled(
 mod tests {
     use super::{
         load_preset_catalog, parse_handbrake_progress_json_block, parse_handbrake_progress_text,
-        resolve_preset_path, should_mark_transcode_stalled, PresetContract,
+        resolve_preset_path, resolve_preset_path_from_roots, should_mark_transcode_stalled,
+        PresetContract,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1445,6 +1470,38 @@ mod tests {
 
         let resolved = resolve_preset_path(dir.path(), "presets/AV1_MKV.json");
         assert_eq!(resolved, dir.path().join(".watchdog/presets/AV1_MKV.json"));
+    }
+
+    #[test]
+    fn preset_path_falls_back_to_packaged_search_root_for_bare_filename() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let packaged_dir = tempfile::tempdir().unwrap();
+        let packaged_presets = packaged_dir.path().join("presets");
+        fs::create_dir_all(&packaged_presets).unwrap();
+        fs::copy(bundled_preset_file(), packaged_presets.join("AV1_MKV.json")).unwrap();
+
+        let resolved = resolve_preset_path_from_roots(
+            base_dir.path(),
+            "AV1_MKV.json",
+            &[packaged_presets.clone()],
+        );
+        assert_eq!(resolved, packaged_presets.join("AV1_MKV.json"));
+    }
+
+    #[test]
+    fn preset_path_falls_back_to_packaged_search_root_for_presets_relative_path() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let packaged_dir = tempfile::tempdir().unwrap();
+        let packaged_presets = packaged_dir.path().join("presets");
+        fs::create_dir_all(&packaged_presets).unwrap();
+        fs::copy(bundled_preset_file(), packaged_presets.join("AV1_MKV.json")).unwrap();
+
+        let resolved = resolve_preset_path_from_roots(
+            base_dir.path(),
+            "presets/AV1_MKV.json",
+            &[packaged_presets.clone()],
+        );
+        assert_eq!(resolved, packaged_presets.join("AV1_MKV.json"));
     }
 
     #[test]

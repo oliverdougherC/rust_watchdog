@@ -3,6 +3,7 @@
 Automated media transcoding pipeline for Jellyfin libraries. The project is codec-configurable and cross-platform for Linux and macOS. It scans media directories, identifies files that need transcoding, runs HandBrakeCLI with a selected preset, verifies the output, and atomically replaces the original only after the replacement passes validation.
 
 Bundled presets now ship with `HEVC_MKV` as the default and `AV1_MKV` as the alternate AV1 option.
+Preset discovery works from the config directory, the current working directory, and packaged preset directories next to the executable, which makes Docker deployments easier without copying presets into `/config`.
 
 ## Features
 
@@ -70,6 +71,8 @@ Recommended deployment shape:
 - Keep `transcode_temp` outside any scanned library root.
 - Run local mode unless you specifically need watchdog-managed NFS remounts.
 - Use `--doctor`, `--healthcheck`, and `--status-json` as part of deployment validation.
+- Keep `in_use_guard_enabled = false` in container deployments unless you deliberately share a PID namespace. `lsof` inside one container cannot see file users in other containers by default.
+- The bundled `HEVC_MKV` preset uses HandBrake's `x265_10bit` encoder. It is CPU-based, so an NVIDIA GPU is available for future presets but is not used by this preset as shipped.
 
 Example local-mode config for Ubuntu:
 
@@ -94,6 +97,33 @@ target_codec = "hevc"
 preset_file = "presets/HEVC_MKV.json"
 preset_name = "HEVC_MKV"
 ```
+
+## Dockge / Docker Compose
+
+This repo now includes a ready-to-adapt container deployment for your server layout:
+
+- [Dockerfile](/Users/ofhd/Developer/rust_watchdog/Dockerfile)
+- [deploy/docker-compose.personal-server.yml](/Users/ofhd/Developer/rust_watchdog/deploy/docker-compose.personal-server.yml)
+- [deploy/watchdog.personal-server.toml](/Users/ofhd/Developer/rust_watchdog/deploy/watchdog.personal-server.toml)
+
+Personal-server defaults in that config:
+
+- local mode with `/mnt/DataStore/data/media/movies`
+- local mode with `/mnt/DataStore/data/media/tv`
+- `HEVC_MKV` preset
+- `/transcode` mapped to NVMe-backed appdata storage
+- state files under `/config/state`
+- slower 15-minute scans and a longer share scan timeout for larger libraries
+
+Suggested Dockge bootstrap:
+
+```bash
+mkdir -p /mnt/NVME/docker/appdata/watchdog/state
+cp deploy/watchdog.personal-server.toml /mnt/NVME/docker/appdata/watchdog/watchdog.toml
+cp deploy/docker-compose.personal-server.yml /mnt/NVME/docker/appdata/watchdog/docker-compose.yml
+```
+
+Then point Dockge at the copied compose file or run it directly from the repo checkout.
 
 Example advanced NFS config for Ubuntu:
 

@@ -1,0 +1,37 @@
+services:
+  rust-watchdog:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rust-watchdog:local
+    container_name: rust-watchdog
+    restart: unless-stopped
+    init: true
+    user: "10000:10000"
+    stop_grace_period: 2m
+    environment:
+      - TZ=America/Los_Angeles
+      - RUST_LOG=info
+    command:
+      - --headless
+      - --config
+      - /config/watchdog.toml
+    volumes:
+      - /mnt/NVME/docker/appdata/watchdog:/config
+      - /mnt/NVME/docker/appdata/watchdog/transcode:/transcode
+      - /mnt/DataStore/data/media/movies:/mnt/DataStore/data/media/movies
+      - /mnt/DataStore/data/media/tv:/mnt/DataStore/data/media/tv
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/watchdog
+        - --healthcheck
+        - --config
+        - /config/watchdog.toml
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 45s
+
+    # HEVC_MKV is a CPU x265 preset. Only add NVIDIA device requests if you
+    # switch to an NVENC-capable preset.
