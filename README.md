@@ -98,6 +98,44 @@ preset_file = "presets/HEVC_MKV.json"
 preset_name = "HEVC_MKV"
 ```
 
+## Personal Server Run Script
+
+If you are running this directly on the host, use [deploy/run-personal-server.sh](/Users/ofhd/Developer/rust_watchdog/deploy/run-personal-server.sh). It keeps the runtime install outside the repo under `/mnt/NVME/docker/appdata/watchdog`, so redeploying the repo does not wipe your config, presets, database, status snapshot, or transcode scratch directory.
+
+The host-native template it installs by default is [deploy/watchdog.personal-server.host.toml](/Users/ofhd/Developer/rust_watchdog/deploy/watchdog.personal-server.host.toml). That template already matches your two media roots and uses:
+
+- `presets/HEVC_MKV.json`
+- `transcode/` under `/mnt/NVME/docker/appdata/watchdog`
+- `state/watchdog.db`
+- `state/watchdog.status.json`
+- `state/watchdog.events.ndjson`
+
+Typical host-native flow:
+
+```bash
+# Build and install/update the persistent runtime
+./deploy/run-personal-server.sh bootstrap
+
+# Validate deps, paths, and mounts
+./deploy/run-personal-server.sh doctor
+
+# Run one pass
+./deploy/run-personal-server.sh once
+
+# Run continuously in the foreground
+./deploy/run-personal-server.sh run
+
+# Install as a systemd service so it survives reboots and redeploys
+sudo ./deploy/run-personal-server.sh install-service
+```
+
+Useful follow-ups:
+
+- `./deploy/run-personal-server.sh status`
+- `./deploy/run-personal-server.sh healthcheck`
+- `sudo ./deploy/run-personal-server.sh restart-service`
+- `./deploy/run-personal-server.sh logs`
+
 ## Dockge / Docker Compose
 
 This repo now includes a ready-to-adapt container deployment for your server layout:

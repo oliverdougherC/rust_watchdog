@@ -1,0 +1,84 @@
+local_mode = true
+
+[nfs]
+server = ""
+
+[[shares]]
+name = "movies"
+remote_path = ""
+local_mount = "/mnt/DataStore/data/media/movies"
+
+[[shares]]
+name = "tv"
+remote_path = ""
+local_mount = "/mnt/DataStore/data/media/tv"
+
+[transcode]
+max_average_bitrate_mbps = 25.0
+target_codec = "hevc"
+preset_file = "presets/HEVC_MKV.json"
+preset_name = "HEVC_MKV"
+timeout_seconds = 18000
+stall_timeout_seconds = 600
+max_retries = 1
+retry_timeout_multiplier = 2.0
+retry_timeout_cap_seconds = 86400
+retry_stall_timeout_cap_seconds = 7200
+min_free_space_multiplier = 2.0
+
+[scan]
+video_extensions = [".mkv", ".mp4", ".avi", ".mov", ".webm"]
+interval_seconds = 900
+include_globs = []
+exclude_globs = []
+max_files_per_pass = 0
+probe_workers = 0
+
+[safety]
+min_file_age_seconds = 1800
+pause_file = "state/watchdog.pause"
+max_failures_before_cooldown = 3
+cooldown_base_seconds = 300
+cooldown_max_seconds = 86400
+in_use_guard_enabled = false
+in_use_guard_command = "lsof"
+stable_observations_required = 2
+stable_window_seconds = 900
+protect_hardlinked_files = true
+temporary_suffixes = [".watchdog.tmp", ".watchdog.old", ".!qB", ".part", ".partial", ".tmp"]
+recovery_scan_interval_seconds = 43200
+share_scan_timeout_seconds = 600
+max_consecutive_pass_failures = 3
+auto_pause_on_pass_failures = true
+quarantine_after_failures = 8
+quarantine_failure_codes = [
+  "timeout_exhausted",
+  "stalled_exhausted",
+  "transcode_failed",
+  "transcode_error",
+  "verification_failed",
+  "verification_error",
+  "safe_replace_failed",
+  "safe_replace_error",
+  "source_changed_during_transcode",
+]
+status_snapshot_stale_seconds = 60
+
+[notify]
+webhook_url = ""
+events = ["pass_failure_summary", "replacement_summary", "cooldown_alert"]
+timeout_seconds = 5
+
+[metrics]
+space_saved_bytes = 0
+transcoded_files = 0
+inspected_files = 0
+retries_scheduled = 0
+flush_interval_seconds = 60
+
+[paths]
+transcode_temp = "transcode"
+database = "state/watchdog.db"
+log_dir = "logs"
+status_snapshot = "state/watchdog.status.json"
+event_journal = "state/watchdog.events.ndjson"
