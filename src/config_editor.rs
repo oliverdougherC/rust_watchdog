@@ -212,12 +212,18 @@ mod tests {
         assert_eq!(round_trip.nfs_server, settings.nfs_server);
         assert_eq!(round_trip.libraries, settings.libraries);
         assert_eq!(round_trip.transcode_temp, settings.transcode_temp);
-        assert_eq!(round_trip.default_preset.preset_name, settings.default_preset.preset_name);
+        assert_eq!(
+            round_trip.default_preset.preset_name,
+            settings.default_preset.preset_name
+        );
         assert_eq!(
             round_trip.default_preset.target_codec,
             settings.default_preset.target_codec
         );
-        assert_eq!(round_trip.scan_interval_seconds, settings.scan_interval_seconds);
+        assert_eq!(
+            round_trip.scan_interval_seconds,
+            settings.scan_interval_seconds
+        );
         assert_eq!(round_trip.notify_webhook_url, settings.notify_webhook_url);
         assert_eq!(round_trip.notify_events, settings.notify_events);
     }

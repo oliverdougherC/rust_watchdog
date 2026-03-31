@@ -1629,7 +1629,7 @@ mod tests {
         let resolved = resolve_preset_path_from_roots(
             base_dir.path(),
             "AV1_MKV.json",
-            &[packaged_presets.clone()],
+            std::slice::from_ref(&packaged_presets),
         );
         assert_eq!(resolved, packaged_presets.join("AV1_MKV.json"));
     }
@@ -1645,7 +1645,7 @@ mod tests {
         let resolved = resolve_preset_path_from_roots(
             base_dir.path(),
             "presets/AV1_MKV.json",
-            &[packaged_presets.clone()],
+            std::slice::from_ref(&packaged_presets),
         );
         assert_eq!(resolved, packaged_presets.join("AV1_MKV.json"));
     }

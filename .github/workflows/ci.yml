@@ -8,24 +8,59 @@ on:
   schedule:
     - cron: "0 9 * * *"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  fast:
-    name: Fast Quality Gate
-    runs-on: macos-latest
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Format
-        run: cargo fmt --check
-      - name: Clippy
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint
         run: cargo clippy --all-targets -- -D warnings
-      - name: Tests
-        run: cargo test --all-targets
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run test suite
+        run: cargo test --all-targets --locked
 
   real-tools:
     name: Real Tools Smoke
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
+    timeout-minutes: 30
     env:
       WATCHDOG_REAL_TOOLS: "1"
       WATCHDOG_REAL_INPUT: ${{ secrets.WATCHDOG_REAL_INPUT }}
@@ -34,6 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install ffmpeg + handbrake
         run: |
           brew update

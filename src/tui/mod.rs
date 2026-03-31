@@ -529,7 +529,12 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn new(config: Config, base_dir: PathBuf, attach_hint: String, launch: TuiLaunchOptions) -> Self {
+    fn new(
+        config: Config,
+        base_dir: PathBuf,
+        attach_hint: String,
+        launch: TuiLaunchOptions,
+    ) -> Self {
         let default_preset = PresetSnapshot::normalized(
             &base_dir,
             &config.transcode.preset_file,
@@ -577,6 +582,7 @@ impl TuiApp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
     config: Config,
     base_dir: PathBuf,
@@ -603,7 +609,8 @@ pub async fn run_tui(
 
     let mut app = TuiApp::new(config, base_dir, attach_hint, launch);
     app.owned_worker = owned_worker;
-    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    app.health_report =
+        run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
     let tick_rate = Duration::from_millis(100);
 
     let result = run_tui_loop(
@@ -1223,7 +1230,9 @@ fn handle_key_event(
             app.setup_wizard = Some(SetupWizardState {
                 step: SetupStep::Welcome,
                 config_exists: app.config_path.exists(),
-                initial_validation_errors: app.editable_settings.validate_with_base_dir(&app.base_dir),
+                initial_validation_errors: app
+                    .editable_settings
+                    .validate_with_base_dir(&app.base_dir),
             });
         }
         KeyCode::Char('i') => open_text_input(
@@ -1242,9 +1251,8 @@ fn handle_key_event(
         KeyCode::Char('d') => {
             if matches!(app.current_tab, Tab::Queue) {
                 if !matches!(app.current_state.run_mode, RunMode::Precision) {
-                    app.status_message = Some(
-                        "Deleting queue rows is only available in Manual mode.".to_string(),
-                    );
+                    app.status_message =
+                        Some("Deleting queue rows is only available in Manual mode.".to_string());
                 } else if let Some(idx) = app.queue_state.table_state.selected() {
                     if let Some(record) = app.queue_state.records.get(idx) {
                         let source_path = record.source_path.clone();
@@ -1563,7 +1571,8 @@ fn commit_text_input(app: &mut TuiApp, value: String) -> anyhow::Result<()> {
         }
     }
 
-    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    app.health_report =
+        run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
     Ok(())
 }
 
@@ -1583,7 +1592,8 @@ fn finish_library_edit(app: &mut TuiApp) {
         }
     }
     app.text_input = None;
-    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    app.health_report =
+        run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
 }
 
 fn handle_import_preset(app: &mut TuiApp, path: &str) -> anyhow::Result<()> {
@@ -1592,16 +1602,25 @@ fn handle_import_preset(app: &mut TuiApp, path: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let imported = import_preset_file(&app.base_dir, Path::new(path))?;
-    if let Some(snapshot) = imported.entries.iter().find_map(PresetCatalogEntry::snapshot) {
+    if let Some(snapshot) = imported
+        .entries
+        .iter()
+        .find_map(PresetCatalogEntry::snapshot)
+    {
         app.editable_settings.default_preset = snapshot.clone();
         app.default_preset = snapshot;
     }
     app.status_message = Some(format!(
         "Imported preset file {} with {} selectable preset(s).",
         imported.stored_path,
-        imported.entries.iter().filter(|entry| entry.selectable).count()
+        imported
+            .entries
+            .iter()
+            .filter(|entry| entry.selectable)
+            .count()
     ));
-    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    app.health_report =
+        run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
     Ok(())
 }
 
@@ -1612,19 +1631,22 @@ fn save_settings(app: &mut TuiApp) -> anyhow::Result<()> {
             "Fix {} configuration issue(s) before saving.",
             validation_errors.len()
         ));
-        app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+        app.health_report =
+            run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
         return Ok(());
     }
 
     save_basic_settings_to_path(&app.config_path, &app.editable_settings)?;
-    app.live_config = Config::load(&app.config_path).unwrap_or_else(|_| app.editable_settings.to_config());
+    app.live_config =
+        Config::load(&app.config_path).unwrap_or_else(|_| app.editable_settings.to_config());
     app.default_preset = app.editable_settings.default_preset.clone();
     app.status_message = Some(format!(
         "Saved settings to {}. Restart the TUI if you changed runtime file locations.",
         app.config_path.display()
     ));
     app.setup_wizard = None;
-    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    app.health_report =
+        run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
     Ok(())
 }
 
@@ -1789,7 +1811,9 @@ fn handle_setup_key(app: &mut TuiApp, code: KeyCode) -> anyhow::Result<bool> {
         }
         KeyCode::Char('d') if matches!(step, SetupStep::Libraries) => {
             if app.selected_library_index < app.editable_settings.libraries.len() {
-                app.editable_settings.libraries.remove(app.selected_library_index);
+                app.editable_settings
+                    .libraries
+                    .remove(app.selected_library_index);
                 app.selected_library_index = app
                     .selected_library_index
                     .min(app.editable_settings.libraries.len().saturating_sub(1));
@@ -2150,7 +2174,11 @@ fn content_area(area: Rect) -> Rect {
 fn clicked_tab(area: Rect, column: u16, row: u16) -> Option<Tab> {
     let title_area = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
         .split(area)[0];
     if !rect_contains(title_area, column, row) {
         return None;
@@ -2418,8 +2446,16 @@ fn render_home_actions(f: &mut Frame, area: Rect, app: &TuiApp) {
             "Health Check",
             "Validate config and tools",
         ),
-        (HomeAction::Browse, "Browse Files", "Add files in Manual mode"),
-        (HomeAction::Presets, "Preset Selector", "Pick a default or manual preset"),
+        (
+            HomeAction::Browse,
+            "Browse Files",
+            "Add files in Manual mode",
+        ),
+        (
+            HomeAction::Presets,
+            "Preset Selector",
+            "Pick a default or manual preset",
+        ),
         (
             HomeAction::PauseResume,
             if paused { "Resume" } else { "Pause" },
@@ -2462,7 +2498,9 @@ fn render_home_actions(f: &mut Frame, area: Rect, app: &TuiApp) {
 
 fn render_health_panel(f: &mut Frame, area: Rect, app: &TuiApp) {
     let lines = if app.health_report.is_empty() {
-        vec![Line::from("Run a health check to validate your current setup.")]
+        vec![Line::from(
+            "Run a health check to validate your current setup.",
+        )]
     } else {
         app.health_report
             .iter()
@@ -2494,7 +2532,11 @@ fn render_text_input_modal(f: &mut Frame, area: Rect, input: &TextInputState) {
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
         .split(inner);
     f.render_widget(
         Paragraph::new(input.prompt.as_str()).wrap(ratatui::widgets::Wrap { trim: true }),
@@ -2528,7 +2570,11 @@ fn render_setup_wizard(f: &mut Frame, area: Rect, app: &TuiApp, setup: &SetupWiz
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let content = match setup.step {
@@ -2620,7 +2666,11 @@ fn render_setup_libraries(app: &TuiApp) -> String {
         lines.push("No library folders configured yet.".to_string());
     } else {
         for (idx, library) in app.editable_settings.libraries.iter().enumerate() {
-            let marker = if idx == app.selected_library_index { ">" } else { " " };
+            let marker = if idx == app.selected_library_index {
+                ">"
+            } else {
+                " "
+            };
             let remote = if app.editable_settings.local_mode {
                 String::new()
             } else {
@@ -2644,10 +2694,7 @@ fn render_setup_preset(app: &TuiApp) -> String {
 
 fn render_setup_review(app: &TuiApp) -> String {
     let mut lines = vec![
-        format!(
-            "Config file: {}",
-            app.config_path.display()
-        ),
+        format!("Config file: {}", app.config_path.display()),
         format!(
             "Storage mode: {}",
             if app.editable_settings.local_mode {
@@ -2661,10 +2708,7 @@ fn render_setup_review(app: &TuiApp) -> String {
             "Preset: {}",
             app.editable_settings.default_preset.short_label()
         ),
-        format!(
-            "Transcode temp: {}",
-            app.editable_settings.transcode_temp
-        ),
+        format!("Transcode temp: {}", app.editable_settings.transcode_temp),
         format!(
             "Scan interval: {} seconds",
             app.editable_settings.scan_interval_seconds

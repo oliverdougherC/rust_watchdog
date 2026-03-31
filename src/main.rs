@@ -837,9 +837,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // Open database
-    let db = if cli.simulate {
-        Arc::new(WatchdogDb::open_in_memory()?)
-    } else if interactive_setup_mode {
+    let db = if cli.simulate || interactive_setup_mode {
         Arc::new(WatchdogDb::open_in_memory()?)
     } else {
         let db_path = runtime_paths.database.clone();
@@ -2325,6 +2323,11 @@ mod tests {
             &[String::from("config error")]
         ));
         assert!(!should_enter_setup_tui(true, false, false, &[]));
-        assert!(!should_enter_setup_tui(false, true, true, &[String::from("config error")]));
+        assert!(!should_enter_setup_tui(
+            false,
+            true,
+            true,
+            &[String::from("config error")]
+        ));
     }
 }

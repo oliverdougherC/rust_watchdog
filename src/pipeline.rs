@@ -4013,18 +4013,10 @@ mod tests {
 
     #[test]
     fn preset_contract_cache_key_distinguishes_target_codec_snapshots() {
-        let av1 = PresetSnapshot::normalized(
-            Path::new("/"),
-            "presets/AV1_MKV.json",
-            "AV1_MKV",
-            "av1",
-        );
-        let h264 = PresetSnapshot::normalized(
-            Path::new("/"),
-            "presets/AV1_MKV.json",
-            "AV1_MKV",
-            "h264",
-        );
+        let av1 =
+            PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "av1");
+        let h264 =
+            PresetSnapshot::normalized(Path::new("/"), "presets/AV1_MKV.json", "AV1_MKV", "h264");
         let payload = r#"{"PresetList":[]}"#;
 
         assert_ne!(
