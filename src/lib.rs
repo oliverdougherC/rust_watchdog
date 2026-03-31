@@ -1,4 +1,5 @@
 pub mod config;
+pub mod config_editor;
 pub mod db;
 pub mod diagnostics;
 pub mod error;

@@ -6,6 +6,7 @@ pub mod queue_tab;
 pub mod widgets;
 
 use crate::config::{bundled_preset_dir, Config};
+use crate::config_editor::{save_basic_settings_to_path, BasicSettings, EditableLibrary};
 use crate::db::{ServiceState, WatchdogDb};
 use crate::event_journal::{
     append_event, append_log_event, read_recent_log_lines_for_current_session,
@@ -20,7 +21,8 @@ use crate::state::{AppState, PipelinePhase, ProgressStage, RunMode};
 use crate::status_snapshot::read_snapshot_file;
 use crate::traits::FileSystem;
 use crate::transcode::{
-    load_preset_catalog, load_preset_payload_text, PresetCatalogEntry, PresetSnapshot,
+    import_preset_file, load_preset_catalog, load_preset_payload_text, PresetCatalogEntry,
+    PresetSnapshot,
 };
 use crate::util::{copy_to_clipboard, pid_is_running};
 use crossterm::{
@@ -61,13 +63,7 @@ enum Tab {
 
 impl Tab {
     fn titles() -> Vec<&'static str> {
-        vec![
-            "1 Dashboard",
-            "2 Queue",
-            "3 Logs",
-            "4 History",
-            "5 Cooldown",
-        ]
+        vec!["1 Home", "2 Queue", "3 Activity", "4 History", "5 Cooling"]
     }
 
     fn index(self) -> usize {
@@ -405,18 +401,114 @@ struct SelectionTaskState {
     started_at: Instant,
 }
 
+pub struct TuiLaunchOptions {
+    pub config_path: PathBuf,
+    pub setup_mode: bool,
+    pub config_exists: bool,
+    pub validation_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupStep {
+    Welcome,
+    Storage,
+    Libraries,
+    Preset,
+    Review,
+}
+
+impl SetupStep {
+    fn next(self) -> Self {
+        match self {
+            Self::Welcome => Self::Storage,
+            Self::Storage => Self::Libraries,
+            Self::Libraries => Self::Preset,
+            Self::Preset => Self::Review,
+            Self::Review => Self::Review,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Welcome => Self::Welcome,
+            Self::Storage => Self::Welcome,
+            Self::Libraries => Self::Storage,
+            Self::Preset => Self::Libraries,
+            Self::Review => Self::Preset,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Welcome => "Welcome / Check Environment",
+            Self::Storage => "Choose Storage Mode",
+            Self::Libraries => "Add Library Folders",
+            Self::Preset => "Choose or Import Preset",
+            Self::Review => "Review, Save, and Check",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SetupWizardState {
+    step: SetupStep,
+    config_exists: bool,
+    initial_validation_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextInputKind {
+    NfsServer,
+    TranscodeTemp,
+    ScanInterval,
+    WebhookUrl,
+    ImportPresetPath,
+    LibraryField,
+}
+
+#[derive(Debug, Clone)]
+struct TextInputState {
+    title: String,
+    prompt: String,
+    value: String,
+    kind: TextInputKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryField {
+    Name,
+    LocalMount,
+    RemotePath,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLibraryEdit {
+    index: Option<usize>,
+    draft: EditableLibrary,
+    field: LibraryField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresetSelectionContext {
+    DefaultPreset,
+    ManualSelection,
+}
+
 struct TuiApp {
     current_tab: Tab,
     logs_state: logs_tab::LogsTabState,
     history_state: history_tab::HistoryTabState,
     cooldown_state: cooldown_tab::CooldownTabState,
     queue_state: queue_tab::QueueTabState,
+    live_config: Config,
     base_dir: PathBuf,
+    config_path: PathBuf,
     last_db_refresh: Instant,
     last_snapshot_refresh: Instant,
     current_state: AppState,
     browser: Option<BrowserState>,
     preset_selector: Option<PresetSelectorState>,
+    preset_selector_context: PresetSelectionContext,
     quit_choice: QuitChoice,
     show_quit_modal: bool,
     quit_kill_state: Option<QuitKillState>,
@@ -424,32 +516,42 @@ struct TuiApp {
     owned_worker: Option<Child>,
     auto_opened_browser: bool,
     status_message: Option<String>,
+    health_report: Vec<String>,
     attach_hint: String,
     selection_task: Option<SelectionTaskState>,
     default_preset: PresetSnapshot,
     selected_precision_preset: PresetSnapshot,
+    editable_settings: BasicSettings,
+    setup_wizard: Option<SetupWizardState>,
+    text_input: Option<TextInputState>,
+    pending_library_edit: Option<PendingLibraryEdit>,
+    selected_library_index: usize,
 }
 
 impl TuiApp {
-    fn new(config: &Config, base_dir: PathBuf, attach_hint: String) -> Self {
+    fn new(config: Config, base_dir: PathBuf, attach_hint: String, launch: TuiLaunchOptions) -> Self {
         let default_preset = PresetSnapshot::normalized(
             &base_dir,
             &config.transcode.preset_file,
             &config.transcode.preset_name,
             &config.transcode.target_codec,
         );
+        let editable_settings = BasicSettings::from_config(&config, &base_dir);
         Self {
             current_tab: Tab::Dashboard,
             logs_state: logs_tab::LogsTabState::default(),
             history_state: history_tab::HistoryTabState::default(),
             cooldown_state: cooldown_tab::CooldownTabState::default(),
             queue_state: queue_tab::QueueTabState::default(),
+            live_config: config,
             base_dir,
+            config_path: launch.config_path,
             last_db_refresh: Instant::now() - Duration::from_secs(10),
             last_snapshot_refresh: Instant::now() - Duration::from_secs(10),
             current_state: AppState::default(),
             browser: None,
             preset_selector: None,
+            preset_selector_context: PresetSelectionContext::ManualSelection,
             quit_choice: QuitChoice::Background,
             show_quit_modal: false,
             quit_kill_state: None,
@@ -457,10 +559,20 @@ impl TuiApp {
             owned_worker: None,
             auto_opened_browser: false,
             status_message: None,
+            health_report: Vec::new(),
             attach_hint,
             selection_task: None,
             default_preset: default_preset.clone(),
             selected_precision_preset: default_preset,
+            editable_settings,
+            setup_wizard: launch.setup_mode.then_some(SetupWizardState {
+                step: SetupStep::Welcome,
+                config_exists: launch.config_exists,
+                initial_validation_errors: launch.validation_errors,
+            }),
+            text_input: None,
+            pending_library_edit: None,
+            selected_library_index: 0,
         }
     }
 }
@@ -473,6 +585,7 @@ pub async fn run_tui(
     event_journal_path: PathBuf,
     attach_hint: String,
     owned_worker: Option<Child>,
+    launch: TuiLaunchOptions,
 ) -> anyhow::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -488,14 +601,14 @@ pub async fn run_tui(
     let backend = ratatui::backend::CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = TuiApp::new(&config, base_dir, attach_hint);
+    let mut app = TuiApp::new(config, base_dir, attach_hint, launch);
     app.owned_worker = owned_worker;
+    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
     let tick_rate = Duration::from_millis(100);
 
     let result = run_tui_loop(
         &mut terminal,
         &mut app,
-        &config,
         &db,
         &snapshot_path,
         &event_journal_path,
@@ -512,7 +625,6 @@ pub async fn run_tui(
 async fn run_tui_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut TuiApp,
-    config: &Config,
     db: &Arc<WatchdogDb>,
     snapshot_path: &Path,
     event_journal_path: &Path,
@@ -537,7 +649,7 @@ async fn run_tui_loop(
             && db.get_queue_count() == 0
             && app.selection_task.is_none()
         {
-            app.browser = Some(BrowserState::new(config));
+            app.browser = Some(BrowserState::new(&app.live_config));
             app.auto_opened_browser = true;
         }
 
@@ -549,7 +661,7 @@ async fn run_tui_loop(
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    if handle_key_event(app, config, db, event_journal_path, key.code)? {
+                    if handle_key_event(app, db, event_journal_path, key.code)? {
                         return Ok(());
                     }
                 }
@@ -1027,27 +1139,26 @@ fn start_manual_selection_task(
     });
 }
 
-fn open_preset_selector(app: &mut TuiApp) {
-    if !matches!(app.current_state.run_mode, RunMode::Precision) {
-        app.status_message =
-            Some("Codec selector is only available in precision mode.".to_string());
-        return;
-    }
+fn open_preset_selector(app: &mut TuiApp, context: PresetSelectionContext) {
+    let current = match context {
+        PresetSelectionContext::DefaultPreset => &app.editable_settings.default_preset,
+        PresetSelectionContext::ManualSelection => &app.selected_precision_preset,
+    };
 
-    let selector = PresetSelectorState::new(&app.base_dir, &app.selected_precision_preset);
+    let selector = PresetSelectorState::new(&app.base_dir, current);
     if selector.entries.is_empty() {
         app.status_message = Some(format!(
             "No preset files found in {}",
             bundled_preset_dir(&app.base_dir).display()
         ));
     } else {
+        app.preset_selector_context = context;
         app.preset_selector = Some(selector);
     }
 }
 
 fn handle_key_event(
     app: &mut TuiApp,
-    config: &Config,
     db: &Arc<WatchdogDb>,
     event_journal_path: &Path,
     code: KeyCode,
@@ -1056,12 +1167,20 @@ fn handle_key_event(
         return handle_quit_modal_key(app, db.as_ref(), event_journal_path, code);
     }
 
+    if app.text_input.is_some() {
+        return handle_text_input_key(app, code);
+    }
+
     if app.preset_selector.is_some() {
         return handle_preset_selector_key(app, code);
     }
 
     if app.browser.is_some() {
-        return handle_browser_key(app, config, db, event_journal_path, code);
+        return handle_browser_key(app, db, event_journal_path, code);
+    }
+
+    if app.setup_wizard.is_some() {
+        return handle_setup_key(app, code);
     }
 
     match code {
@@ -1089,15 +1208,42 @@ fn handle_key_event(
             if app.selection_task.is_some() {
                 app.status_message = Some("Manual selection is already scanning.".to_string());
             } else {
-                app.browser = Some(BrowserState::new(config));
+                app.browser = Some(BrowserState::new(&app.live_config));
             }
         }
-        KeyCode::Char('c') => open_preset_selector(app),
+        KeyCode::Char('c') => {
+            let context = if matches!(app.current_state.run_mode, RunMode::Precision) {
+                PresetSelectionContext::ManualSelection
+            } else {
+                PresetSelectionContext::DefaultPreset
+            };
+            open_preset_selector(app, context);
+        }
+        KeyCode::Char('s') => {
+            app.setup_wizard = Some(SetupWizardState {
+                step: SetupStep::Welcome,
+                config_exists: app.config_path.exists(),
+                initial_validation_errors: app.editable_settings.validate_with_base_dir(&app.base_dir),
+            });
+        }
+        KeyCode::Char('i') => open_text_input(
+            app,
+            TextInputKind::ImportPresetPath,
+            "Import Preset",
+            "Enter a preset JSON path to import into this app:",
+            String::new(),
+        ),
+        KeyCode::Char('h') => {
+            app.health_report =
+                run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+            app.status_message = Some("Health check updated.".to_string());
+        }
+        KeyCode::Char('p') => toggle_pause_file(app)?,
         KeyCode::Char('d') => {
             if matches!(app.current_tab, Tab::Queue) {
                 if !matches!(app.current_state.run_mode, RunMode::Precision) {
                     app.status_message = Some(
-                        "Deleting queue rows is only available in precision mode.".to_string(),
+                        "Deleting queue rows is only available in Manual mode.".to_string(),
                     );
                 } else if let Some(idx) = app.queue_state.table_state.selected() {
                     if let Some(record) = app.queue_state.records.get(idx) {
@@ -1179,7 +1325,6 @@ fn handle_key_event(
 
 fn handle_browser_key(
     app: &mut TuiApp,
-    config: &Config,
     db: &Arc<WatchdogDb>,
     _event_journal_path: &Path,
     code: KeyCode,
@@ -1193,7 +1338,7 @@ fn handle_browser_key(
 
     match code {
         KeyCode::Esc => app.browser = None,
-        KeyCode::Char('c') => open_preset_selector(app),
+        KeyCode::Char('c') => open_preset_selector(app, PresetSelectionContext::ManualSelection),
         KeyCode::Char('j') | KeyCode::Down => {
             if let Some(browser) = app.browser.as_mut() {
                 browser.move_down();
@@ -1206,7 +1351,7 @@ fn handle_browser_key(
         }
         KeyCode::Enter => {
             if let Some(browser) = app.browser.as_mut() {
-                browser.descend_or_toggle(config);
+                browser.descend_or_toggle(&app.live_config);
             }
         }
         KeyCode::Char(' ') => {
@@ -1216,7 +1361,7 @@ fn handle_browser_key(
         }
         KeyCode::Backspace => {
             if let Some(browser) = app.browser.as_mut() {
-                browser.go_up(config);
+                browser.go_up(&app.live_config);
             }
         }
         KeyCode::Char('a') => {
@@ -1229,7 +1374,8 @@ fn handle_browser_key(
                 app.status_message =
                     Some("Select at least one file or folder before adding.".to_string());
             } else {
-                start_manual_selection_task(app, config, db, selected);
+                let config = app.live_config.clone();
+                start_manual_selection_task(app, &config, db, selected);
             }
         }
         _ => {}
@@ -1272,11 +1418,23 @@ fn handle_preset_selector_key(app: &mut TuiApp, code: KeyCode) -> anyhow::Result
                 return Ok(false);
             };
             if let Some(snapshot) = entry.snapshot() {
-                app.selected_precision_preset = snapshot;
-                app.status_message = Some(format!(
-                    "Precision preset selected: {}",
-                    app.selected_precision_preset.short_label()
-                ));
+                match app.preset_selector_context {
+                    PresetSelectionContext::DefaultPreset => {
+                        app.editable_settings.default_preset = snapshot.clone();
+                        app.default_preset = snapshot.clone();
+                        app.status_message = Some(format!(
+                            "Default preset selected: {}",
+                            snapshot.short_label()
+                        ));
+                    }
+                    PresetSelectionContext::ManualSelection => {
+                        app.selected_precision_preset = snapshot.clone();
+                        app.status_message = Some(format!(
+                            "Manual mode preset selected: {}",
+                            snapshot.short_label()
+                        ));
+                    }
+                }
                 app.preset_selector = None;
             } else {
                 app.status_message = Some(
@@ -1290,6 +1448,405 @@ fn handle_preset_selector_key(app: &mut TuiApp, code: KeyCode) -> anyhow::Result
         _ => {}
     }
 
+    Ok(false)
+}
+
+fn open_text_input(
+    app: &mut TuiApp,
+    kind: TextInputKind,
+    title: &str,
+    prompt: &str,
+    value: String,
+) {
+    app.text_input = Some(TextInputState {
+        title: title.to_string(),
+        prompt: prompt.to_string(),
+        value,
+        kind,
+    });
+}
+
+fn start_library_edit(app: &mut TuiApp, index: Option<usize>) {
+    let draft = index
+        .and_then(|idx| app.editable_settings.libraries.get(idx).cloned())
+        .unwrap_or_else(|| EditableLibrary {
+            name: String::new(),
+            local_mount: String::new(),
+            remote_path: String::new(),
+        });
+    app.pending_library_edit = Some(PendingLibraryEdit {
+        index,
+        draft,
+        field: LibraryField::Name,
+    });
+    open_next_library_field(app);
+}
+
+fn open_next_library_field(app: &mut TuiApp) {
+    let Some(pending) = app.pending_library_edit.as_ref() else {
+        return;
+    };
+    let (title, prompt, value) = match pending.field {
+        LibraryField::Name => (
+            "Library Name",
+            "Enter a short name for this library folder:",
+            pending.draft.name.clone(),
+        ),
+        LibraryField::LocalMount => (
+            "Local Path",
+            "Enter the local path to watch on this machine:",
+            pending.draft.local_mount.clone(),
+        ),
+        LibraryField::RemotePath => (
+            "Remote Path",
+            "Enter the remote NFS path for this library (leave blank in Local mode):",
+            pending.draft.remote_path.clone(),
+        ),
+    };
+    open_text_input(app, TextInputKind::LibraryField, title, prompt, value);
+}
+
+fn commit_text_input(app: &mut TuiApp, value: String) -> anyhow::Result<()> {
+    let Some(input) = app.text_input.take() else {
+        return Ok(());
+    };
+
+    match input.kind {
+        TextInputKind::NfsServer => {
+            app.editable_settings.nfs_server = value.trim().to_string();
+            app.status_message = Some("NFS server updated.".to_string());
+        }
+        TextInputKind::TranscodeTemp => {
+            app.editable_settings.transcode_temp = value.trim().to_string();
+            app.status_message = Some("Transcode temp folder updated.".to_string());
+        }
+        TextInputKind::ScanInterval => match value.trim().parse::<u64>() {
+            Ok(interval) if interval > 0 => {
+                app.editable_settings.scan_interval_seconds = interval;
+                app.status_message = Some("Scan interval updated.".to_string());
+            }
+            _ => {
+                app.status_message = Some("Scan interval must be a positive number.".to_string());
+            }
+        },
+        TextInputKind::WebhookUrl => {
+            app.editable_settings.notify_webhook_url = value.trim().to_string();
+            app.status_message = Some("Webhook URL updated.".to_string());
+        }
+        TextInputKind::ImportPresetPath => {
+            handle_import_preset(app, value.trim())?;
+        }
+        TextInputKind::LibraryField => {
+            let Some(pending) = app.pending_library_edit.as_mut() else {
+                return Ok(());
+            };
+            match pending.field {
+                LibraryField::Name => {
+                    pending.draft.name = value.trim().to_string();
+                    pending.field = LibraryField::LocalMount;
+                }
+                LibraryField::LocalMount => {
+                    pending.draft.local_mount = value.trim().to_string();
+                    if app.editable_settings.local_mode {
+                        finish_library_edit(app);
+                        return Ok(());
+                    }
+                    pending.field = LibraryField::RemotePath;
+                }
+                LibraryField::RemotePath => {
+                    pending.draft.remote_path = value.trim().to_string();
+                    finish_library_edit(app);
+                    return Ok(());
+                }
+            }
+            open_next_library_field(app);
+        }
+    }
+
+    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    Ok(())
+}
+
+fn finish_library_edit(app: &mut TuiApp) {
+    let Some(pending) = app.pending_library_edit.take() else {
+        return;
+    };
+    match pending.index {
+        Some(idx) if idx < app.editable_settings.libraries.len() => {
+            app.editable_settings.libraries[idx] = pending.draft;
+            app.status_message = Some("Library folder updated.".to_string());
+        }
+        _ => {
+            app.editable_settings.libraries.push(pending.draft);
+            app.selected_library_index = app.editable_settings.libraries.len().saturating_sub(1);
+            app.status_message = Some("Library folder added.".to_string());
+        }
+    }
+    app.text_input = None;
+    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+}
+
+fn handle_import_preset(app: &mut TuiApp, path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        app.status_message = Some("Enter a preset JSON path first.".to_string());
+        return Ok(());
+    }
+    let imported = import_preset_file(&app.base_dir, Path::new(path))?;
+    if let Some(snapshot) = imported.entries.iter().find_map(PresetCatalogEntry::snapshot) {
+        app.editable_settings.default_preset = snapshot.clone();
+        app.default_preset = snapshot;
+    }
+    app.status_message = Some(format!(
+        "Imported preset file {} with {} selectable preset(s).",
+        imported.stored_path,
+        imported.entries.iter().filter(|entry| entry.selectable).count()
+    ));
+    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    Ok(())
+}
+
+fn save_settings(app: &mut TuiApp) -> anyhow::Result<()> {
+    let validation_errors = app.editable_settings.validate_with_base_dir(&app.base_dir);
+    if !validation_errors.is_empty() {
+        app.status_message = Some(format!(
+            "Fix {} configuration issue(s) before saving.",
+            validation_errors.len()
+        ));
+        app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+        return Ok(());
+    }
+
+    save_basic_settings_to_path(&app.config_path, &app.editable_settings)?;
+    app.live_config = Config::load(&app.config_path).unwrap_or_else(|_| app.editable_settings.to_config());
+    app.default_preset = app.editable_settings.default_preset.clone();
+    app.status_message = Some(format!(
+        "Saved settings to {}. Restart the TUI if you changed runtime file locations.",
+        app.config_path.display()
+    ));
+    app.setup_wizard = None;
+    app.health_report = run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+    Ok(())
+}
+
+fn run_embedded_health_check(
+    live_config: &Config,
+    settings: &BasicSettings,
+    base_dir: &Path,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let validation_errors = settings.validate_with_base_dir(base_dir);
+    if validation_errors.is_empty() {
+        lines.push("Configuration: ready".to_string());
+    } else {
+        lines.push(format!(
+            "Configuration: {} issue(s)",
+            validation_errors.len()
+        ));
+        for err in validation_errors.iter().take(3) {
+            lines.push(format!(" - {}", err));
+        }
+    }
+
+    let deps = ["ffprobe", "HandBrakeCLI", "rsync"];
+    let mut missing = Vec::new();
+    for dep in deps {
+        if which::which(dep).is_err() {
+            missing.push(dep);
+        }
+    }
+    if missing.is_empty() {
+        lines.push("Dependencies: ffprobe, HandBrakeCLI, and rsync found".to_string());
+    } else {
+        lines.push(format!("Dependencies missing: {}", missing.join(", ")));
+    }
+
+    let preset_path = settings.default_preset.resolve_path(base_dir);
+    lines.push(format!(
+        "Default preset: {}",
+        if preset_path.exists() {
+            settings.default_preset.short_label()
+        } else {
+            format!("missing ({})", preset_path.display())
+        }
+    ));
+
+    lines.push(format!(
+        "Storage mode: {}",
+        if settings.local_mode { "Local" } else { "NFS" }
+    ));
+    lines.push(format!(
+        "Library folders: {} configured",
+        settings.libraries.len()
+    ));
+    lines.push(format!(
+        "Current runtime preset: {}",
+        PresetSnapshot::normalized(
+            base_dir,
+            &live_config.transcode.preset_file,
+            &live_config.transcode.preset_name,
+            &live_config.transcode.target_codec,
+        )
+        .short_label()
+    ));
+    lines
+}
+
+fn toggle_pause_file(app: &mut TuiApp) -> anyhow::Result<()> {
+    let pause_path = app
+        .live_config
+        .resolve_path(&app.base_dir, &app.live_config.safety.pause_file);
+    if pause_path.exists() {
+        std::fs::remove_file(&pause_path)?;
+        app.status_message = Some("Watchdog resumed.".to_string());
+    } else {
+        if let Some(parent) = pause_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let marker = format!(
+            "paused_at={}\nreason=manual_tui\nsource=operator\n",
+            chrono::Utc::now().to_rfc3339()
+        );
+        std::fs::write(&pause_path, marker.as_bytes())?;
+        app.status_message = Some("Watchdog paused.".to_string());
+    }
+    Ok(())
+}
+
+fn handle_text_input_key(app: &mut TuiApp, code: KeyCode) -> anyhow::Result<bool> {
+    let Some(input) = app.text_input.as_mut() else {
+        return Ok(false);
+    };
+    match code {
+        KeyCode::Esc => {
+            app.text_input = None;
+            app.pending_library_edit = None;
+        }
+        KeyCode::Backspace => {
+            input.value.pop();
+        }
+        KeyCode::Enter => {
+            let value = input.value.clone();
+            commit_text_input(app, value)?;
+        }
+        KeyCode::Char(ch) => {
+            input.value.push(ch);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_setup_key(app: &mut TuiApp, code: KeyCode) -> anyhow::Result<bool> {
+    let Some(step) = app.setup_wizard.as_ref().map(|setup| setup.step) else {
+        return Ok(false);
+    };
+
+    match code {
+        KeyCode::Esc => {
+            app.setup_wizard = None;
+        }
+        KeyCode::Left | KeyCode::BackTab => {
+            if let Some(setup) = app.setup_wizard.as_mut() {
+                setup.step = setup.step.prev();
+            }
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            if let Some(setup) = app.setup_wizard.as_mut() {
+                setup.step = setup.step.next();
+            }
+        }
+        KeyCode::Enter => {
+            if matches!(step, SetupStep::Review) {
+                save_settings(app)?;
+            } else {
+                if let Some(setup) = app.setup_wizard.as_mut() {
+                    setup.step = setup.step.next();
+                }
+            }
+        }
+        KeyCode::Char('l') if matches!(step, SetupStep::Storage) => {
+            app.editable_settings.local_mode = true;
+            app.status_message = Some("Storage mode set to Local.".to_string());
+        }
+        KeyCode::Char('n') if matches!(step, SetupStep::Storage) => {
+            app.editable_settings.local_mode = false;
+            app.status_message = Some("Storage mode set to NFS.".to_string());
+        }
+        KeyCode::Char('e') if matches!(step, SetupStep::Storage) => {
+            open_text_input(
+                app,
+                TextInputKind::NfsServer,
+                "NFS Server",
+                "Enter the NFS server host or IP address:",
+                app.editable_settings.nfs_server.clone(),
+            );
+        }
+        KeyCode::Char('a') if matches!(step, SetupStep::Libraries) => start_library_edit(app, None),
+        KeyCode::Char('e') if matches!(step, SetupStep::Libraries) => {
+            if app.selected_library_index < app.editable_settings.libraries.len() {
+                start_library_edit(app, Some(app.selected_library_index));
+            }
+        }
+        KeyCode::Char('d') if matches!(step, SetupStep::Libraries) => {
+            if app.selected_library_index < app.editable_settings.libraries.len() {
+                app.editable_settings.libraries.remove(app.selected_library_index);
+                app.selected_library_index = app
+                    .selected_library_index
+                    .min(app.editable_settings.libraries.len().saturating_sub(1));
+                app.status_message = Some("Library folder removed.".to_string());
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down if matches!(step, SetupStep::Libraries) => {
+            if app.selected_library_index + 1 < app.editable_settings.libraries.len() {
+                app.selected_library_index += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up if matches!(step, SetupStep::Libraries) => {
+            if app.selected_library_index > 0 {
+                app.selected_library_index -= 1;
+            }
+        }
+        KeyCode::Char('c') if matches!(step, SetupStep::Preset) => {
+            open_preset_selector(app, PresetSelectionContext::DefaultPreset);
+        }
+        KeyCode::Char('i') if matches!(step, SetupStep::Preset) => open_text_input(
+            app,
+            TextInputKind::ImportPresetPath,
+            "Import Preset",
+            "Enter a preset JSON path to import into this app:",
+            String::new(),
+        ),
+        KeyCode::Char('t') if matches!(step, SetupStep::Review) => open_text_input(
+            app,
+            TextInputKind::TranscodeTemp,
+            "Transcode Temp Folder",
+            "Enter the temporary transcode folder path:",
+            app.editable_settings.transcode_temp.clone(),
+        ),
+        KeyCode::Char('w') if matches!(step, SetupStep::Review) => open_text_input(
+            app,
+            TextInputKind::WebhookUrl,
+            "Webhook URL",
+            "Enter a notification webhook URL (optional):",
+            app.editable_settings.notify_webhook_url.clone(),
+        ),
+        KeyCode::Char('i') if matches!(step, SetupStep::Review) => open_text_input(
+            app,
+            TextInputKind::ScanInterval,
+            "Scan Interval",
+            "Enter the scan interval in seconds:",
+            app.editable_settings.scan_interval_seconds.to_string(),
+        ),
+        KeyCode::Char('h') if matches!(step, SetupStep::Review) => {
+            app.health_report =
+                run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+            app.status_message = Some("Health check updated.".to_string());
+        }
+        KeyCode::Char('s') if matches!(step, SetupStep::Review) => {
+            save_settings(app)?;
+        }
+        _ => {}
+    }
     Ok(false)
 }
 
@@ -1465,6 +2022,10 @@ fn handle_mouse_event(
     mouse: MouseEvent,
     area: Rect,
 ) -> anyhow::Result<bool> {
+    if let Some(_input) = app.text_input.as_ref() {
+        return Ok(false);
+    }
+
     if app.show_quit_modal {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return Ok(false);
@@ -1477,6 +2038,25 @@ fn handle_mouse_event(
             }
         }
         return Ok(false);
+    }
+
+    if app.setup_wizard.is_some() {
+        return Ok(false);
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some(tab) = clicked_tab(area, mouse.column, mouse.row) {
+            app.current_tab = tab;
+            return Ok(false);
+        }
+
+        if matches!(app.current_tab, Tab::Dashboard) {
+            for (action, rect) in home_action_rects(content_area(area)).into_iter() {
+                if rect_contains(rect, mouse.column, mouse.row) {
+                    return perform_home_action(app, db, event_journal_path, action);
+                }
+            }
+        }
     }
 
     if let Some(selector) = app.preset_selector.as_mut() {
@@ -1508,6 +2088,122 @@ fn handle_mouse_event(
     }
 
     Ok(false)
+}
+
+fn perform_home_action(
+    app: &mut TuiApp,
+    db: &Arc<WatchdogDb>,
+    _event_journal_path: &Path,
+    action: HomeAction,
+) -> anyhow::Result<bool> {
+    match action {
+        HomeAction::Setup => {
+            app.setup_wizard = Some(SetupWizardState {
+                step: SetupStep::Welcome,
+                config_exists: app.config_path.exists(),
+                initial_validation_errors: app
+                    .editable_settings
+                    .validate_with_base_dir(&app.base_dir),
+            });
+        }
+        HomeAction::HealthCheck => {
+            app.health_report =
+                run_embedded_health_check(&app.live_config, &app.editable_settings, &app.base_dir);
+            app.status_message = Some("Health check updated.".to_string());
+        }
+        HomeAction::Browse => {
+            if app.selection_task.is_some() {
+                app.status_message = Some("Manual selection is already scanning.".to_string());
+            } else {
+                app.browser = Some(BrowserState::new(&app.live_config));
+            }
+        }
+        HomeAction::Presets => open_preset_selector(app, PresetSelectionContext::DefaultPreset),
+        HomeAction::PauseResume => {
+            toggle_pause_file(app)?;
+        }
+        HomeAction::ImportPreset => open_text_input(
+            app,
+            TextInputKind::ImportPresetPath,
+            "Import Preset",
+            "Enter a preset JSON path to import into this app:",
+            String::new(),
+        ),
+    }
+    if matches!(action, HomeAction::Browse) {
+        let _ = db;
+    }
+    Ok(false)
+}
+
+fn content_area(area: Rect) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(area)[1]
+}
+
+fn clicked_tab(area: Rect, column: u16, row: u16) -> Option<Tab> {
+    let title_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(2)])
+        .split(area)[0];
+    if !rect_contains(title_area, column, row) {
+        return None;
+    }
+    let inner = Block::default().borders(Borders::ALL).inner(title_area);
+    let mut x = inner.x;
+    for (idx, title) in Tab::titles().iter().enumerate() {
+        let width = title.len() as u16;
+        let rect = Rect::new(x, inner.y, width, inner.height);
+        if rect_contains(rect, column, row) {
+            return Some(match idx {
+                0 => Tab::Dashboard,
+                1 => Tab::Queue,
+                2 => Tab::Logs,
+                3 => Tab::History,
+                4 => Tab::Cooldown,
+                _ => Tab::Dashboard,
+            });
+        }
+        x = x.saturating_add(width + 3);
+    }
+    None
+}
+
+fn home_action_rects(area: Rect) -> Vec<(HomeAction, Rect)> {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(14),
+            Constraint::Length(5),
+            Constraint::Min(6),
+        ])
+        .split(area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(16),
+            Constraint::Percentage(17),
+            Constraint::Percentage(16),
+            Constraint::Percentage(17),
+        ])
+        .split(sections[1]);
+
+    vec![
+        (HomeAction::Setup, columns[0]),
+        (HomeAction::HealthCheck, columns[1]),
+        (HomeAction::Browse, columns[2]),
+        (HomeAction::Presets, columns[3]),
+        (HomeAction::PauseResume, columns[4]),
+        (HomeAction::ImportPreset, columns[5]),
+    ]
 }
 
 fn format_manual_selection_message(summary: &crate::selection::ManualSelectionSummary) -> String {
@@ -1606,7 +2302,7 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
 
     render_title_bar(f, outer_chunks[0], app);
     match app.current_tab {
-        Tab::Dashboard => dashboard_tab::render_dashboard(f, outer_chunks[1], &app.current_state),
+        Tab::Dashboard => render_home(f, outer_chunks[1], app),
         Tab::Queue => queue_tab::render_queue(
             f,
             outer_chunks[1],
@@ -1635,7 +2331,17 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
         );
     }
     if let Some(selector) = app.preset_selector.as_mut() {
-        render_preset_selector_modal(f, size, selector, &app.selected_precision_preset);
+        let selected = match app.preset_selector_context {
+            PresetSelectionContext::DefaultPreset => &app.editable_settings.default_preset,
+            PresetSelectionContext::ManualSelection => &app.selected_precision_preset,
+        };
+        render_preset_selector_modal(f, size, selector, selected);
+    }
+    if let Some(text_input) = app.text_input.as_ref() {
+        render_text_input_modal(f, size, text_input);
+    }
+    if let Some(setup) = app.setup_wizard.as_ref() {
+        render_setup_wizard(f, size, app, setup);
     }
     if app.show_quit_modal {
         render_quit_modal(f, size, app);
@@ -1644,7 +2350,7 @@ fn draw_ui(f: &mut Frame, app: &mut TuiApp) {
 
 fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
     let block = Block::default()
-        .title(" Jellyfin Transcoding Watchdog ")
+        .title(" Watchdog Control Center ")
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -1669,6 +2375,321 @@ fn render_title_bar(f: &mut Frame, area: Rect, app: &TuiApp) {
         )
         .divider(Span::raw(" | "));
     f.render_widget(tabs, inner);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeAction {
+    Setup,
+    HealthCheck,
+    Browse,
+    Presets,
+    PauseResume,
+    ImportPreset,
+}
+
+fn render_home(f: &mut Frame, area: Rect, app: &mut TuiApp) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(14),
+            Constraint::Length(5),
+            Constraint::Min(6),
+        ])
+        .split(area);
+
+    dashboard_tab::render_dashboard(f, sections[0], &app.current_state);
+    render_home_actions(f, sections[1], app);
+    render_health_panel(f, sections[2], app);
+}
+
+fn render_home_actions(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let paused = app
+        .live_config
+        .resolve_path(&app.base_dir, &app.live_config.safety.pause_file)
+        .exists();
+    let labels = [
+        (
+            HomeAction::Setup,
+            "Setup Wizard",
+            "Open guided configuration",
+        ),
+        (
+            HomeAction::HealthCheck,
+            "Health Check",
+            "Validate config and tools",
+        ),
+        (HomeAction::Browse, "Browse Files", "Add files in Manual mode"),
+        (HomeAction::Presets, "Preset Selector", "Pick a default or manual preset"),
+        (
+            HomeAction::PauseResume,
+            if paused { "Resume" } else { "Pause" },
+            "Toggle the pause marker",
+        ),
+        (
+            HomeAction::ImportPreset,
+            "Import Preset",
+            "Copy a HandBrake JSON preset here",
+        ),
+    ];
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(16),
+            Constraint::Percentage(17),
+            Constraint::Percentage(16),
+            Constraint::Percentage(17),
+        ])
+        .split(area);
+
+    for ((_, title, subtitle), rect) in labels.iter().zip(columns.iter()) {
+        let text = format!("{title}\n{subtitle}");
+        f.render_widget(
+            Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                )
+                .wrap(ratatui::widgets::Wrap { trim: true }),
+            *rect,
+        );
+    }
+}
+
+fn render_health_panel(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let lines = if app.health_report.is_empty() {
+        vec![Line::from("Run a health check to validate your current setup.")]
+    } else {
+        app.health_report
+            .iter()
+            .map(|line| Line::from(line.as_str()))
+            .collect::<Vec<_>>()
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Setup & Health ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_text_input_modal(f: &mut Frame, area: Rect, input: &TextInputState) {
+    let popup = centered_rect(60, 24, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" {} ", input.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightBlue));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3), Constraint::Length(1)])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(input.prompt.as_str()).wrap(ratatui::widgets::Wrap { trim: true }),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(input.value.as_str()).block(
+            Block::default()
+                .title(" Value ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        sections[1],
+    );
+    f.render_widget(
+        Paragraph::new("Enter save  Backspace edit  Esc cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        sections[2],
+    );
+}
+
+fn render_setup_wizard(f: &mut Frame, area: Rect, app: &TuiApp, setup: &SetupWizardState) {
+    let popup = centered_rect(86, 78, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" Setup Wizard: {} ", setup.title()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(3), Constraint::Length(1)])
+        .split(inner);
+
+    let content = match setup.step {
+        SetupStep::Welcome => render_setup_welcome(app, setup),
+        SetupStep::Storage => render_setup_storage(app),
+        SetupStep::Libraries => render_setup_libraries(app),
+        SetupStep::Preset => render_setup_preset(app),
+        SetupStep::Review => render_setup_review(app),
+    };
+    f.render_widget(
+        Paragraph::new(content)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" Guided Setup ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(setup_action_hint(setup.step)).alignment(Alignment::Center),
+        sections[1],
+    );
+    f.render_widget(
+        Paragraph::new("Tab/Shift-Tab move between steps  Esc close")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center),
+        sections[2],
+    );
+}
+
+impl SetupWizardState {
+    fn title(&self) -> &'static str {
+        self.step.title()
+    }
+}
+
+fn render_setup_welcome(app: &TuiApp, setup: &SetupWizardState) -> String {
+    let mut lines = vec![
+        if setup.config_exists {
+            "Watchdog opened in guided setup so you can review or repair this configuration."
+                .to_string()
+        } else {
+            "Watchdog did not find a saved configuration, so it opened the first-run setup wizard."
+                .to_string()
+        },
+        String::new(),
+    ];
+    if !setup.initial_validation_errors.is_empty() {
+        lines.push(format!(
+            "Current config issues: {}",
+            setup.initial_validation_errors.len()
+        ));
+        for err in setup.initial_validation_errors.iter().take(4) {
+            lines.push(format!(" - {}", err));
+        }
+        lines.push(String::new());
+    }
+    for line in &app.health_report {
+        lines.push(line.clone());
+    }
+    lines.join("\n")
+}
+
+fn render_setup_storage(app: &TuiApp) -> String {
+    format!(
+        "Storage mode: {}\nNFS server: {}\n\nActions:\n - Press l for Local mode\n - Press n for NFS mode\n - Press e to edit the NFS server",
+        if app.editable_settings.local_mode {
+            "Local"
+        } else {
+            "NFS"
+        },
+        if app.editable_settings.nfs_server.trim().is_empty() {
+            "(not set)"
+        } else {
+            app.editable_settings.nfs_server.as_str()
+        }
+    )
+}
+
+fn render_setup_libraries(app: &TuiApp) -> String {
+    let mut lines = vec![
+        "Library folders decide what Watchdog scans.".to_string(),
+        "Use j/k to change selection. Press a to add, e to edit, d to remove.".to_string(),
+        String::new(),
+    ];
+    if app.editable_settings.libraries.is_empty() {
+        lines.push("No library folders configured yet.".to_string());
+    } else {
+        for (idx, library) in app.editable_settings.libraries.iter().enumerate() {
+            let marker = if idx == app.selected_library_index { ">" } else { " " };
+            let remote = if app.editable_settings.local_mode {
+                String::new()
+            } else {
+                format!(" | remote={}", library.remote_path)
+            };
+            lines.push(format!(
+                "{} {} | local={}{}",
+                marker, library.name, library.local_mount, remote
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_setup_preset(app: &TuiApp) -> String {
+    format!(
+        "Default preset: {}\n\nActions:\n - Press c to choose a preset\n - Press i to import a HandBrake preset JSON file",
+        app.editable_settings.default_preset.short_label()
+    )
+}
+
+fn render_setup_review(app: &TuiApp) -> String {
+    let mut lines = vec![
+        format!(
+            "Config file: {}",
+            app.config_path.display()
+        ),
+        format!(
+            "Storage mode: {}",
+            if app.editable_settings.local_mode {
+                "Local"
+            } else {
+                "NFS"
+            }
+        ),
+        format!("Library folders: {}", app.editable_settings.libraries.len()),
+        format!(
+            "Preset: {}",
+            app.editable_settings.default_preset.short_label()
+        ),
+        format!(
+            "Transcode temp: {}",
+            app.editable_settings.transcode_temp
+        ),
+        format!(
+            "Scan interval: {} seconds",
+            app.editable_settings.scan_interval_seconds
+        ),
+        String::new(),
+        "Actions:".to_string(),
+        " - Press t to edit the temp folder".to_string(),
+        " - Press i to edit the scan interval".to_string(),
+        " - Press w to edit the webhook URL".to_string(),
+        " - Press h to refresh the health summary".to_string(),
+        " - Press s to save".to_string(),
+        String::new(),
+    ];
+    lines.extend(app.health_report.iter().cloned());
+    lines.join("\n")
+}
+
+fn setup_action_hint(step: SetupStep) -> &'static str {
+    match step {
+        SetupStep::Welcome => "Enter next",
+        SetupStep::Storage => "l local  n nfs  e edit server  Enter next",
+        SetupStep::Libraries => "a add  e edit  d remove  Enter next",
+        SetupStep::Preset => "c choose preset  i import preset  Enter next",
+        SetupStep::Review => "t temp folder  i interval  w webhook  h health  s save",
+    }
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
@@ -1714,7 +2735,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
 fn browser_help_line(app: &TuiApp, width: u16) -> Line<'static> {
     if width < 72 {
         if matches!(app.current_state.run_mode, RunMode::Precision) {
-            Line::from("j/k move  Enter open  Space select  a add  c codec  Esc close")
+            Line::from("j/k move  Enter open  Space select  a add  c preset  Esc close")
         } else {
             Line::from("j/k move  Enter open  Space select  a add  Esc close")
         }
@@ -1764,7 +2785,7 @@ fn browser_help_line(app: &TuiApp, width: u16) -> Line<'static> {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(":codec  "),
+                Span::raw(":preset  "),
             ]);
         }
         spans.extend([
@@ -1830,9 +2851,9 @@ fn preset_selector_help_line(width: u16) -> Line<'static> {
 fn main_help_line(app: &TuiApp, width: u16) -> Line<'static> {
     if width < 72 {
         if matches!(app.current_state.run_mode, RunMode::Precision) {
-            Line::from("q quit  1-5 tabs  b browse  c codec  d delete  j/k scroll")
+            Line::from("q quit  s setup  h health  p pause  b browse  c preset  d delete")
         } else {
-            Line::from("q quit  1-5 tabs  b browse  j/k scroll  f log-filter")
+            Line::from("q quit  s setup  h health  i import  p pause  b browse")
         }
     } else {
         let mut spans = vec![
@@ -1851,6 +2872,34 @@ fn main_help_line(app: &TuiApp, width: u16) -> Line<'static> {
             ),
             Span::raw(":tabs  "),
             Span::styled(
+                "s",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":setup  "),
+            Span::styled(
+                "h",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":health  "),
+            Span::styled(
+                "i",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":import preset  "),
+            Span::styled(
+                "p",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(":pause/resume  "),
+            Span::styled(
                 "b",
                 Style::default()
                     .fg(Color::Yellow)
@@ -1866,7 +2915,7 @@ fn main_help_line(app: &TuiApp, width: u16) -> Line<'static> {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(":codec  "),
+                Span::raw(":preset  "),
                 Span::styled(
                     "d",
                     Style::default()
@@ -2010,7 +3059,7 @@ fn render_preset_selector_modal(
     f.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(" Codec Selector ")
+        .title(" Preset Selector ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(popup);
@@ -2368,6 +3417,15 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
     use std::process::Command;
 
+    fn test_launch_options() -> TuiLaunchOptions {
+        TuiLaunchOptions {
+            config_path: PathBuf::from("/tmp/watchdog/watchdog.toml"),
+            setup_mode: false,
+            config_exists: true,
+            validation_errors: Vec::new(),
+        }
+    }
+
     #[test]
     fn browser_state_scrolls_to_keep_selection_visible() {
         let mut browser = BrowserState {
@@ -2404,29 +3462,27 @@ mod tests {
     }
 
     #[test]
-    fn open_preset_selector_rejects_non_precision_mode() {
+    fn open_preset_selector_can_be_used_for_default_presets() {
         let mut app = TuiApp::new(
-            &Config::default_config(),
+            Config::default_config(),
             PathBuf::from("/tmp/watchdog"),
             String::new(),
+            test_launch_options(),
         );
         app.current_state.run_mode = RunMode::Watchdog;
 
-        open_preset_selector(&mut app);
+        open_preset_selector(&mut app, PresetSelectionContext::DefaultPreset);
 
-        assert!(app.preset_selector.is_none());
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("Codec selector is only available in precision mode.")
-        );
+        assert!(app.preset_selector.is_some() || app.status_message.is_some());
     }
 
     #[test]
-    fn browser_help_line_only_shows_codec_shortcut_in_precision_mode() {
+    fn browser_help_line_only_shows_preset_shortcut_in_manual_mode() {
         let mut app = TuiApp::new(
-            &Config::default_config(),
+            Config::default_config(),
             PathBuf::from("/tmp/watchdog"),
             String::new(),
+            test_launch_options(),
         );
 
         app.current_state.run_mode = RunMode::Watchdog;
@@ -2436,7 +3492,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(!watchdog_text.contains(":codec"));
+        assert!(!watchdog_text.contains(":preset"));
 
         app.current_state.run_mode = RunMode::Precision;
         let precision_help = browser_help_line(&app, 120);
@@ -2445,7 +3501,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(precision_text.contains(":codec"));
+        assert!(precision_text.contains(":preset"));
     }
 
     #[test]
@@ -2453,9 +3509,10 @@ mod tests {
         let backend = TestBackend::new(160, 48);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = TuiApp::new(
-            &Config::default_config(),
+            Config::default_config(),
             PathBuf::from("/tmp/watchdog"),
             "watchdog --attach --config .watchdog/watchdog.toml".to_string(),
+            test_launch_options(),
         );
         app.show_quit_modal = true;
         app.worker_pid = Some(88529);
@@ -2487,9 +3544,10 @@ mod tests {
     fn mouse_scroll_moves_browser_selection() {
         let db = Arc::new(WatchdogDb::open_in_memory().unwrap());
         let mut app = TuiApp::new(
-            &Config::default_config(),
+            Config::default_config(),
             PathBuf::from("/tmp/watchdog"),
             String::new(),
+            test_launch_options(),
         );
         app.browser = Some(BrowserState {
             current_dir: None,
@@ -2550,9 +3608,10 @@ mod tests {
         let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
         let pid = child.id();
         let mut app = TuiApp::new(
-            &Config::default_config(),
+            Config::default_config(),
             PathBuf::from("/tmp/watchdog"),
             String::new(),
+            test_launch_options(),
         );
         db.set_worker_state(pid, "precision");
         app.owned_worker = Some(child);

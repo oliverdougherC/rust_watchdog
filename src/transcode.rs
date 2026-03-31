@@ -125,6 +125,12 @@ impl PresetCatalogEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedPreset {
+    pub stored_path: String,
+    pub entries: Vec<PresetCatalogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PresetMetadata {
     target_codec: String,
     container_extension: String,
@@ -344,6 +350,146 @@ pub fn load_preset_catalog(base_dir: &Path) -> Vec<PresetCatalogEntry> {
     }
 
     catalog
+}
+
+pub fn import_preset_file(base_dir: &Path, source_path: &Path) -> Result<ImportedPreset> {
+    let payload_text = load_preset_payload_text(source_path)?;
+    let file_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            WatchdogError::Config(format!(
+                "preset source path '{}' does not have a usable filename",
+                source_path.display()
+            ))
+        })?;
+    let file_name = ensure_json_file_name(file_name);
+    let target_dir = base_dir.join(BUNDLED_PRESET_DIR_NAME);
+    fs::create_dir_all(&target_dir).map_err(|err| {
+        WatchdogError::Config(format!(
+            "failed to create preset directory {}: {}",
+            target_dir.display(),
+            err
+        ))
+    })?;
+
+    let target_path = next_available_preset_path(&target_dir, &file_name);
+    let stored_path = path_for_storage(base_dir, &target_path);
+    let entries = preset_catalog_from_payload_text(&payload_text, &stored_path)?;
+    if !entries.iter().any(|entry| entry.selectable) {
+        return Err(WatchdogError::Config(format!(
+            "preset file {} does not contain any selectable HandBrake presets",
+            source_path.display()
+        )));
+    }
+
+    fs::write(&target_path, payload_text).map_err(|err| {
+        WatchdogError::Config(format!(
+            "failed to write imported preset {}: {}",
+            target_path.display(),
+            err
+        ))
+    })?;
+
+    Ok(ImportedPreset {
+        stored_path,
+        entries,
+    })
+}
+
+fn ensure_json_file_name(file_name: &str) -> String {
+    if file_name
+        .rsplit('.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        file_name.to_string()
+    } else {
+        format!("{file_name}.json")
+    }
+}
+
+fn next_available_preset_path(target_dir: &Path, file_name: &str) -> PathBuf {
+    let base = Path::new(file_name);
+    let stem = base
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("imported_preset");
+    let ext = base
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or("json");
+
+    let first = target_dir.join(file_name);
+    if !first.exists() {
+        return first;
+    }
+
+    for idx in 2..1000 {
+        let candidate = target_dir.join(format!("{stem}_{idx}.{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    target_dir.join(format!("{stem}_imported.{ext}"))
+}
+
+fn preset_catalog_from_payload_text(
+    payload_text: &str,
+    stored_path: &str,
+) -> Result<Vec<PresetCatalogEntry>> {
+    let payload = parse_preset_payload_text(payload_text, stored_path)?;
+    let mut catalog = Vec::new();
+    let Some(presets) = payload.get("PresetList").and_then(Value::as_array) else {
+        catalog.push(invalid_catalog_entry(
+            stored_path,
+            "(invalid file)",
+            "PresetList is missing or invalid".to_string(),
+        ));
+        return Ok(catalog);
+    };
+
+    if presets.is_empty() {
+        catalog.push(invalid_catalog_entry(
+            stored_path,
+            "(empty file)",
+            "PresetList is empty".to_string(),
+        ));
+        return Ok(catalog);
+    }
+
+    for (idx, preset) in presets.iter().enumerate() {
+        let preset_name = preset
+            .get("PresetName")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("(unnamed preset #{})", idx + 1));
+        match parse_preset_metadata(preset, Path::new(stored_path), &preset_name) {
+            Ok(metadata) => catalog.push(PresetCatalogEntry {
+                preset_file: stored_path.to_string(),
+                preset_name,
+                selectable: true,
+                target_codec: Some(metadata.target_codec),
+                encoder: metadata.encoder,
+                quality_summary: metadata.quality_summary,
+                speed_preset: metadata.speed_preset,
+                subtitle_summary: metadata.subtitle_summary,
+                audio_summary: metadata.audio_summary,
+                error_summary: None,
+            }),
+            Err(err) => catalog.push(invalid_catalog_entry(
+                stored_path,
+                &preset_name,
+                config_error_message(&err),
+            )),
+        }
+    }
+
+    Ok(catalog)
 }
 
 fn invalid_catalog_entry(
@@ -1362,9 +1508,9 @@ fn should_mark_transcode_stalled(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_preset_catalog, parse_handbrake_progress_json_block, parse_handbrake_progress_text,
-        resolve_preset_path, resolve_preset_path_from_roots, should_mark_transcode_stalled,
-        PresetContract,
+        import_preset_file, load_preset_catalog, parse_handbrake_progress_json_block,
+        parse_handbrake_progress_text, resolve_preset_path, resolve_preset_path_from_roots,
+        should_mark_transcode_stalled, PresetContract,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1520,6 +1666,31 @@ mod tests {
         assert!(catalog.iter().any(|entry| !entry.selectable
             && entry.preset_file == "presets/broken.json"
             && entry.error_summary.is_some()));
+    }
+
+    #[test]
+    fn import_preset_file_copies_preset_into_managed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let imported = import_preset_file(dir.path(), &bundled_preset_file()).unwrap();
+
+        assert_eq!(imported.stored_path, "presets/AV1_MKV.json");
+        assert!(dir.path().join("presets/AV1_MKV.json").exists());
+        assert!(imported.entries.iter().any(|entry| entry.selectable));
+    }
+
+    #[test]
+    fn import_preset_file_renames_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("presets")).unwrap();
+        fs::copy(
+            bundled_preset_file(),
+            dir.path().join("presets/AV1_MKV.json"),
+        )
+        .unwrap();
+
+        let imported = import_preset_file(dir.path(), &bundled_preset_file()).unwrap();
+        assert_eq!(imported.stored_path, "presets/AV1_MKV_2.json");
+        assert!(dir.path().join("presets/AV1_MKV_2.json").exists());
     }
 
     #[test]

@@ -45,7 +45,10 @@ impl RunMode {
 
 impl std::fmt::Display for RunMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Watchdog => f.write_str("Automatic"),
+            Self::Precision => f.write_str("Manual"),
+        }
     }
 }
 

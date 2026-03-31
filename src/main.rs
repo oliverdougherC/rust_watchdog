@@ -414,13 +414,17 @@ struct Cli {
     #[arg(long)]
     headless: bool,
 
-    /// Run in precision/manual-selection mode instead of automatic watchdog scanning
+    /// Run in Manual mode instead of automatic watchdog scanning
     #[arg(long)]
     precision: bool,
 
     /// Attach the TUI to an already-running worker without spawning a new one
     #[arg(long)]
     attach: bool,
+
+    /// Open the guided setup and settings workflow
+    #[arg(long)]
+    setup: bool,
 
     /// Custom config file path
     #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
@@ -473,6 +477,10 @@ struct Cli {
     /// Clear cached inspected-file scan state on startup
     #[arg(long)]
     clear_scan_cache: bool,
+
+    /// Import a HandBrake preset JSON into the managed presets directory and exit
+    #[arg(long)]
+    import_preset: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -555,6 +563,7 @@ async fn run() -> anyhow::Result<()> {
         && (cli.headless
             || cli.dry_run
             || cli.once
+            || cli.setup
             || cli.doctor
             || run_status_mode
             || run_healthcheck_mode
@@ -565,6 +574,40 @@ async fn run() -> anyhow::Result<()> {
             || cli.quarantine_clear_all)
     {
         anyhow::bail!("--attach is only valid for interactive TUI sessions");
+    }
+    if cli.setup
+        && (cli.headless
+            || cli.dry_run
+            || cli.once
+            || cli.doctor
+            || run_status_mode
+            || run_healthcheck_mode
+            || cli.pause
+            || cli.resume
+            || cli.quarantine_list
+            || cli.quarantine_clear.is_some()
+            || cli.quarantine_clear_all)
+    {
+        anyhow::bail!("--setup is only valid for the interactive TUI");
+    }
+    if cli.setup && cli.import_preset.is_some() {
+        anyhow::bail!("Use either --setup or --import-preset, not both");
+    }
+    if cli.import_preset.is_some()
+        && (cli.dry_run
+            || cli.once
+            || cli.headless
+            || cli.attach
+            || cli.doctor
+            || run_status_mode
+            || run_healthcheck_mode
+            || cli.pause
+            || cli.resume
+            || cli.quarantine_list
+            || cli.quarantine_clear.is_some()
+            || cli.quarantine_clear_all)
+    {
+        anyhow::bail!("--import-preset is a standalone command");
     }
 
     // Set up tracing — suppress stderr output in TUI mode to avoid corrupting the display
@@ -619,7 +662,14 @@ async fn run() -> anyhow::Result<()> {
         default_level
     );
 
+    let config_exists = if cli.simulate {
+        true
+    } else {
+        cli.config.exists()
+    };
+
     // Load or generate config
+    let mut config_load_error = None;
     let mut config = if cli.simulate {
         info!("Simulation mode: using default config with in-memory database");
         Config::default_config()
@@ -627,6 +677,7 @@ async fn run() -> anyhow::Result<()> {
         match Config::load(&cli.config) {
             Ok(c) => c,
             Err(e) => {
+                config_load_error = Some(e.to_string());
                 error!(
                     "Failed to load config from {}: {} (code={} category={})",
                     cli.config.display(),
@@ -643,8 +694,15 @@ async fn run() -> anyhow::Result<()> {
                 if run_status_mode {
                     std::process::exit(STATUS_INTERNAL_FAIL);
                 }
-                return Err(anyhow::Error::new(e)
-                    .context(format!("Config load failed from {}", cli.config.display())));
+                if tui_mode || cli.setup {
+                    warn!(
+                        "Interactive launch will open guided setup instead of failing on config load."
+                    );
+                    Config::default_config()
+                } else {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Config load failed from {}", cli.config.display())));
+                }
             }
         }
     };
@@ -667,6 +725,19 @@ async fn run() -> anyhow::Result<()> {
     };
     info!("Resolved base directory: {}", base_dir.display());
 
+    if let Some(source) = cli.import_preset.as_ref() {
+        let imported = watchdog::transcode::import_preset_file(&base_dir, source)?;
+        println!("imported_preset_file: {}", imported.stored_path);
+        for entry in imported.entries.iter().filter(|entry| entry.selectable) {
+            println!(
+                "- {} [{}]",
+                entry.preset_name,
+                entry.target_codec.as_deref().unwrap_or("unknown")
+            );
+        }
+        return Ok(());
+    }
+
     let runtime_paths = resolve_runtime_paths(&config, &base_dir);
     if !cli.dry_run {
         config.paths.database = runtime_paths.database.to_string_lossy().to_string();
@@ -681,7 +752,9 @@ async fn run() -> anyhow::Result<()> {
         && !cli.quarantine_list
         && cli.quarantine_clear.is_none()
         && !cli.quarantine_clear_all
-        && !cli.doctor;
+        && !cli.doctor
+        && !cli.setup
+        && config_load_error.is_none();
     if needs_preset_contract {
         let preset_path = resolve_preset_path(&base_dir, &config.transcode.preset_file);
         let preset_contract = PresetContract::resolve(&preset_path, &config.transcode.preset_name)?;
@@ -733,6 +806,12 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let validation_errors = config.validate_with_base_dir(&base_dir);
+    let interactive_setup_mode = should_enter_setup_tui(
+        tui_mode,
+        cli.setup,
+        config_load_error.is_some(),
+        &validation_errors,
+    );
     if run_healthcheck_mode && !cli.simulate && !validation_errors.is_empty() {
         for err in &validation_errors {
             error!("Config validation error: {}", err);
@@ -759,6 +838,8 @@ async fn run() -> anyhow::Result<()> {
 
     // Open database
     let db = if cli.simulate {
+        Arc::new(WatchdogDb::open_in_memory()?)
+    } else if interactive_setup_mode {
         Arc::new(WatchdogDb::open_in_memory()?)
     } else {
         let db_path = runtime_paths.database.clone();
@@ -930,22 +1011,24 @@ async fn run() -> anyhow::Result<()> {
         std::process::exit(exit_code);
     }
 
-    maybe_bootstrap_persisted_metrics(
-        &mut config,
-        &cli.config,
-        db.as_ref(),
-        cli.simulate,
-        cli.dry_run,
-    );
+    if !interactive_setup_mode {
+        maybe_bootstrap_persisted_metrics(
+            &mut config,
+            &cli.config,
+            db.as_ref(),
+            cli.simulate,
+            cli.dry_run,
+        );
+    }
 
     // Validate config (doctor mode handles diagnostics itself)
-    if !validation_errors.is_empty() && !cli.simulate {
+    if !validation_errors.is_empty() && !cli.simulate && !interactive_setup_mode {
         for err in &validation_errors {
             error!("Config validation error: {}", err);
         }
         warn!(
-            "Configuration validation failed; run `watchdog --doctor --config {}` for a full diagnostic report",
-            cli.config.display()
+            "Configuration validation failed; run `watchdog --setup --config {0}` or `watchdog --doctor --config {0}`",
+            cli.config.display(),
         );
         anyhow::bail!(
             "Configuration validation failed with {} error(s)",
@@ -954,7 +1037,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // Verify dependencies (skip in simulation mode)
-    if !cli.simulate {
+    if !cli.simulate && !interactive_setup_mode {
         if let Err(missing) = util::verify_dependencies() {
             error!("Missing required tools: {}", missing.join(", "));
             debug!(
@@ -962,7 +1045,7 @@ async fn run() -> anyhow::Result<()> {
                 std::env::var("PATH").unwrap_or_else(|_| "<unavailable>".to_string())
             );
             anyhow::bail!(
-                "Dependency check failed. Install: {}. Run `watchdog --doctor --config {}` for detailed diagnostics.",
+                "Dependency check failed. Install: {0}. Run `watchdog --setup --config {1}` or `watchdog --doctor --config {1}` for detailed diagnostics.",
                 missing.join(", "),
                 cli.config.display()
             );
@@ -1148,7 +1231,9 @@ async fn run() -> anyhow::Result<()> {
         };
 
         let mut owned_worker = None;
-        let attach_run_mode = if cli.attach {
+        let attach_run_mode = if interactive_setup_mode {
+            requested_run_mode
+        } else if cli.attach {
             if live_worker_pid.is_none() {
                 anyhow::bail!(
                     "No active worker is running. Start one with `watchdog{}` first.",
@@ -1190,6 +1275,12 @@ async fn run() -> anyhow::Result<()> {
             runtime_paths.event_journal.clone(),
             attach_hint,
             owned_worker,
+            tui::TuiLaunchOptions {
+                config_path: cli.config.clone(),
+                setup_mode: interactive_setup_mode,
+                config_exists,
+                validation_errors: validation_errors.clone(),
+            },
         )
         .await
         {
@@ -1306,6 +1397,15 @@ fn resolve_config_path(requested: &Path, cwd: &Path) -> PathBuf {
         }
     }
     requested.to_path_buf()
+}
+
+fn should_enter_setup_tui(
+    tui_mode: bool,
+    setup_flag: bool,
+    config_load_failed: bool,
+    validation_errors: &[String],
+) -> bool {
+    tui_mode && (setup_flag || config_load_failed || !validation_errors.is_empty())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -2165,6 +2265,7 @@ mod tests {
             headless: false,
             precision: false,
             attach: false,
+            setup: false,
             config,
             log_level: None,
             healthcheck: false,
@@ -2178,6 +2279,7 @@ mod tests {
             quarantine_clear: None,
             quarantine_clear_all: false,
             clear_scan_cache: false,
+            import_preset: None,
         }
     }
 
@@ -2210,5 +2312,19 @@ mod tests {
             resolve_config_path(Path::new(DEFAULT_CONFIG_PATH), temp_dir.path()),
             PathBuf::from(LEGACY_DEFAULT_CONFIG_PATH)
         );
+    }
+
+    #[test]
+    fn should_enter_setup_tui_triggers_for_missing_or_invalid_config() {
+        assert!(should_enter_setup_tui(true, true, false, &[]));
+        assert!(should_enter_setup_tui(true, false, true, &[]));
+        assert!(should_enter_setup_tui(
+            true,
+            false,
+            false,
+            &[String::from("config error")]
+        ));
+        assert!(!should_enter_setup_tui(true, false, false, &[]));
+        assert!(!should_enter_setup_tui(false, true, true, &[String::from("config error")]));
     }
 }
